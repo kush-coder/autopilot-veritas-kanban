@@ -1,0 +1,630 @@
+/**
+ * Storage abstraction interfaces.
+ *
+ * These define a backend-agnostic contract for persisting tasks and settings.
+ * The first concrete implementation wraps the existing file-based services;
+ * future implementations (SQLite, PostgreSQL, S3, …) can be added without
+ * touching business logic.
+ */
+
+import type {
+  Task,
+  FeatureSettings,
+  TaskTemplate,
+  CreateTemplateInput,
+  UpdateTemplateInput,
+  ManagedListItem,
+  TelemetryEvent,
+  TelemetryEventType,
+  TelemetryConfig,
+  TelemetryQueryOptions,
+  AnyTelemetryEvent,
+  PromptTemplate,
+  PromptVersion,
+  PromptUsage,
+  PromptStats,
+  CreatePromptTemplateInput,
+  UpdatePromptTemplateInput,
+  RenderPreviewRequest,
+  RenderPreviewResponse,
+  DesktopSetupContext,
+  RunEventAppendResult,
+  RunEventEnvelope,
+  RunEventPage,
+  RunEventQuery,
+  RunApprovalListQuery,
+  RunApprovalRequest,
+  RunApprovalTransitionInput,
+  RunApprovalTransitionResult,
+  PhaseTransitionAppendInput,
+  PhaseTransitionAppendResult,
+  PhaseTransitionQuery,
+  PhaseTransitionRecord,
+  RunSupervisorCompareAndSetInput,
+  RunSupervisorCompareAndSetResult,
+  RunSupervisorListQuery,
+  RunSupervisorRecord,
+  DurableGoalCompareAndSetInput,
+  DurableGoalCompareAndSetResult,
+  DurableGoalListQuery,
+  DurableGoalRecord,
+  ReflectionExtractionJob,
+  ReflectionExtractionJobClaimInput,
+  ReflectionExtractionJobClaimResult,
+  ReflectionExtractionJobCompareAndSetInput,
+  ReflectionExtractionJobCompareAndSetResult,
+  ReflectionExtractionJobEnqueueResult,
+  ReflectionExtractionJobListQuery,
+  AdmissionReservation,
+  AdmissionReservationClaimInput,
+  AdmissionReservationClaimResult,
+  AdmissionReservationClaimOrQueueInput,
+  AdmissionReservationClaimOrQueueResult,
+  AdmissionReservationCompareAndSetInput,
+  AdmissionReservationCompareAndSetResult,
+  AdmissionReservationListQuery,
+  AdmissionQueuedClaimInput,
+  AdmissionQueuedClaimResult,
+  AdmissionQueueCompareAndSetInput,
+  AdmissionQueueCompareAndSetResult,
+  AdmissionQueueEntry,
+  AdmissionQueueListQuery,
+  RunToolCatalog,
+  ToolServerDefinition,
+  ToolServerDiscovery,
+  WorkspaceExecutionTrustDecision,
+  WorkspaceExecutionTrustInventory,
+  RunOutputArtifactCleanupInput,
+  RunOutputArtifactCleanupResult,
+  RunOutputArtifactCreateResult,
+  RunOutputArtifactListQuery,
+  RunOutputArtifactLookup,
+  RunOutputArtifactMetadata,
+  RunOutputArtifactRange,
+  RunOutputArtifactRangeQuery,
+  RunOutputQuarantineReason,
+} from '@veritas-kanban/shared';
+import type {
+  Notification,
+  NotificationStats,
+  ThreadSubscription,
+} from '../services/notification-service.js';
+import type { Activity, ActivityType } from '../services/activity-service.js';
+import type {
+  StatusHistoryEntry,
+  DailySummary,
+  AgentStatusState,
+} from '../services/status-history-service.js';
+import type { ManagedListServiceConfig } from '../services/managed-list-service.js';
+import type { WorkProductArtifactRepository } from './work-product-artifact-repository.js';
+export type { WorkProductArtifactRepository } from './work-product-artifact-repository.js';
+
+// ---------------------------------------------------------------------------
+// Task Repository
+// ---------------------------------------------------------------------------
+
+export interface TaskRepository {
+  /** Return every active task (not archived). */
+  findAll(): Promise<Task[]>;
+
+  /** Look up a single task by ID. Returns null when not found. */
+  findById(id: string): Promise<Task | null>;
+
+  /** Persist a brand-new task and return it (with generated ID, timestamps, …). */
+  create(task: Task): Promise<Task>;
+
+  /** Apply a partial update and return the full updated task. Throws if not found. */
+  update(id: string, updates: Partial<Task>): Promise<Task>;
+
+  /** Delete a task by ID. Throws if not found. */
+  delete(id: string): Promise<void>;
+
+  /** Full-text(-ish) search over tasks. */
+  search(query: string): Promise<Task[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Settings Repository
+// ---------------------------------------------------------------------------
+
+export interface SettingsRepository {
+  /** Return the current feature settings (merged with defaults). */
+  get(): Promise<FeatureSettings>;
+
+  /** Deep-merge a partial patch and return the resulting settings. */
+  update(settings: Partial<FeatureSettings>): Promise<FeatureSettings>;
+}
+
+// ---------------------------------------------------------------------------
+// Activity Repository
+// ---------------------------------------------------------------------------
+
+export interface ActivityRepository {
+  /** Return recent activities, ordered newest-first. */
+  getActivities(limit?: number): Promise<Activity[]>;
+
+  /** Append a new activity entry and return it. */
+  logActivity(
+    type: ActivityType,
+    taskId: string,
+    taskTitle: string,
+    details?: Record<string, unknown>,
+    agent?: string,
+    actor?: string
+  ): Promise<Activity>;
+
+  /** Delete all activity entries. */
+  clearActivities(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Template Repository
+// ---------------------------------------------------------------------------
+
+export interface TemplateRepository {
+  /** Return all task templates, sorted by name. */
+  getTemplates(): Promise<TaskTemplate[]>;
+
+  /** Look up a single template by ID. Returns null when not found. */
+  getTemplate(id: string): Promise<TaskTemplate | null>;
+
+  /** Create a new template and return it. */
+  createTemplate(input: CreateTemplateInput): Promise<TaskTemplate>;
+
+  /** Partial-update a template. Returns null when not found. */
+  updateTemplate(id: string, input: UpdateTemplateInput): Promise<TaskTemplate | null>;
+
+  /** Delete a template by ID. Returns true if deleted, false if not found. */
+  deleteTemplate(id: string): Promise<boolean>;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt Registry Repository
+// ---------------------------------------------------------------------------
+
+export interface PromptRegistryRepository {
+  getTemplates(): Promise<PromptTemplate[]>;
+
+  getTemplate(id: string): Promise<PromptTemplate | null>;
+
+  createTemplate(input: CreatePromptTemplateInput): Promise<PromptTemplate>;
+
+  updateTemplate(id: string, input: UpdatePromptTemplateInput): Promise<PromptTemplate | null>;
+
+  deleteTemplate(id: string): Promise<boolean>;
+
+  getVersionHistory(templateId: string): Promise<PromptVersion[]>;
+
+  recordUsage(
+    templateId: string,
+    usedBy?: string,
+    renderedPrompt?: string,
+    model?: string,
+    inputTokens?: number,
+    outputTokens?: number
+  ): Promise<PromptUsage>;
+
+  getUsageRecords(templateId: string): Promise<PromptUsage[]>;
+
+  getStats(templateId: string): Promise<PromptStats | null>;
+
+  getAllStats(): Promise<PromptStats[]>;
+
+  renderPreview(request: RenderPreviewRequest): Promise<RenderPreviewResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// Status History Repository
+// ---------------------------------------------------------------------------
+
+export interface StatusHistoryRepository {
+  /** Return history entries with pagination. */
+  getHistory(limit?: number, offset?: number): Promise<StatusHistoryEntry[]>;
+
+  /** Record a status transition and return the new entry. */
+  logStatusChange(
+    previousStatus: AgentStatusState,
+    newStatus: AgentStatusState,
+    taskId?: string,
+    taskTitle?: string,
+    subAgentCount?: number
+  ): Promise<StatusHistoryEntry>;
+
+  /** Return entries within a time range. */
+  getHistoryByDateRange(startDate: string, endDate: string): Promise<StatusHistoryEntry[]>;
+
+  /** Compute an activity summary for a single day. */
+  getDailySummary(date?: string): Promise<DailySummary>;
+
+  /** Compute daily summaries for the past 7 days. */
+  getWeeklySummary(): Promise<DailySummary[]>;
+
+  /** Delete all history entries. */
+  clearHistory(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Managed List Repository (generic — priorities, projects, sprints, …)
+// ---------------------------------------------------------------------------
+
+export interface ManagedListRepository<T extends ManagedListItem> {
+  /** Initialise the list (seed defaults, etc.). */
+  init(): Promise<void>;
+
+  /** Return all items, optionally including hidden ones. */
+  list(includeHidden?: boolean): Promise<T[]>;
+
+  /** Look up a single item by ID. */
+  get(id: string): Promise<T | null>;
+
+  /** Create a new item. */
+  create(input: Omit<T, 'order' | 'created' | 'updated'> & { id?: string }): Promise<T>;
+
+  /** Seed a pre-built item (for migrations). */
+  seedItem(item: T): Promise<T>;
+
+  /** Partial-update an item. Returns null when not found. */
+  update(id: string, patch: Partial<T>): Promise<T | null>;
+
+  /** Check whether an item can be safely deleted. */
+  canDelete(id: string): Promise<{ allowed: boolean; referenceCount: number; isDefault: boolean }>;
+
+  /** Delete an item. */
+  delete(id: string, force?: boolean): Promise<{ deleted: boolean; referenceCount?: number }>;
+
+  /** Reorder items by providing an ordered list of IDs. */
+  reorder(orderedIds: string[]): Promise<T[]>;
+}
+
+export interface ManagedListProvider {
+  /**
+   * Create a managed-list repository for the given config.
+   *
+   * Concrete storage implementations decide how/where list data is persisted.
+   */
+  create<T extends ManagedListItem>(config: ManagedListServiceConfig<T>): ManagedListRepository<T>;
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry Repository
+// ---------------------------------------------------------------------------
+
+export interface TelemetryRepository {
+  /** One-time setup (create directories, run retention cleanup). */
+  init(): Promise<void>;
+
+  /** Emit a telemetry event. */
+  emit<T extends TelemetryEvent>(
+    event: Omit<T, 'id' | 'timestamp'> & { timestamp?: string }
+  ): Promise<T>;
+
+  /** Query events with optional filters. */
+  getEvents(options?: TelemetryQueryOptions): Promise<AnyTelemetryEvent[]>;
+
+  /** Get all events for a specific task. */
+  getTaskEvents(taskId: string): Promise<AnyTelemetryEvent[]>;
+
+  /** Batch-query events for multiple tasks. */
+  getBulkTaskEvents(
+    taskIds: string[],
+    perTaskLimit?: number
+  ): Promise<Map<string, AnyTelemetryEvent[]>>;
+
+  /** Get events since a given timestamp. */
+  getEventsSince(since: string): Promise<AnyTelemetryEvent[]>;
+
+  /** Count events by type within a time period. */
+  countEvents(
+    type: TelemetryEventType | TelemetryEventType[],
+    since?: string,
+    until?: string
+  ): Promise<number>;
+
+  /** Delete all events. */
+  clear(): Promise<void>;
+
+  /** Wait for pending writes to complete. */
+  flush(): Promise<void>;
+
+  /** Export events as JSON. */
+  exportAsJson(options?: TelemetryQueryOptions): Promise<string>;
+
+  /** Export events as CSV. */
+  exportAsCsv(options?: TelemetryQueryOptions): Promise<string>;
+
+  /** Update runtime configuration. */
+  configure(config: Partial<TelemetryConfig>): void;
+
+  /** Get current configuration. */
+  getConfig(): TelemetryConfig;
+
+  /** Check if telemetry is enabled. */
+  isEnabled(): boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Setup Context Repository
+// ---------------------------------------------------------------------------
+
+export interface SetupContextRepository {
+  /** Return a read-only summary of data already present in the active store. */
+  getSetupContext(): DesktopSetupContext;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace File Repository
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceFileRepository {
+  /**
+   * Read an optional UTF-8 file beneath a workspace root.
+   *
+   * Implementations must reject traversal outside `workspaceRoot`. A missing
+   * file returns null; other I/O failures remain visible to the caller.
+   */
+  readOptionalText(workspaceRoot: string, relativePath: string): Promise<string | null>;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace Execution Trust Repository
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceExecutionTrustRepository {
+  inspect(workspacePath: string): Promise<WorkspaceExecutionTrustInventory>;
+  listDecisions(identityDigest?: string): Promise<WorkspaceExecutionTrustDecision[]>;
+  appendDecision(
+    decision: WorkspaceExecutionTrustDecision
+  ): Promise<WorkspaceExecutionTrustDecision>;
+}
+
+// ---------------------------------------------------------------------------
+// Run Event Journal Repository
+// ---------------------------------------------------------------------------
+
+export type RunEventRepositoryAppendInput = Omit<RunEventEnvelope, 'sequence'>;
+
+export interface RunEventRepository {
+  /**
+   * Append one event and allocate the next attempt-local sequence.
+   *
+   * Implementations must enforce `(attemptId, dedupeKey)` idempotency when a
+   * dedupe key is present and return the prior event with `appended: false`.
+   */
+  append(event: RunEventRepositoryAppendInput): Promise<RunEventAppendResult>;
+
+  /** Replay one attempt in ascending sequence order. */
+  list(query: RunEventQuery): Promise<RunEventPage>;
+}
+
+// ---------------------------------------------------------------------------
+// Governed Run Output Artifacts
+// ---------------------------------------------------------------------------
+
+export interface RunOutputArtifactRepository {
+  /** Atomically persist redacted content and its immutable causal metadata. */
+  create(
+    metadata: RunOutputArtifactMetadata,
+    content: Uint8Array | null
+  ): Promise<RunOutputArtifactCreateResult>;
+
+  /** Resolve metadata only when every workspace/run scope component matches. */
+  get(lookup: RunOutputArtifactLookup): Promise<RunOutputArtifactMetadata | null>;
+
+  /** Return a bounded content range without materializing the complete artifact. */
+  readRange(query: RunOutputArtifactRangeQuery): Promise<RunOutputArtifactRange | null>;
+
+  /** List bounded metadata records without returning artifact content. */
+  list(query: RunOutputArtifactListQuery): Promise<RunOutputArtifactMetadata[]>;
+
+  /** Expire eligible bodies while preserving metadata tombstones for event references. */
+  cleanup(input: RunOutputArtifactCleanupInput): Promise<RunOutputArtifactCleanupResult>;
+
+  /** Quarantine an unsafe body while retaining a scoped metadata tombstone. */
+  quarantine(
+    lookup: RunOutputArtifactLookup,
+    reason: RunOutputQuarantineReason,
+    now: string
+  ): Promise<RunOutputArtifactMetadata | null>;
+}
+
+// ---------------------------------------------------------------------------
+// Run Approval Repository
+// ---------------------------------------------------------------------------
+
+export interface RunApprovalRepository {
+  /** Persist a new pending approval. IDs are unique and never reused. */
+  create(request: RunApprovalRequest): Promise<RunApprovalRequest>;
+
+  /** Return one approval snapshot, or null when it does not exist. */
+  get(id: string): Promise<RunApprovalRequest | null>;
+
+  /** Query materialized approval snapshots. */
+  list(query: RunApprovalListQuery): Promise<RunApprovalRequest[]>;
+
+  /**
+   * Atomically transition one pending approval using revision and action-hash
+   * compare-and-set guards.
+   */
+  transition(input: RunApprovalTransitionInput): Promise<RunApprovalTransitionResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase Transition Repository
+// ---------------------------------------------------------------------------
+
+export interface PhaseTransitionRepository {
+  /** Return the one materialized active phase for an exact run. */
+  getCurrent(
+    workspaceId: string,
+    taskId: string,
+    attemptId: string
+  ): Promise<PhaseTransitionRecord | null>;
+
+  /** Resolve one run-scoped idempotency key without scanning bounded history. */
+  getByOperationId(
+    workspaceId: string,
+    taskId: string,
+    attemptId: string,
+    operationId: string
+  ): Promise<PhaseTransitionRecord | null>;
+
+  /** Return append-only transition history in ascending sequence order. */
+  list(query: PhaseTransitionQuery): Promise<PhaseTransitionRecord[]>;
+
+  /** Append one transition behind exact sequence, phase, and manifest CAS guards. */
+  append(input: PhaseTransitionAppendInput): Promise<PhaseTransitionAppendResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Durable Run Supervisor Repository
+// ---------------------------------------------------------------------------
+
+export interface RunSupervisorRepository {
+  /** Persist one newly allocated run supervisor record at revision 1. */
+  create(record: RunSupervisorRecord): Promise<RunSupervisorRecord>;
+
+  /** Return one supervisor record, or null when it does not exist. */
+  get(id: string): Promise<RunSupervisorRecord | null>;
+
+  /** Query materialized supervisor records. */
+  list(query: RunSupervisorListQuery): Promise<RunSupervisorRecord[]>;
+
+  /** Replace one record with a revision-guarded compare-and-set operation. */
+  compareAndSet(input: RunSupervisorCompareAndSetInput): Promise<RunSupervisorCompareAndSetResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Durable Goal Repository
+// ---------------------------------------------------------------------------
+
+export interface DurableGoalRepository {
+  /** Persist one newly allocated durable goal at revision 1. */
+  create(record: DurableGoalRecord): Promise<DurableGoalRecord>;
+
+  /** Return one durable goal, or null when it does not exist. */
+  get(id: string): Promise<DurableGoalRecord | null>;
+
+  /** Query materialized durable goals. */
+  list(query: DurableGoalListQuery): Promise<DurableGoalRecord[]>;
+
+  /** Replace one goal with a revision-guarded compare-and-set operation. */
+  compareAndSet(input: DurableGoalCompareAndSetInput): Promise<DurableGoalCompareAndSetResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Reflection Extraction Job Repository
+// ---------------------------------------------------------------------------
+
+export interface ReflectionExtractionJobRepository {
+  /** Atomically create one job or return the existing idempotent job. */
+  enqueue(job: ReflectionExtractionJob): Promise<ReflectionExtractionJobEnqueueResult>;
+
+  /** Return one materialized extraction job. */
+  get(id: string): Promise<ReflectionExtractionJob | null>;
+
+  /** Query bounded materialized extraction jobs. */
+  list(query: ReflectionExtractionJobListQuery): Promise<ReflectionExtractionJob[]>;
+
+  /** Atomically expire stale leases, enforce concurrency limits, and claim one eligible job. */
+  claim(input: ReflectionExtractionJobClaimInput): Promise<ReflectionExtractionJobClaimResult>;
+
+  /** Replace one job with a revision-guarded compare-and-set operation. */
+  compareAndSet(
+    input: ReflectionExtractionJobCompareAndSetInput
+  ): Promise<ReflectionExtractionJobCompareAndSetResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Durable Admission Reservation Repository
+// ---------------------------------------------------------------------------
+
+export interface AdmissionReservationRepository {
+  /** Atomically expire stale leases, evaluate aggregate policies, and reserve capacity. */
+  claim(input: AdmissionReservationClaimInput): Promise<AdmissionReservationClaimResult>;
+  /** Atomically reserve capacity or persist one bounded queue entry. */
+  claimOrEnqueue(
+    input: AdmissionReservationClaimOrQueueInput
+  ): Promise<AdmissionReservationClaimOrQueueResult>;
+  /** Atomically claim one scheduler-selected eligible entry and its admission capacity. */
+  claimQueued(input: AdmissionQueuedClaimInput): Promise<AdmissionQueuedClaimResult>;
+  get(id: string): Promise<AdmissionReservation | null>;
+  list(query: AdmissionReservationListQuery): Promise<AdmissionReservation[]>;
+  compareAndSet(
+    input: AdmissionReservationCompareAndSetInput
+  ): Promise<AdmissionReservationCompareAndSetResult>;
+  expireLeases(now: string): Promise<AdmissionReservation[]>;
+  getQueueEntry(id: string): Promise<AdmissionQueueEntry | null>;
+  listQueue(query: AdmissionQueueListQuery): Promise<AdmissionQueueEntry[]>;
+  compareAndSetQueue(
+    input: AdmissionQueueCompareAndSetInput
+  ): Promise<AdmissionQueueCompareAndSetResult>;
+  expireQueueLeases(now: string): Promise<AdmissionQueueEntry[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Run-scoped Tool Control Plane Repository
+// ---------------------------------------------------------------------------
+
+export interface ToolControlPlaneRepository {
+  listDefinitions(): Promise<ToolServerDefinition[]>;
+  getDefinition(id: string): Promise<ToolServerDefinition | null>;
+  saveDefinition(definition: ToolServerDefinition): Promise<ToolServerDefinition>;
+  deleteDefinition(id: string): Promise<boolean>;
+  getDiscovery(definitionDigest: string): Promise<ToolServerDiscovery | null>;
+  saveDiscovery(discovery: ToolServerDiscovery): Promise<ToolServerDiscovery>;
+  getRunCatalog(taskId: string, attemptId: string): Promise<RunToolCatalog | null>;
+  saveRunCatalog(catalog: RunToolCatalog): Promise<RunToolCatalog>;
+}
+
+// ---------------------------------------------------------------------------
+// Storage Provider (top-level aggregate)
+// ---------------------------------------------------------------------------
+
+export interface StorageProvider {
+  readonly tasks: TaskRepository;
+  readonly settings: SettingsRepository;
+  readonly activities: ActivityRepository;
+  readonly templates: TemplateRepository;
+  readonly promptRegistry: PromptRegistryRepository;
+  readonly statusHistory: StatusHistoryRepository;
+  readonly managedLists: ManagedListProvider;
+  readonly telemetry: TelemetryRepository;
+  readonly runEvents: RunEventRepository;
+  readonly runOutputArtifacts: RunOutputArtifactRepository;
+  readonly workProductArtifacts: WorkProductArtifactRepository;
+  readonly runApprovals: RunApprovalRepository;
+  readonly phaseTransitions: PhaseTransitionRepository;
+  readonly runSupervisors: RunSupervisorRepository;
+  readonly durableGoals: DurableGoalRepository;
+  readonly reflectionExtractionJobs: ReflectionExtractionJobRepository;
+  readonly admissionReservations: AdmissionReservationRepository;
+  readonly toolControlPlane: ToolControlPlaneRepository;
+  readonly setupContext?: SetupContextRepository;
+
+  /** One-time startup hook (create dirs, open connections, etc.). */
+  initialize(): Promise<void>;
+
+  /** Graceful shutdown (close watchers, release connections, etc.). */
+  shutdown(): Promise<void>;
+}
+
+/** Incremental notification operations; bulk import/export remains adapter-specific. */
+export interface NotificationQuery {
+  agent?: string;
+  undelivered?: boolean;
+  taskId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface NotificationRepository {
+  appendNotifications(notifications: Notification[]): void | Promise<void>;
+  listNotifications(query?: NotificationQuery): Notification[] | Promise<Notification[]>;
+  markDelivered(id: string, at: string): boolean | Promise<boolean>;
+  markManyDelivered(ids: string[], at: string): number | Promise<number>;
+  markAllDelivered(agent: string, at: string): number | Promise<number>;
+  clearNotifications(): number | Promise<number>;
+  getStats(): NotificationStats | Promise<NotificationStats>;
+  subscribe(subscription: ThreadSubscription): void | Promise<void>;
+  getSubscriptions(taskId: string): ThreadSubscription[] | Promise<ThreadSubscription[]>;
+}

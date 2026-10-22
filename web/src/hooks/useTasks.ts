@@ -1,0 +1,870 @@
+import { createElement, useEffect, useMemo, useRef } from 'react';
+import { useQuery, useMutation, useQueryClient, QueryClient } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import { useWebSocketStatus } from '@/contexts/WebSocketContext';
+import { toast } from '@/hooks/useToast';
+import { useFeatureSettings } from '@/hooks/useFeatureSettings';
+import {
+  openTaskConflict,
+  recordTaskConflict,
+  resolveTaskConflict,
+  taskConflictToastId,
+  type TaskConflictOperation,
+} from '@/hooks/useTaskConflicts';
+import {
+  DEFAULT_FEATURE_SETTINGS,
+  toBoardTask,
+  type BoardTask,
+  normalizeBoardColumns,
+  normalizeBoardDefaultStatus,
+  sortTasksByBoardPosition,
+  type BoardColumnConfig,
+  type Task,
+  type CreateTaskInput,
+  type MoveTaskInput,
+  type UpdateTaskInput,
+} from '@veritas-kanban/shared';
+
+/**
+ * Patch a single task in both the list cache (['tasks']) and the individual
+ * cache (['tasks', id]) using the full task object returned by the server.
+ *
+ * This replaces the previous pattern of `invalidateQueries(['tasks'])` which
+ * triggered a full GET /api/tasks re-fetch — wasteful when the mutation
+ * response already contains the complete updated task. Used by detail-level
+ * mutations (subtasks, comments, observations, verification steps) where
+ * only one task changes and the server returns it in full.
+ */
+function patchTaskInCaches(queryClient: QueryClient, task: Task): void {
+  // Patch the list cache in-place (no network request)
+  queryClient.setQueryData<Task[]>(['tasks'], (old) =>
+    old ? old.map((t) => (t.id === task.id ? task : t)) : old
+  );
+  // Also update the individual task cache
+  queryClient.setQueryData(['tasks', task.id], task);
+  queryClient.setQueryData<BoardTask[]>(['tasks', 'board'], (old) =>
+    old?.map((item) => (item.id === task.id ? toBoardTask(task) : item))
+  );
+  queryClient.invalidateQueries({ queryKey: ['tasks', 'search'] });
+}
+
+type ApiMutationError = Error & { code?: string; details?: unknown };
+
+function cachedTaskRevision(queryClient: QueryClient, taskId: string): number | undefined {
+  const detailTask = queryClient.getQueryData<Task>(['tasks', taskId]);
+  const listTask = queryClient.getQueryData<Task[]>(['tasks'])?.find((task) => task.id === taskId);
+  const boardTask = queryClient
+    .getQueryData<BoardTask[]>(['tasks', 'board'])
+    ?.find((task) => task.id === taskId);
+  const revisions = [detailTask?.revision, listTask?.revision, boardTask?.revision].filter(
+    (revision): revision is number => typeof revision === 'number'
+  );
+  return revisions.length > 0 ? Math.max(...revisions) : undefined;
+}
+
+function cachedTask(queryClient: QueryClient, taskId: string): Task | undefined {
+  return (
+    queryClient.getQueryData<Task>(['tasks', taskId]) ??
+    queryClient.getQueryData<Task[]>(['tasks'])?.find((task) => task.id === taskId)
+  );
+}
+
+function conflictCurrentTask(error: ApiMutationError): Task | undefined {
+  const details = error.details as { current?: unknown } | undefined;
+  const current = details?.current;
+  if (
+    current &&
+    typeof current === 'object' &&
+    'id' in current &&
+    typeof (current as { id?: unknown }).id === 'string'
+  ) {
+    return current as Task;
+  }
+  return undefined;
+}
+
+export function isRevisionConflict(error: unknown): error is ApiMutationError {
+  return (
+    error instanceof Error &&
+    (error as ApiMutationError).code === 'CONFLICT' &&
+    typeof (error as ApiMutationError).details === 'object'
+  );
+}
+
+function handleRevisionConflict(
+  queryClient: QueryClient,
+  error: ApiMutationError,
+  taskId: string,
+  operation: TaskConflictOperation = 'task update'
+): boolean {
+  if (!isRevisionConflict(error)) {
+    return false;
+  }
+
+  const current = conflictCurrentTask(error);
+  if (current) {
+    patchTaskInCaches(queryClient, current);
+  }
+
+  queryClient.invalidateQueries({ queryKey: ['tasks'] });
+  queryClient.invalidateQueries({ queryKey: ['tasks', taskId] });
+
+  const knownTask = current ?? cachedTask(queryClient, taskId);
+  const taskTitle = knownTask?.title ?? taskId;
+  const recorded = recordTaskConflict({
+    taskId,
+    taskTitle,
+    currentTask: current,
+    operation,
+  });
+  if (recorded.isNewIdentity && !recorded.hasOpenSurface) {
+    toast({
+      id: taskConflictToastId(taskId),
+      title: 'Task updated before your change',
+      description: `The latest version of ${taskTitle} was loaded. Review the task before trying your ${operation} again.`,
+      action: createElement(
+        'button',
+        {
+          type: 'button',
+          className:
+            'rounded-md border border-current px-2.5 py-1.5 text-xs font-medium hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current',
+          'aria-label': `Review conflict for ${taskTitle}`,
+          onClick: () => openTaskConflict(taskId),
+        },
+        'Review task'
+      ),
+      variant: 'destructive',
+      duration: 10000,
+    });
+  }
+
+  return true;
+}
+
+/**
+ * Polling intervals based on WebSocket connection state.
+ * - Connected: 60s safety-net polling (WS delivers real-time updates)
+ * - Disconnected: 10s aggressive polling as fallback
+ */
+const POLL_INTERVAL_WS_CONNECTED = 60_000;
+const POLL_INTERVAL_WS_DISCONNECTED = 10_000;
+
+export function useTasks() {
+  const { isConnected } = useWebSocketStatus();
+
+  return useQuery({
+    queryKey: ['tasks'],
+    queryFn: api.tasks.list,
+    refetchInterval: isConnected ? POLL_INTERVAL_WS_CONNECTED : POLL_INTERVAL_WS_DISCONNECTED,
+    staleTime: isConnected ? 30_000 : 5_000,
+  });
+}
+
+/** Separate card projection cache; realtime invalidates the shared tasks prefix. */
+export function useBoardTasks() {
+  const { isConnected } = useWebSocketStatus();
+  const queryClient = useQueryClient();
+  const wasConnected = useRef(isConnected);
+  useEffect(() => {
+    if (isConnected && !wasConnected.current) {
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'board'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'search'] });
+    }
+    wasConnected.current = isConnected;
+  }, [isConnected, queryClient]);
+  return useQuery({
+    queryKey: ['tasks', 'board'],
+    retry: false,
+    queryFn: ({ signal }) => api.tasks.listBoard(signal),
+  });
+}
+
+export function useBoardSearch(search: string) {
+  return useQuery({
+    queryKey: ['tasks', 'search', search],
+    queryFn: ({ signal }) => api.tasks.searchIds(search, signal),
+    enabled: Boolean(search),
+  });
+}
+
+export function useArchivedTasks() {
+  return useQuery({
+    queryKey: ['tasks', 'archived'],
+    queryFn: api.tasks.listArchived,
+  });
+}
+
+export function useTask(id: string) {
+  return useQuery({
+    queryKey: ['tasks', id],
+    queryFn: () => api.tasks.get(id),
+    enabled: !!id,
+  });
+}
+
+export function useCreateTask() {
+  const queryClient = useQueryClient();
+  const { settings } = useFeatureSettings();
+  const boardColumns = normalizeBoardColumns(
+    settings.board?.columns ?? DEFAULT_FEATURE_SETTINGS.board.columns
+  );
+  const defaultStatus = normalizeBoardDefaultStatus(settings.board?.defaultStatus, boardColumns);
+
+  return useMutation({
+    mutationFn: (input: CreateTaskInput) => api.tasks.create(input),
+    // Optimistic update: immediately add a placeholder task
+    onMutate: async (input) => {
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ['tasks'] });
+
+      // Snapshot the previous value
+      const previousTasks = queryClient.getQueryData<Task[]>(['tasks']);
+
+      // Optimistically add new task with temporary ID
+      const optimisticTask: Task = {
+        id: `temp-${Date.now()}`,
+        title: input.title,
+        description: input.description || '',
+        type: (input.type || 'code') as Task['type'],
+        status: input.status ?? defaultStatus,
+        priority: input.priority || 'medium',
+        project: input.project,
+        sprint: input.sprint,
+        created: new Date().toISOString(),
+        updated: new Date().toISOString(),
+        subtasks: [],
+        comments: [],
+        reviewComments: [],
+      };
+
+      queryClient.setQueryData<Task[]>(['tasks'], (old) =>
+        old ? [optimisticTask, ...old] : [optimisticTask]
+      );
+
+      return { previousTasks };
+    },
+    // On error, rollback to previous value
+    onError: (_err, _input, context) => {
+      if (context?.previousTasks) {
+        queryClient.setQueryData(['tasks'], context.previousTasks);
+      }
+    },
+    // Always refetch to sync with server
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+    },
+  });
+}
+
+export function useUpdateTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string; input: UpdateTaskInput }) =>
+      api.tasks.update(id, input, cachedTaskRevision(queryClient, id)),
+    // On success, merge the server response with the current cache.
+    // Preserve timeTracking from the cache if it wasn't part of this update,
+    // since concurrent timer mutations (start/stop) may have already patched
+    // the cache with newer time tracking state. Without this, the debounced
+    // save response (which doesn't include timeTracking changes) would
+    // overwrite the timer stop/start that happened in between.
+    onSuccess: (serverTask, { input }) => {
+      resolveTaskConflict(serverTask.id, 'task update');
+      const mergeWithCachedTimeTracking = (cached: Task | undefined): Task => {
+        if (!cached || input.timeTracking !== undefined) {
+          // If this update explicitly included timeTracking, use server response as-is
+          return serverTask;
+        }
+        // Preserve the cached timeTracking (which may reflect a more recent timer mutation)
+        return { ...serverTask, timeTracking: cached.timeTracking };
+      };
+
+      queryClient.setQueryData<Task[]>(['tasks'], (old) =>
+        old ? old.map((t) => (t.id === serverTask.id ? mergeWithCachedTimeTracking(t) : t)) : old
+      );
+
+      const cachedTask = queryClient.getQueryData<Task>(['tasks', serverTask.id]);
+      queryClient.setQueryData(['tasks', serverTask.id], mergeWithCachedTimeTracking(cachedTask));
+      queryClient.setQueryData<BoardTask[]>(['tasks', 'board'], (old) =>
+        old?.map((task) =>
+          task.id === serverTask.id ? toBoardTask(mergeWithCachedTimeTracking(task)) : task
+        )
+      );
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'search'] });
+
+      // GH-87: Invalidate metrics cache if status changed to keep sidebar in sync.
+      // The sidebar relies on useMetrics() which has a 30s refetch interval + 10s staleTime.
+      // Without this, sidebar counts can lag behind the actual board state.
+      if (input.status) {
+        queryClient.invalidateQueries({ queryKey: ['metrics'] });
+        queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+      }
+    },
+    // Handle validation errors with detailed toast messages
+    onError: (error: Error & { code?: string; details?: unknown }, { id }) => {
+      if (handleRevisionConflict(queryClient, error, id)) {
+        return;
+      }
+
+      // Extract enforcement gate error details
+      const details = error.details as
+        Array<{ code: string; message: string; path: string[] }> | undefined;
+
+      // If this is an enforcement gate error, show a detailed toast
+      if (details && details.length > 0) {
+        const gateError = details[0];
+
+        // Map gate codes to user-friendly titles and actionable guidance
+        const gateInfo: Record<string, { title: string; guidance: string }> = {
+          REVIEW_GATE: {
+            title: '🔒 Review Gate Blocked',
+            guidance: 'Add all four review scores (10/10/10/10) before completing this task.',
+          },
+          CLOSING_COMMENTS_REQUIRED: {
+            title: '💬 Closing Comments Required',
+            guidance:
+              'Add a review comment with a deliverable summary (≥20 chars) before completing.',
+          },
+          DELIVERABLE_REQUIRED: {
+            title: '📦 Deliverable Required',
+            guidance: 'Attach at least one deliverable before marking this task as done.',
+          },
+          ORCHESTRATOR_DELEGATION: {
+            title: '🤖 Delegation Required',
+            guidance:
+              'Orchestrator should delegate this work to a sub-agent instead of doing it directly.',
+          },
+        };
+
+        const info = gateInfo[gateError.code];
+        const title = info?.title || '⚠️ Enforcement Gate';
+        const guidance = info?.guidance || '';
+
+        toast({
+          title,
+          description: `${gateError.message}${guidance ? `\n\n→ ${guidance}` : ''}`,
+          variant: 'destructive',
+          duration: 10000, // Longer duration for enforcement messages
+        });
+      } else {
+        // Generic error fallback
+        toast({
+          title: '❌ Update Failed',
+          description: error.message || 'An unexpected error occurred',
+          variant: 'destructive',
+        });
+      }
+    },
+    // NOTE: No general onSettled invalidation here. The onSuccess handler already
+    // patches the cache with the server response (preserving timer state).
+    // An aggressive invalidateQueries would trigger a background refetch
+    // whose response could overwrite timer state that was patched between
+    // the mutation start and the refetch completing. The WebSocket
+    // task:changed events and polling handle eventual consistency.
+    // Status-specific metrics invalidation is handled above (GH-87).
+  });
+}
+
+export function useMoveTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      id,
+      input,
+    }: {
+      id: string;
+      input: Omit<MoveTaskInput, 'expectedRevision' | 'updatedBy'>;
+    }) => api.tasks.move(id, input, cachedTaskRevision(queryClient, id) ?? 1),
+    retry: (failureCount, error) => {
+      const apiCode =
+        error && typeof error === 'object' && 'code' in error
+          ? (error as { code?: unknown }).code
+          : undefined;
+      const terminalCodes = new Set([
+        'CONFLICT',
+        'VALIDATION_ERROR',
+        'BAD_REQUEST',
+        'NOT_FOUND',
+        'AUTH_REQUIRED',
+        'FORBIDDEN',
+        'WRITE_FORBIDDEN',
+      ]);
+      return failureCount < 1 && (typeof apiCode !== 'string' || !terminalCodes.has(apiCode));
+    },
+    retryDelay: 100,
+    onSuccess: ({ task }) => {
+      patchTaskInCaches(queryClient, task);
+      queryClient.invalidateQueries({ queryKey: ['metrics'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+      queryClient.invalidateQueries({ queryKey: ['activities'] });
+      queryClient.invalidateQueries({ queryKey: ['activity-feed'] });
+      queryClient.invalidateQueries({ queryKey: ['activity'] });
+    },
+    onError: (error: unknown, { id }) => {
+      if (isRevisionConflict(error)) {
+        const current = conflictCurrentTask(error);
+        if (current) patchTaskInCaches(queryClient, current);
+        queryClient.invalidateQueries({ queryKey: ['tasks'] });
+        queryClient.invalidateQueries({ queryKey: ['tasks', id] });
+        toast({
+          title: 'Move not saved',
+          description: current
+            ? `${current.title} changed before the move was committed. The latest task is loaded.`
+            : 'The task changed before the move was committed. Reload and try again.',
+          variant: 'destructive',
+          duration: 10000,
+        });
+        return;
+      }
+
+      toast({
+        title: 'Move failed',
+        description:
+          error instanceof Error ? error.message : 'The task stayed in its original position.',
+        variant: 'destructive',
+      });
+    },
+  });
+}
+
+export function useDeleteTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => api.tasks.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+    },
+  });
+}
+
+export function useArchiveTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => api.tasks.archive(id),
+    onMutate: async (id: string) => {
+      // Cancel outgoing refetches so they don't overwrite our optimistic update
+      await queryClient.cancelQueries({ queryKey: ['tasks'] });
+
+      // Snapshot previous value for rollback
+      const previous = queryClient.getQueryData<Task[]>(['tasks']);
+
+      // Optimistically remove the task from the board immediately
+      if (previous) {
+        queryClient.setQueryData<Task[]>(
+          ['tasks'],
+          previous.filter((t) => t.id !== id)
+        );
+      }
+
+      return { previous };
+    },
+    onError: (_err, _id, context) => {
+      // Roll back on failure
+      if (context?.previous) {
+        queryClient.setQueryData(['tasks'], context.previous);
+      }
+    },
+    onSettled: () => {
+      // Always refetch after mutation settles to ensure consistency
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'archived'] });
+      queryClient.invalidateQueries({ queryKey: ['metrics'] });
+      queryClient.invalidateQueries({ queryKey: ['activity'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+    },
+  });
+}
+
+export function useBulkArchive() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (sprint: string) => api.tasks.bulkArchive(sprint),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'archived'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+    },
+  });
+}
+
+export function useBulkUpdate() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ ids, status }: { ids: string[]; status: Task['status'] }) =>
+      api.tasks.bulkUpdate(ids, status),
+    onMutate: async ({ ids, status }) => {
+      // Cancel outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ['tasks'] });
+
+      // Snapshot previous value
+      const previous = queryClient.getQueryData<Task[]>(['tasks']);
+
+      // Optimistically update tasks
+      if (previous) {
+        queryClient.setQueryData<Task[]>(
+          ['tasks'],
+          previous.map((t) => (ids.includes(t.id) ? { ...t, status } : t))
+        );
+      }
+
+      return { previous };
+    },
+    onError: (_err, _vars, context) => {
+      // Rollback on error
+      if (context?.previous) {
+        queryClient.setQueryData(['tasks'], context.previous);
+      }
+    },
+    onSettled: () => {
+      // Single batch of cache invalidations (not per-task)
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['metrics'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+      queryClient.invalidateQueries({ queryKey: ['activity'] });
+    },
+  });
+}
+
+export function useBulkArchiveByIds() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (ids: string[]) => api.tasks.bulkArchiveByIds(ids),
+    onMutate: async (ids: string[]) => {
+      // Cancel outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ['tasks'] });
+
+      // Snapshot previous value
+      const previous = queryClient.getQueryData<Task[]>(['tasks']);
+
+      // Optimistically remove tasks from board
+      if (previous) {
+        queryClient.setQueryData<Task[]>(
+          ['tasks'],
+          previous.filter((t) => !ids.includes(t.id))
+        );
+      }
+
+      return { previous };
+    },
+    onError: (_err, _ids, context) => {
+      // Rollback on error
+      if (context?.previous) {
+        queryClient.setQueryData(['tasks'], context.previous);
+      }
+    },
+    onSettled: () => {
+      // Single batch of cache invalidations (not per-task)
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'archived'] });
+      queryClient.invalidateQueries({ queryKey: ['metrics'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+      queryClient.invalidateQueries({ queryKey: ['activity'] });
+    },
+  });
+}
+
+export function useRestoreTask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) => api.tasks.restore(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'archived'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+    },
+  });
+}
+
+export function useAddSubtask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      title,
+      acceptanceCriteria,
+    }: {
+      taskId: string;
+      title: string;
+      acceptanceCriteria?: string[];
+    }) => api.tasks.addSubtask(taskId, title, acceptanceCriteria),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useUpdateSubtask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      subtaskId,
+      updates,
+    }: {
+      taskId: string;
+      subtaskId: string;
+      updates: { title?: string; completed?: boolean };
+    }) => api.tasks.updateSubtask(taskId, subtaskId, updates),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useDeleteSubtask() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ taskId, subtaskId }: { taskId: string; subtaskId: string }) =>
+      api.tasks.deleteSubtask(taskId, subtaskId),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useToggleSubtaskCriteria() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      subtaskId,
+      criteriaIndex,
+    }: {
+      taskId: string;
+      subtaskId: string;
+      criteriaIndex: number;
+    }) => api.tasks.toggleSubtaskCriteria(taskId, subtaskId, criteriaIndex),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useAddVerificationStep() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ taskId, description }: { taskId: string; description: string }) =>
+      api.tasks.addVerificationStep(taskId, description),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useUpdateVerificationStep() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      stepId,
+      updates,
+    }: {
+      taskId: string;
+      stepId: string;
+      updates: { description?: string; checked?: boolean };
+    }) => api.tasks.updateVerificationStep(taskId, stepId, updates),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useDeleteVerificationStep() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ taskId, stepId }: { taskId: string; stepId: string }) =>
+      api.tasks.deleteVerificationStep(taskId, stepId),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useAddComment() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ taskId, author, text }: { taskId: string; author: string; text: string }) =>
+      api.tasks.addComment(taskId, author, text, cachedTaskRevision(queryClient, taskId)),
+    onSuccess: (task) => {
+      resolveTaskConflict(task.id, 'comment change');
+      patchTaskInCaches(queryClient, task);
+    },
+    onError: (error, { taskId }) => {
+      handleRevisionConflict(queryClient, error as ApiMutationError, taskId, 'comment change');
+    },
+  });
+}
+
+export function useEditComment() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      commentId,
+      text,
+    }: {
+      taskId: string;
+      commentId: string;
+      text: string;
+    }) => api.tasks.editComment(taskId, commentId, text, cachedTaskRevision(queryClient, taskId)),
+    onSuccess: (task) => {
+      resolveTaskConflict(task.id, 'comment change');
+      patchTaskInCaches(queryClient, task);
+    },
+    onError: (error, { taskId }) => {
+      handleRevisionConflict(queryClient, error as ApiMutationError, taskId, 'comment change');
+    },
+  });
+}
+
+export function useDeleteComment() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ taskId, commentId }: { taskId: string; commentId: string }) =>
+      api.tasks.deleteComment(taskId, commentId, cachedTaskRevision(queryClient, taskId)),
+    onSuccess: (task) => {
+      resolveTaskConflict(task.id, 'comment change');
+      patchTaskInCaches(queryClient, task);
+    },
+    onError: (error, { taskId }) => {
+      handleRevisionConflict(queryClient, error as ApiMutationError, taskId, 'comment change');
+    },
+  });
+}
+
+export function useAddObservation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      taskId,
+      data,
+    }: {
+      taskId: string;
+      data: {
+        type: 'decision' | 'blocker' | 'insight' | 'context';
+        content: string;
+        score?: number;
+        agent?: string;
+      };
+    }) => api.tasks.addObservation(taskId, data),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useDeleteObservation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ taskId, observationId }: { taskId: string; observationId: string }) =>
+      api.tasks.deleteObservation(taskId, observationId),
+    onSuccess: (task) => {
+      patchTaskInCaches(queryClient, task);
+    },
+  });
+}
+
+export function useReorderTasks() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (orderedIds: string[]) => api.tasks.reorder(orderedIds),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+    },
+  });
+}
+
+export function useTasksByStatus(
+  tasks: Task[] | undefined,
+  columns?: BoardColumnConfig[]
+): Record<string, Task[]> {
+  return useMemo(() => {
+    const statuses = normalizeBoardColumns(columns ?? DEFAULT_FEATURE_SETTINGS.board.columns).map(
+      (column) => column.id
+    );
+    const grouped = Object.fromEntries(statuses.map((status) => [status, [] as Task[]])) as Record<
+      string,
+      Task[]
+    >;
+
+    for (const task of tasks ?? []) {
+      if (!grouped[task.status]) {
+        grouped[task.status] = [];
+      }
+      grouped[task.status].push(task);
+    }
+
+    for (const status of Object.keys(grouped)) {
+      grouped[status] = sortTasksByBoardPosition(grouped[status]);
+    }
+
+    return grouped;
+  }, [tasks, columns]);
+}
+
+// A shared snapshot index avoids scanning the whole board for every card.
+export type TaskDependencyIndex = ReadonlyMap<string, Task>;
+
+export function isTaskBlocked(task: Task, allTasks: Task[] | TaskDependencyIndex): boolean {
+  return getTaskBlockers(task, allTasks).length > 0;
+}
+
+export function getTaskBlockers(task: Task, allTasks: Task[] | TaskDependencyIndex): Task[] {
+  if (!task.blockedBy?.length) return [];
+  if (Array.isArray(allTasks)) {
+    const ids = new Set(task.blockedBy);
+    return allTasks.filter((candidate) => ids.has(candidate.id) && candidate.status !== 'done');
+  }
+  return [...new Set(task.blockedBy)].flatMap((id) => {
+    const blocker = allTasks.get(id);
+    return blocker && blocker.status !== 'done' ? [blocker] : [];
+  });
+}
+
+// Archive suggestions - sprints where all tasks are done
+export function useArchiveSuggestions() {
+  const { isConnected } = useWebSocketStatus();
+
+  return useQuery({
+    queryKey: ['tasks', 'archive-suggestions'],
+    queryFn: api.tasks.getArchiveSuggestions,
+    // When WS is connected, task:changed events trigger invalidation anyway
+    refetchInterval: isConnected ? 120_000 : 30_000,
+  });
+}
+
+export function useArchiveSprint() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (sprint: string) => api.tasks.archiveSprint(sprint),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'archived'] });
+      queryClient.invalidateQueries({ queryKey: ['tasks', 'archive-suggestions'] });
+      queryClient.invalidateQueries({ queryKey: ['task-counts'] });
+    },
+  });
+}

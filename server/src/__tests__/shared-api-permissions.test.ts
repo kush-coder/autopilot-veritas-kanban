@@ -1,0 +1,219 @@
+import { describe, expect, it } from 'vitest';
+
+import { getApiPermissionRequirement } from '../../../shared/src/utils/api-permissions.js';
+
+describe('shared API permission metadata', () => {
+  it('keeps admission inspection agent-scoped and mutations admin-scoped', () => {
+    expect(getApiPermissionRequirement('/api/v1/admission').permissions).toEqual(['agent:read']);
+    expect(getApiPermissionRequirement('/api/admission', { method: 'POST' }).permissions).toEqual([
+      'admin:manage',
+    ]);
+  });
+
+  it('requires agent write permission for local agent start and stop routes', () => {
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/start', { method: 'POST' }).permissions
+    ).toEqual(['agent:write']);
+    expect(
+      getApiPermissionRequirement('/api/v1/agents/task_1/stop', { method: 'POST' }).permissions
+    ).toEqual(['agent:write']);
+  });
+
+  it('keeps launch-manifest preview read-scoped', () => {
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/launch-preview', { method: 'POST' })
+        .permissions
+    ).toEqual(['agent:read']);
+  });
+
+  it('keeps workspace trust scans read-scoped and decisions admin-scoped', () => {
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/workspace-trust', {
+        method: 'GET',
+      }).permissions
+    ).toEqual(['agent:read']);
+    for (const action of ['decisions', 'revoke']) {
+      expect(
+        getApiPermissionRequirement(`/api/agents/task_1/workspace-trust/${action}`, {
+          method: 'POST',
+        }).permissions
+      ).toEqual(['admin:manage']);
+    }
+  });
+
+  it('keeps phase reads agent-scoped and transition requests task-write scoped', () => {
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/phase', { method: 'GET' }).permissions
+    ).toEqual(['agent:read']);
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/access', { method: 'GET' }).permissions
+    ).toEqual(['agent:read']);
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/phase/transitions', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['task:write']);
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/access/changes/preview', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['agent:read']);
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/access/changes', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['task:write']);
+  });
+
+  it('separates conversation steering from lifecycle mutation authority', () => {
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/conversation/steer', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['task:write']);
+    for (const action of [
+      'resume',
+      'follow-up',
+      'fork',
+      'interrupt',
+      'compact',
+      'archive',
+      'close',
+    ]) {
+      expect(
+        getApiPermissionRequirement(`/api/v1/agents/task_1/conversation/${action}`, {
+          method: 'POST',
+        }).permissions
+      ).toEqual(['agent:write']);
+    }
+  });
+
+  it('requires agent write permission for workspace checkpoint rewind', () => {
+    expect(
+      getApiPermissionRequirement('/api/agents/task_1/workspace/checkpoints/rewind', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['agent:write']);
+  });
+
+  it('keeps knowledge collection reads and writes under work-product permissions', () => {
+    expect(getApiPermissionRequirement('/api/knowledge/collections').permissions).toEqual([
+      'work_product:read',
+    ]);
+    expect(
+      getApiPermissionRequirement('/api/v1/knowledge/collections', { method: 'POST' }).permissions
+    ).toEqual(['work_product:write']);
+  });
+
+  it('reserves physical file Work Product purge for administrators', () => {
+    expect(
+      getApiPermissionRequirement('/api/v1/work-products/wp_123/artifact', {
+        method: 'DELETE',
+      }).permissions
+    ).toEqual(['admin:manage']);
+    expect(
+      getApiPermissionRequirement('/api/work-products/wp_123', { method: 'DELETE' }).permissions
+    ).toEqual(['work_product:write']);
+    expect(
+      getApiPermissionRequirement('/api/v1/work-products/wp_123/artifact/preview/audit', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['work_product:read']);
+  });
+
+  it('requires workflow execution for Codex review diff posts', () => {
+    expect(
+      getApiPermissionRequirement('/api/diff/task_1/codex-review', { method: 'POST' }).permissions
+    ).toEqual(['workflow:execute']);
+  });
+
+  it('keeps ceremony API under workflow read and write permissions', () => {
+    expect(getApiPermissionRequirement('/api/ceremonies').permissions).toEqual(['workflow:read']);
+    expect(
+      getApiPermissionRequirement('/api/ceremonies/ceremony_1/complete', { method: 'POST' })
+        .permissions
+    ).toEqual(['workflow:write']);
+  });
+
+  it('keeps reflection API under workflow read and write permissions', () => {
+    expect(getApiPermissionRequirement('/api/reflections').permissions).toEqual(['workflow:read']);
+    expect(
+      getApiPermissionRequirement('/api/reflections/reflection_1/accept', { method: 'POST' })
+        .permissions
+    ).toEqual(['workflow:write']);
+  });
+
+  it('keeps diff reads task-read scoped', () => {
+    expect(getApiPermissionRequirement('/api/diff/task_1/full').permissions).toEqual(['task:read']);
+  });
+
+  it('normalizes v1 diff paths before checking permissions', () => {
+    expect(
+      getApiPermissionRequirement('/api/v1/diff/task_1/codex-review', { method: 'POST' })
+        .permissions
+    ).toEqual(['workflow:execute']);
+  });
+
+  it('separates sandbox policy validation from preset mutations', () => {
+    expect(
+      getApiPermissionRequirement('/api/sandbox-policies/validate', { method: 'POST' }).permissions
+    ).toEqual(['policy:read', 'agent:read']);
+    expect(
+      getApiPermissionRequirement('/api/sandbox-policies', { method: 'POST' }).permissions
+    ).toEqual(['policy:write']);
+  });
+
+  it('keeps credential broker definitions admin-scoped', () => {
+    expect(getApiPermissionRequirement('/api/credential-broker').permissions).toEqual([
+      'admin:manage',
+    ]);
+    expect(
+      getApiPermissionRequirement('/api/v1/credential-broker/github-token', {
+        method: 'PUT',
+      }).permissions
+    ).toEqual(['admin:manage']);
+  });
+
+  it('separates tool-server administration from run-scoped reads and calls', () => {
+    expect(getApiPermissionRequirement('/api/tool-servers').permissions).toEqual(['settings:read']);
+    expect(
+      getApiPermissionRequirement('/api/tool-servers/fixture', { method: 'PUT' }).permissions
+    ).toEqual(['admin:manage']);
+    expect(
+      getApiPermissionRequirement('/api/v1/tool-servers/runs/task_1/attempt_1/catalog').permissions
+    ).toEqual(['agent:read']);
+    expect(
+      getApiPermissionRequirement('/api/tool-servers/call', { method: 'POST' }).permissions
+    ).toEqual(['agent:write']);
+  });
+
+  it('separates run-terminal observation from control', () => {
+    expect(
+      getApiPermissionRequirement('/api/v1/run-terminals/runs/task_1/attempt_1').permissions
+    ).toEqual(['agent:read']);
+    expect(
+      getApiPermissionRequirement('/api/run-terminals/runs/task_1/attempt_1/wait-any', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['agent:write']);
+    expect(
+      getApiPermissionRequirement('/api/v1/run-terminals/runs/task_1/attempt_1/execute', {
+        method: 'POST',
+      }).permissions
+    ).toEqual(['agent:write']);
+  });
+});
+
+describe('case-insensitive API permission metadata', () => {
+  it.each([
+    ['/API/V1/WORK-PRODUCTS/wp_MixedCase/ARTIFACT', 'DELETE', 'admin:manage'],
+    ['/api/work-products/wp_MixedCase/ArTiFaCt/', 'DELETE', 'admin:manage'],
+    ['/API/DIFF/task_MixedCase/CODEX-REVIEW', 'POST', 'workflow:execute'],
+    ['/api/v1/diff/task_MixedCase/CoDeX-ReViEw/', 'POST', 'workflow:execute'],
+    ['/api/work-products/wp_MixedCase/ARTIFACT/PREVIEW/AUDIT', 'POST', 'work_product:read'],
+  ])('matches server permissions for %s', (path, method, permission) => {
+    const requirement = getApiPermissionRequirement(path, { method });
+    expect(requirement.permissions).toEqual([permission]);
+    expect(requirement.path).toContain('MixedCase');
+  });
+});

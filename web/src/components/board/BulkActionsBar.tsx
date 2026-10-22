@@ -1,0 +1,396 @@
+import { useState, useMemo } from 'react';
+import { X, Trash2, Archive, ArrowRight, Inbox } from 'lucide-react';
+import { ActionIcon, Button, Select, Text } from '@mantine/core';
+import { UiModal, OverlayFooter } from '@/components/ui/UiOverlay';
+import { UiAction } from '@/components/ui/UiVocabulary';
+import { useToast } from '@/hooks/useToast';
+import { useBulkActions } from '@/hooks/useBulkActions';
+import { useDeleteTask, useBulkUpdate, useBulkArchiveByIds } from '@/hooks/useTasks';
+import { useBulkDemote } from '@/hooks/useBacklog';
+import { useFeatureSettings } from '@/hooks/useFeatureSettings';
+import { cn } from '@/lib/utils';
+import {
+  DEFAULT_FEATURE_SETTINGS,
+  normalizeBoardColumns,
+  type BoardColumnConfig,
+  type Task,
+  type TaskStatus,
+} from '@veritas-kanban/shared';
+
+const STATUS_BUTTON_COLORS: Record<string, { color: string; activeColor: string }> = {
+  todo: {
+    color: 'border-slate-400 text-slate-600',
+    activeColor: 'bg-slate-500 text-white border-slate-500',
+  },
+  'in-progress': {
+    color: 'border-blue-400 text-blue-600',
+    activeColor: 'bg-blue-500 text-white border-blue-500',
+  },
+  blocked: {
+    color: 'border-red-400 text-red-600',
+    activeColor: 'bg-red-500 text-white border-red-500',
+  },
+  done: {
+    color: 'border-green-400 text-green-600',
+    activeColor: 'bg-green-500 text-white border-green-500',
+  },
+};
+
+const DEFAULT_STATUS_BUTTON_COLOR = {
+  color: 'border-primary/60 text-primary',
+  activeColor: 'bg-primary text-primary-foreground border-primary',
+};
+
+interface BulkActionsBarProps {
+  tasks: Task[];
+}
+
+export function BulkActionsBar({ tasks }: BulkActionsBarProps) {
+  const { selectedIds, isSelecting, toggleSelecting, selectAll, toggleGroup, clearSelection } =
+    useBulkActions();
+  const { toast } = useToast();
+  const { settings } = useFeatureSettings();
+  const columns = useMemo<BoardColumnConfig[]>(
+    () => normalizeBoardColumns(settings.board?.columns ?? DEFAULT_FEATURE_SETTINGS.board.columns),
+    [settings.board?.columns]
+  );
+  const moveStatusOptions = useMemo(
+    () => columns.map((column) => ({ value: column.id, label: column.title })),
+    [columns]
+  );
+
+  const bulkUpdate = useBulkUpdate();
+  const deleteTask = useDeleteTask();
+  const bulkArchiveByIds = useBulkArchiveByIds();
+  const bulkDemote = useBulkDemote();
+
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [moveTarget, setMoveTarget] = useState<TaskStatus | null>(null);
+
+  // Group task IDs by status
+  const taskIdsByStatus = useMemo(() => {
+    const map: Record<string, string[]> = Object.fromEntries(
+      columns.map((column) => [column.id, [] as string[]])
+    );
+    for (const task of tasks) {
+      if (map[task.status]) {
+        map[task.status].push(task.id);
+      }
+    }
+    return map;
+  }, [columns, tasks]);
+
+  const allTaskIds = useMemo(() => tasks.map((t) => t.id), [tasks]);
+  const selectedCount = selectedIds.size;
+  const allSelected = selectedCount === allTaskIds.length && allTaskIds.length > 0;
+
+  const handleSelectAll = () => {
+    if (allSelected) {
+      clearSelection();
+    } else {
+      selectAll(allTaskIds);
+    }
+  };
+
+  /** Check if all tasks of a given status are selected */
+  const isStatusFullySelected = (status: TaskStatus): boolean => {
+    const ids = taskIdsByStatus[status];
+    return ids.length > 0 && ids.every((id) => selectedIds.has(id));
+  };
+
+  /** Check if some (but not all) tasks of a given status are selected */
+  const isStatusPartiallySelected = (status: TaskStatus): boolean => {
+    const ids = taskIdsByStatus[status];
+    if (ids.length === 0) return false;
+    const someSelected = ids.some((id) => selectedIds.has(id));
+    const allSelectedInGroup = ids.every((id) => selectedIds.has(id));
+    return someSelected && !allSelectedInGroup;
+  };
+
+  const handleMoveToStatus = async () => {
+    if (!moveTarget) return;
+    setIsProcessing(true);
+    try {
+      const ids = Array.from(selectedIds);
+      const result = await bulkUpdate.mutateAsync({
+        ids,
+        status: moveTarget,
+      });
+
+      if (result.failed.length > 0) {
+        toast({
+          variant: 'default',
+          title: 'Partial Success',
+          description: `Moved ${result.updated.length} of ${ids.length} tasks. ${result.failed.length} failed.`,
+        });
+      } else {
+        toast({
+          variant: 'default',
+          title: 'Success',
+          description: `Moved ${result.updated.length} task${result.updated.length !== 1 ? 's' : ''}.`,
+        });
+      }
+
+      clearSelection();
+      setMoveTarget(null);
+    } catch (error) {
+      const err = error as Error & { details?: Array<{ code: string; message: string }> };
+      const gateDetail = err.details?.[0];
+      toast({
+        variant: 'destructive',
+        title: gateDetail ? `⚠️ Enforcement: ${gateDetail.code}` : 'Move Failed',
+        description: gateDetail?.message || 'Failed to move selected tasks.',
+        duration: gateDetail ? 10000 : 5000,
+      });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleArchiveSelected = async () => {
+    setIsProcessing(true);
+    const taskIds = Array.from(selectedIds);
+
+    try {
+      const result = await bulkArchiveByIds.mutateAsync(taskIds);
+
+      if (result.failed.length > 0 && result.archived.length > 0) {
+        toast({
+          variant: 'default',
+          title: 'Partial Archive',
+          description: `Archived ${result.archived.length} of ${taskIds.length} tasks. ${result.failed.length} failed.`,
+        });
+      } else if (result.failed.length > 0) {
+        toast({
+          variant: 'destructive',
+          title: 'Archive Failed',
+          description: `Failed to archive all ${taskIds.length} selected tasks.`,
+        });
+      } else {
+        toast({
+          variant: 'default',
+          title: 'Success',
+          description: `Archived ${result.archived.length} task${result.archived.length !== 1 ? 's' : ''}.`,
+        });
+      }
+
+      clearSelection();
+    } catch {
+      toast({
+        variant: 'destructive',
+        title: 'Archive Failed',
+        description: 'Failed to archive selected tasks.',
+      });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleMoveToBacklog = async () => {
+    setIsProcessing(true);
+    const taskIds = Array.from(selectedIds);
+
+    try {
+      const result = await bulkDemote.mutateAsync(taskIds);
+
+      if (result.failed.length > 0 && result.demoted.length > 0) {
+        toast({
+          variant: 'default',
+          title: 'Partial Success',
+          description: `Moved ${result.demoted.length} of ${taskIds.length} tasks to backlog. ${result.failed.length} failed.`,
+        });
+      } else if (result.failed.length > 0) {
+        toast({
+          variant: 'destructive',
+          title: 'Move Failed',
+          description: `Failed to move all ${taskIds.length} selected tasks.`,
+        });
+      } else {
+        toast({
+          variant: 'default',
+          title: 'Success',
+          description: `Moved ${result.demoted.length} task${result.demoted.length !== 1 ? 's' : ''} to backlog.`,
+        });
+      }
+
+      clearSelection();
+    } catch {
+      toast({
+        variant: 'destructive',
+        title: 'Move Failed',
+        description: 'Failed to move selected tasks to backlog.',
+      });
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleDeleteSelected = async () => {
+    setIsProcessing(true);
+    try {
+      await Promise.all(Array.from(selectedIds).map((id) => deleteTask.mutateAsync(id)));
+      clearSelection();
+    } finally {
+      setIsProcessing(false);
+      setShowDeleteConfirm(false);
+    }
+  };
+
+  if (!isSelecting) {
+    return null;
+  }
+
+  return (
+    <>
+      <div
+        className="flex items-center justify-between gap-4 mb-4 p-3 rounded-lg bg-muted/50 border"
+        role="toolbar"
+        aria-label="Bulk actions"
+      >
+        <div className="flex items-center gap-3">
+          <ActionIcon
+            aria-label="Exit selection mode"
+            variant="subtle"
+            size="sm"
+            onClick={toggleSelecting}
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </ActionIcon>
+
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleSelectAll}
+            aria-label={allSelected ? 'Deselect all tasks' : 'Select all tasks'}
+          >
+            {allSelected ? 'Deselect All' : 'Select All'}
+          </Button>
+
+          {/* Status filter buttons */}
+          <div className="flex items-center gap-1.5 ml-1">
+            {columns.map(({ id, title }) => {
+              const colors = STATUS_BUTTON_COLORS[id] ?? DEFAULT_STATUS_BUTTON_COLOR;
+              const count = taskIdsByStatus[id]?.length ?? 0;
+              if (count === 0) return null;
+              const fullySelected = isStatusFullySelected(id);
+              const partiallySelected = isStatusPartiallySelected(id);
+              return (
+                <Button
+                  key={id}
+                  variant="outline"
+                  size="xs"
+                  onClick={() => toggleGroup(taskIdsByStatus[id] ?? [])}
+                  className={cn(
+                    'text-xs h-7 px-2 border transition-colors',
+                    fullySelected
+                      ? colors.activeColor
+                      : partiallySelected
+                        ? `${colors.color} opacity-70`
+                        : colors.color
+                  )}
+                  aria-label={`Select all ${title} tasks (${count})`}
+                  aria-pressed={fullySelected}
+                >
+                  {title} ({count})
+                </Button>
+              );
+            })}
+          </div>
+
+          <span className="text-sm text-muted-foreground ml-1">{selectedCount} selected</span>
+        </div>
+
+        {selectedCount > 0 && (
+          <div className="flex items-center gap-2">
+            {/* Move to status — two-step: pick target → confirm */}
+            <Select
+              value={moveTarget}
+              onChange={(value) => setMoveTarget(value as TaskStatus | null)}
+              disabled={isProcessing}
+              data={moveStatusOptions}
+              aria-label="Move selected tasks to status"
+              placeholder="Move to..."
+              className="w-[140px]"
+              leftSection={<ArrowRight className="h-4 w-4" aria-hidden="true" />}
+              clearable
+            />
+
+            {moveTarget && (
+              <Button
+                variant="filled"
+                size="sm"
+                onClick={handleMoveToStatus}
+                disabled={isProcessing}
+                leftSection={<ArrowRight className="h-4 w-4" aria-hidden="true" />}
+              >
+                {isProcessing ? 'Moving...' : 'Move'}
+              </Button>
+            )}
+
+            {/* Move to Backlog */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleMoveToBacklog}
+              disabled={isProcessing}
+              leftSection={<Inbox className="h-4 w-4" aria-hidden="true" />}
+            >
+              To Backlog
+            </Button>
+
+            {/* Archive */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleArchiveSelected}
+              disabled={isProcessing}
+              leftSection={<Archive className="h-4 w-4" aria-hidden="true" />}
+            >
+              Archive
+            </Button>
+
+            {/* Delete */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowDeleteConfirm(true)}
+              disabled={isProcessing}
+              className="text-destructive hover:text-destructive"
+              leftSection={<Trash2 className="h-4 w-4" aria-hidden="true" />}
+            >
+              Delete
+            </Button>
+          </div>
+        )}
+      </div>
+
+      <UiModal
+        opened={showDeleteConfirm}
+        onClose={() => setShowDeleteConfirm(false)}
+        title={`Delete ${selectedCount} task${selectedCount !== 1 ? 's' : ''}?`}
+        variant="confirm"
+        compound
+      >
+        <div className="vk-overlay-scroll">
+          <Text size="sm" c="dimmed">
+            This action cannot be undone. The selected tasks will be permanently deleted.
+          </Text>
+        </div>
+        <OverlayFooter>
+          <UiAction
+            variant="quiet"
+            data-autofocus
+            onClick={() => setShowDeleteConfirm(false)}
+            disabled={isProcessing}
+          >
+            Cancel
+          </UiAction>
+          <UiAction onClick={handleDeleteSelected} disabled={isProcessing} variant="destructive">
+            {isProcessing ? 'Deleting...' : 'Delete'}
+          </UiAction>
+        </OverlayFooter>
+      </UiModal>
+    </>
+  );
+}

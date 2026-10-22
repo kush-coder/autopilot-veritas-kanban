@@ -1,0 +1,68 @@
+import * as React from 'react';
+import { Badge as MantineBadge, type BadgeProps as MantineBadgeProps } from '@mantine/core';
+import { cva, type VariantProps } from 'class-variance-authority';
+
+import { SlotRoot } from '@/components/ui/slot';
+import { cn } from '@/lib/utils';
+
+const badgeVariants = cva(
+  'group/badge inline-flex h-5 w-fit shrink-0 items-center justify-center gap-1 overflow-hidden rounded-4xl border border-transparent px-2 py-0.5 text-xs font-medium whitespace-nowrap transition-colors focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&>svg]:pointer-events-none [&>svg]:size-3!',
+  {
+    variants: {
+      variant: {
+        default: 'bg-primary-action text-primary-foreground [a]:hover:bg-primary-action-hover',
+        secondary: 'bg-secondary text-secondary-foreground [a]:hover:bg-secondary/80',
+        destructive:
+          'bg-destructive/10 text-destructive focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:focus-visible:ring-destructive/40 [a]:hover:bg-destructive/20',
+        outline: 'border-border text-foreground [a]:hover:bg-muted [a]:hover:text-muted-foreground',
+        ghost: 'hover:bg-muted hover:text-muted-foreground dark:hover:bg-muted/50',
+        link: 'text-primary underline-offset-4 hover:underline',
+      },
+    },
+    defaultVariants: {
+      variant: 'default',
+    },
+  }
+);
+
+const mantineBadgeVariant = {
+  default: 'filled',
+  secondary: 'light',
+  destructive: 'light',
+  outline: 'outline',
+  ghost: 'transparent',
+  link: 'transparent',
+} as const satisfies Record<
+  NonNullable<VariantProps<typeof badgeVariants>['variant']>,
+  MantineBadgeProps['variant']
+>;
+
+function Badge({
+  className,
+  variant = 'default',
+  asChild = false,
+  ...props
+}: React.ComponentProps<'span'> & VariantProps<typeof badgeVariants> & { asChild?: boolean }) {
+  const resolvedVariant = variant ?? 'default';
+  const classes = cn(badgeVariants({ variant: resolvedVariant }), className);
+  const color = resolvedVariant === 'destructive' ? 'red' : undefined;
+
+  if (asChild) {
+    return (
+      <SlotRoot data-slot="badge" data-variant={resolvedVariant} className={classes} {...props} />
+    );
+  }
+
+  return (
+    <MantineBadge
+      data-slot="badge"
+      data-variant={resolvedVariant}
+      variant={mantineBadgeVariant[resolvedVariant]}
+      color={color}
+      className={classes}
+      {...(props as Omit<MantineBadgeProps, 'ref'>)}
+    />
+  );
+}
+
+export { Badge, badgeVariants };

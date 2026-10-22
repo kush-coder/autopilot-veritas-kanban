@@ -1,0 +1,776 @@
+import { Buffer } from 'node:buffer';
+import type {
+  AgentBudgetPolicy,
+  ExecutableAgentProvider,
+  HarnessSupportStatus,
+  ProviderRuntimeManifest,
+  RunLaunchInstructionReference,
+  RunLaunchManifest,
+  RunLaunchManifestBlocker,
+  RunLaunchCredentialPlan,
+  RunLaunchManifestDriftResult,
+  RunLaunchManifestInstructionKind,
+  RunLaunchManifestOrigin,
+  RunLaunchPermissions,
+  RunLaunchProfileReference,
+  RunLaunchResources,
+  RunToolCatalog,
+  RunLaunchRouting,
+  RunLaunchRuntime,
+  RunLaunchTools,
+  RunLaunchFilesystemSandboxEvidence,
+  RunLaunchPhaseAuthority,
+  SandboxPolicyDryRunResult,
+  TaskEnvelope,
+  TaskReadinessSummary,
+  WorkspaceExecutionTrustEvaluation,
+} from '@veritas-kanban/shared';
+import {
+  RUN_LAUNCH_MANIFEST_SCHEMA_VERSION,
+  WORKSPACE_EXECUTION_TRUST_POLICY_VERSION,
+} from '@veritas-kanban/shared';
+import { ConflictError, ValidationError } from '../middleware/error-handler.js';
+import { parseProviderRuntimeManifest } from '../schemas/provider-runtime-manifest-schemas.js';
+import { parseRunLaunchManifest } from '../schemas/run-launch-manifest-schemas.js';
+import { runToolCatalogSchema } from '../schemas/tool-control-plane-schemas.js';
+import {
+  calculateRunLaunchManifestDigest,
+  digestRunLaunchValue,
+} from '../utils/run-launch-manifest-digest.js';
+import { sanitizeProviderRuntimeDiagnostic } from '../utils/provider-runtime-manifest-sanitize.js';
+import { calculateRunToolCatalogDigest } from '../utils/tool-control-plane-digest.js';
+import { compileProviderLaunchCredentialPlan } from './provider-launch-credential-plan-service.js';
+import { runToolBridgeSupport, runToolCatalogRequiresBridge } from './run-tool-bridge-service.js';
+
+export interface RunLaunchManifestInstructionInput {
+  id: string;
+  kind: RunLaunchManifestInstructionKind;
+  content: string;
+  materialContent?: string;
+  origin: string;
+  precedence: number;
+}
+
+export interface RunLaunchManifestCompileInput {
+  taskId: string;
+  attemptId: string;
+  createdAt?: string;
+  taskEnvelope: TaskEnvelope;
+  providerRuntimeManifest: ProviderRuntimeManifest;
+  requiredRuntimeCapabilities?: string[];
+  harnessSupport: HarnessSupportStatus;
+  routing: RunLaunchRouting;
+  profile?: RunLaunchProfileReference;
+  phase: RunLaunchPhaseAuthority;
+  readiness: {
+    summary: TaskReadinessSummary;
+    overrideReason?: string;
+  };
+  instructions: RunLaunchManifestInstructionInput[];
+  runtime: RunLaunchRuntime;
+  tools: RunLaunchTools;
+  permissions: RunLaunchPermissions;
+  resources?: RunLaunchResources;
+  requiredHealthChecks: string[];
+  satisfiedHealthChecks?: string[];
+  sandboxPolicy: SandboxPolicyDryRunResult;
+  filesystemSandbox?: RunLaunchFilesystemSandboxEvidence;
+  runToolCatalog?: RunToolCatalog;
+  budgetPolicy: AgentBudgetPolicy;
+  workspaceTrust: WorkspaceExecutionTrustEvaluation;
+  origins: RunLaunchManifestOrigin[];
+}
+
+const MATERIAL_SECTIONS: Array<keyof RunLaunchManifest> = [
+  'taskEnvelope',
+  'providerRuntime',
+  'providerRequirements',
+  'harnessSupport',
+  'routing',
+  'profile',
+  'phase',
+  'readiness',
+  'instructions',
+  'workspace',
+  'runtime',
+  'credentials',
+  'tools',
+  'permissions',
+  'resources',
+  'requiredHealthChecks',
+  'sandbox',
+  'budget',
+  'workspaceTrust',
+  'origins',
+  'enforcement',
+];
+
+export class RunLaunchManifestService {
+  compile(input: RunLaunchManifestCompileInput): RunLaunchManifest {
+    const providerRuntime = parseProviderRuntimeManifest(input.providerRuntimeManifest);
+    this.assertProviderRuntimeLink(input.taskEnvelope, providerRuntime);
+
+    const instructions = [...input.instructions]
+      .map<RunLaunchInstructionReference>((instruction) => ({
+        id: instruction.id.trim(),
+        kind: instruction.kind,
+        digest: digestRunLaunchValue(instruction.content),
+        materialDigest: digestRunLaunchValue(instruction.materialContent ?? instruction.content),
+        byteLength: Buffer.byteLength(instruction.content, 'utf8'),
+        origin: instruction.origin.trim(),
+        precedence: instruction.precedence,
+      }))
+      .sort(
+        (left, right) =>
+          left.precedence - right.precedence ||
+          left.kind.localeCompare(right.kind) ||
+          left.id.localeCompare(right.id)
+      );
+    const tools = normalizeTools(input.tools);
+    const permissions = normalizePermissions(input.permissions);
+    const resources = normalizeResources(
+      input.resources ?? {
+        skills: [],
+        shared: [],
+        enforcement: 'not-required',
+      }
+    );
+    const requiredHealthChecks = uniqueSorted(input.requiredHealthChecks);
+    const providerRequirements = compileProviderRequirements(
+      providerRuntime,
+      input.requiredRuntimeCapabilities ?? []
+    );
+    const satisfiedHealthChecks = new Set(uniqueSorted(input.satisfiedHealthChecks ?? []));
+    const sandbox = {
+      presetId: input.sandboxPolicy.preset.id,
+      enforcement: input.sandboxPolicy.preset.enforcement,
+      decision: input.sandboxPolicy.decision,
+      effective: {
+        sandboxMode: input.sandboxPolicy.effective.sandboxMode,
+        networkAccessEnabled: input.sandboxPolicy.effective.networkAccessEnabled,
+        environmentKeys: uniqueSorted(input.sandboxPolicy.effective.envPassthrough),
+        credentialReferences: uniqueSorted(
+          input.sandboxPolicy.effective.credentialRefs.map(sanitizeProviderRuntimeDiagnostic)
+        ),
+      },
+      unsupportedRules: [...input.sandboxPolicy.unsupportedRules]
+        .map((rule) => ({
+          id: rule.id,
+          capability: rule.capability,
+          status: rule.status,
+        }))
+        .sort((left, right) => left.id.localeCompare(right.id)),
+      warnings: uniqueSorted(input.sandboxPolicy.warnings.map(sanitizeProviderRuntimeDiagnostic)),
+      ...(input.filesystemSandbox ? { filesystem: input.filesystemSandbox } : {}),
+    };
+    const runtime = normalizeRuntime(input.runtime);
+    const brokeredCredentialReferences = brokeredReferencesFromCatalog(input, providerRuntime);
+    const credentials = compileProviderLaunchCredentialPlan({
+      provider: providerRuntime.provider,
+      providerRuntimeManifest: providerRuntime,
+      runtime,
+      sandbox: input.sandboxPolicy,
+      harnessProfileId: input.harnessSupport.profileId,
+      brokeredCredentialReferences,
+    });
+    const blockers = collectBlockers({
+      input,
+      tools,
+      permissions,
+      resources,
+      credentials,
+      providerRequirements,
+      requiredHealthChecks,
+      satisfiedHealthChecks,
+    });
+    const enforcementWarnings = uniqueSorted([
+      ...sandbox.warnings,
+      ...providerRequirements.capabilities
+        .filter((capability) => capability.advisory)
+        .map((capability) => `${capability.id}: ${capability.reason}`),
+      ...(input.harnessSupport.supportTier === 'degraded' ? [input.harnessSupport.reason] : []),
+      ...input.phase.evidence.warnings,
+    ]).map(sanitizeProviderRuntimeDiagnostic);
+    const payload: Omit<RunLaunchManifest, 'digest'> = {
+      schemaVersion: RUN_LAUNCH_MANIFEST_SCHEMA_VERSION,
+      createdAt: input.createdAt ?? new Date().toISOString(),
+      taskId: input.taskId.trim(),
+      attemptId: input.attemptId.trim(),
+      taskEnvelope: {
+        schemaVersion: input.taskEnvelope.schemaVersion,
+        digest: input.taskEnvelope.digest,
+        materialDigest: digestTaskEnvelopeMaterial(input.taskEnvelope),
+      },
+      providerRuntime: {
+        schemaVersion: providerRuntime.schemaVersion,
+        digest: providerRuntime.digest,
+        materialDigest: digestProviderRuntimeMaterial(providerRuntime),
+        probeRevision: providerRuntime.probeRevision,
+        provider: providerRuntime.provider,
+        adapter: providerRuntime.adapter,
+        protocolVersion: providerRuntime.protocolVersion,
+        providerVersion: sanitizeProviderRuntimeDiagnostic(providerRuntime.providerVersion),
+        ...(providerRuntime.providerBuild
+          ? {
+              providerBuild: sanitizeProviderRuntimeDiagnostic(providerRuntime.providerBuild),
+            }
+          : {}),
+      },
+      providerRequirements,
+      harnessSupport: {
+        profileId: input.harnessSupport.profileId,
+        ...(input.harnessSupport.adapterId ? { adapterId: input.harnessSupport.adapterId } : {}),
+        transport: input.harnessSupport.transport,
+        supportTier: input.harnessSupport.supportTier,
+      },
+      routing: {
+        ...input.routing,
+        reason: sanitizeProviderRuntimeDiagnostic(input.routing.reason),
+      },
+      ...(input.profile ? { profile: { ...input.profile } } : {}),
+      phase: structuredClone(input.phase),
+      readiness: {
+        ready: input.readiness.summary.ready,
+        overridden:
+          !input.readiness.summary.ready && Boolean(input.readiness.overrideReason?.trim()),
+        passed: input.readiness.summary.passed,
+        total: input.readiness.summary.total,
+        missingRequired: uniqueSorted(
+          input.readiness.summary.missingRequired.map((check) => check.id)
+        ),
+        warnings: uniqueSorted(input.readiness.summary.warnings.map((check) => check.id)),
+        ...(!input.readiness.summary.ready && input.readiness.overrideReason?.trim()
+          ? { overrideReasonDigest: digestRunLaunchValue(input.readiness.overrideReason.trim()) }
+          : {}),
+      },
+      instructions,
+      workspace: {
+        worktreeId: input.taskEnvelope.workspace.worktreeId,
+        ...(input.taskEnvelope.workspace.worktreeManifestId
+          ? { worktreeManifestId: input.taskEnvelope.workspace.worktreeManifestId }
+          : {}),
+        ...(input.taskEnvelope.workspace.ownershipLeaseId
+          ? { ownershipLeaseId: input.taskEnvelope.workspace.ownershipLeaseId }
+          : {}),
+        ...(input.taskEnvelope.workspace.ownershipAttemptId
+          ? { ownershipAttemptId: input.taskEnvelope.workspace.ownershipAttemptId }
+          : {}),
+        repo: input.taskEnvelope.workspace.repo,
+        branch: input.taskEnvelope.workspace.branch,
+        baseBranch: input.taskEnvelope.workspace.baseBranch,
+        resolvedBaseCommit:
+          input.taskEnvelope.workspace.resolvedBaseCommit ??
+          input.taskEnvelope.workspace.baseline.headSha,
+        baseResolutionSource:
+          input.taskEnvelope.workspace.baseResolutionSource ?? 'legacy-launch-head',
+      },
+      runtime,
+      credentials,
+      tools,
+      permissions,
+      resources,
+      requiredHealthChecks,
+      sandbox,
+      budget: structuredClone(input.budgetPolicy),
+      workspaceTrust: {
+        schemaVersion: input.workspaceTrust.schemaVersion,
+        status: input.workspaceTrust.status,
+        source: sanitizeProviderRuntimeDiagnostic(input.workspaceTrust.source),
+        policyVersion:
+          input.workspaceTrust.decision?.policyVersion ?? WORKSPACE_EXECUTION_TRUST_POLICY_VERSION,
+        identityDigest: input.workspaceTrust.identity.digest,
+        inventoryDigest: input.workspaceTrust.inventory.digest,
+        inventoryEntryCount: input.workspaceTrust.inventory.entries.length,
+        containsExecutableConfiguration: input.workspaceTrust.inventory.entries.some(
+          (entry) => entry.posture === 'executable'
+        ),
+        requestedCapabilities: [
+          ...new Set(
+            input.workspaceTrust.inventory.entries.flatMap((entry) => entry.requestedCapabilities)
+          ),
+        ].sort(),
+        ...(input.workspaceTrust.decision
+          ? {
+              decisionId: input.workspaceTrust.decision.id,
+              decisionMode: input.workspaceTrust.decision.mode,
+              ...(input.workspaceTrust.decision.expiresAt
+                ? { decisionExpiresAt: input.workspaceTrust.decision.expiresAt }
+                : {}),
+            }
+          : {}),
+        inventory: input.workspaceTrust.inventory.entries.map((entry) => ({
+          id: entry.id,
+          pathDigest: entry.canonicalPathDigest,
+          kind: entry.kind,
+          posture: entry.posture,
+          sourceFingerprint: entry.sourceFingerprint,
+          requestedCapabilities: [...entry.requestedCapabilities].sort(),
+        })),
+      },
+      origins: [...input.origins]
+        .map((origin) => ({
+          ...origin,
+          field: origin.field.trim(),
+          source: sanitizeProviderRuntimeDiagnostic(origin.source),
+        }))
+        .sort(
+          (left, right) =>
+            left.field.localeCompare(right.field) ||
+            left.precedence - right.precedence ||
+            left.source.localeCompare(right.source)
+        ),
+      enforcement: {
+        enforceable: blockers.length === 0,
+        blockers,
+        warnings: enforcementWarnings,
+      },
+    };
+    return immutableClone(
+      parseRunLaunchManifest({
+        ...payload,
+        digest: calculateRunLaunchManifestDigest(payload),
+      })
+    );
+  }
+
+  assertEnforceable(manifest: RunLaunchManifest): void {
+    const parsed = parseRunLaunchManifest(manifest);
+    if (parsed.enforcement.enforceable) return;
+    throw new ConflictError('The effective run launch manifest cannot be enforced.', {
+      manifestDigest: parsed.digest,
+      blockers: parsed.enforcement.blockers,
+    });
+  }
+
+  private assertProviderRuntimeLink(
+    taskEnvelope: TaskEnvelope,
+    providerRuntime: ProviderRuntimeManifest
+  ): void {
+    const reference = taskEnvelope.launchManifest;
+    if (
+      reference.schemaVersion !== providerRuntime.schemaVersion ||
+      reference.digest !== providerRuntime.digest ||
+      reference.provider !== providerRuntime.provider ||
+      reference.adapter !== providerRuntime.adapter ||
+      reference.protocolVersion !== providerRuntime.protocolVersion
+    ) {
+      throw new ValidationError(
+        'Task envelope provider runtime reference does not match the selected runtime manifest.'
+      );
+    }
+  }
+}
+
+export function diffRunLaunchManifests(
+  current: RunLaunchManifest,
+  parent: RunLaunchManifest
+): RunLaunchManifestDriftResult {
+  const currentManifest = parseRunLaunchManifest(current);
+  const parentManifest = parseRunLaunchManifest(parent);
+  const changes = MATERIAL_SECTIONS.flatMap((field) => {
+    const beforeValue =
+      field === 'taskEnvelope'
+        ? {
+            schemaVersion: parentManifest.taskEnvelope.schemaVersion,
+            materialDigest: parentManifest.taskEnvelope.materialDigest,
+          }
+        : field === 'providerRuntime'
+          ? {
+              ...parentManifest.providerRuntime,
+              digest: undefined,
+            }
+          : field === 'instructions'
+            ? materialInstructions(parentManifest.instructions)
+            : field === 'runtime'
+              ? materialRuntime(parentManifest)
+              : field === 'credentials'
+                ? materialCredentials(parentManifest)
+                : field === 'sandbox'
+                  ? materialSandbox(parentManifest)
+                  : parentManifest[field];
+    const afterValue =
+      field === 'taskEnvelope'
+        ? {
+            schemaVersion: currentManifest.taskEnvelope.schemaVersion,
+            materialDigest: currentManifest.taskEnvelope.materialDigest,
+          }
+        : field === 'providerRuntime'
+          ? {
+              ...currentManifest.providerRuntime,
+              digest: undefined,
+            }
+          : field === 'instructions'
+            ? materialInstructions(currentManifest.instructions)
+            : field === 'runtime'
+              ? materialRuntime(currentManifest)
+              : field === 'credentials'
+                ? materialCredentials(currentManifest)
+                : field === 'sandbox'
+                  ? materialSandbox(currentManifest)
+                  : currentManifest[field];
+    const beforeDigest = digestRunLaunchValue(beforeValue);
+    const afterDigest = digestRunLaunchValue(afterValue);
+    return beforeDigest === afterDigest ? [] : [{ field, beforeDigest, afterDigest }];
+  });
+  return {
+    material: changes.length > 0,
+    changes,
+  };
+}
+
+function materialInstructions(
+  instructions: RunLaunchManifest['instructions']
+): Array<Omit<RunLaunchInstructionReference, 'digest' | 'byteLength'>> {
+  return instructions.map(
+    ({ digest: _digest, byteLength: _byteLength, ...instruction }) => instruction
+  );
+}
+
+function materialRuntime(manifest: RunLaunchManifest): RunLaunchRuntime {
+  const normalizedAttemptId = manifest.attemptId
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  const attemptVariants = [...new Set([manifest.attemptId, normalizedAttemptId].filter(Boolean))];
+  return {
+    ...manifest.runtime,
+    args: manifest.runtime.args.map((argument) =>
+      attemptVariants.reduce(
+        (normalized, attemptId) => normalized.replaceAll(attemptId, '<attempt-id>'),
+        argument
+      )
+    ),
+  };
+}
+
+function materialCredentials(
+  manifest: RunLaunchManifest
+): Omit<RunLaunchCredentialPlan, 'digest' | 'providerRuntimeManifestDigest'> | undefined {
+  if (!manifest.credentials) return undefined;
+  const {
+    digest: _digest,
+    providerRuntimeManifestDigest: _providerRuntimeManifestDigest,
+    ...material
+  } = manifest.credentials;
+  return material;
+}
+
+function materialSandbox(manifest: RunLaunchManifest): unknown {
+  const filesystem = manifest.sandbox.filesystem;
+  if (!filesystem) return manifest.sandbox;
+  const { providerRuntimeManifestDigest: _providerRuntimeManifestDigest, ...materialFilesystem } =
+    filesystem;
+  return {
+    ...manifest.sandbox,
+    filesystem: materialFilesystem,
+  };
+}
+
+function normalizeRuntime(runtime: RunLaunchRuntime): RunLaunchRuntime {
+  return {
+    ...(runtime.model ? { model: sanitizeProviderRuntimeDiagnostic(runtime.model) } : {}),
+    command: sanitizeProviderRuntimeDiagnostic(runtime.command),
+    args: runtime.args.map(sanitizeProviderRuntimeDiagnostic),
+    workingDirectory: runtime.workingDirectory,
+    worktree: runtime.worktree,
+    environmentKeys: uniqueSorted(runtime.environmentKeys),
+    credentialReferences: uniqueSorted(
+      runtime.credentialReferences.map(sanitizeProviderRuntimeDiagnostic)
+    ),
+  };
+}
+
+function normalizeTools(tools: RunLaunchTools): RunLaunchTools {
+  return {
+    allowed: uniqueSorted(tools.allowed),
+    denied: uniqueSorted(tools.denied),
+    policyIds: uniqueSorted(tools.policyIds),
+    mcpServers: uniqueSorted(tools.mcpServers),
+    ...(tools.catalogDigest ? { catalogDigest: tools.catalogDigest } : {}),
+    enforcement: tools.enforcement,
+  };
+}
+
+function normalizePermissions(permissions: RunLaunchPermissions): RunLaunchPermissions {
+  return {
+    level: permissions.level,
+    required: uniqueSorted(permissions.required),
+    enforcement: permissions.enforcement,
+  };
+}
+
+function normalizeResources(resources: RunLaunchResources): RunLaunchResources {
+  return {
+    skills: uniqueSorted(resources.skills),
+    shared: uniqueSorted(resources.shared),
+    enforcement: resources.enforcement,
+  };
+}
+
+function brokeredReferencesFromCatalog(
+  input: RunLaunchManifestCompileInput,
+  providerRuntime: ProviderRuntimeManifest
+): string[] {
+  if (!input.runToolCatalog) return [];
+  const catalog = runToolCatalogSchema.parse(input.runToolCatalog);
+  if (
+    catalog.taskId !== input.taskId.trim() ||
+    catalog.attemptId !== input.attemptId.trim() ||
+    catalog.provider !== providerRuntime.provider ||
+    catalog.providerRuntimeManifestDigest !== providerRuntime.digest ||
+    catalog.taskEnvelopeDigest !== input.taskEnvelope.digest ||
+    catalog.digest !== input.tools.catalogDigest ||
+    catalog.digest !== calculateRunToolCatalogDigest(catalog)
+  ) {
+    throw new ConflictError(
+      'Brokered credential evidence does not match the exact run tool catalog.',
+      {
+        taskId: input.taskId,
+        attemptId: input.attemptId,
+        catalogDigest: catalog.digest,
+        manifestCatalogDigest: input.tools.catalogDigest,
+      }
+    );
+  }
+  return uniqueSorted(
+    catalog.entries
+      .filter((entry) => entry.status === 'ready')
+      .flatMap((entry) =>
+        (entry.credentialBindings ?? []).map((binding) => binding.credentialReference)
+      )
+  );
+}
+
+function collectBlockers({
+  input,
+  tools,
+  permissions,
+  resources,
+  credentials,
+  providerRequirements,
+  requiredHealthChecks,
+  satisfiedHealthChecks,
+}: {
+  input: RunLaunchManifestCompileInput;
+  tools: RunLaunchTools;
+  permissions: RunLaunchPermissions;
+  resources: RunLaunchResources;
+  credentials: RunLaunchCredentialPlan;
+  providerRequirements: RunLaunchManifest['providerRequirements'];
+  requiredHealthChecks: string[];
+  satisfiedHealthChecks: Set<string>;
+}): RunLaunchManifestBlocker[] {
+  const blockers: RunLaunchManifestBlocker[] = [];
+  const add = (code: string, field: string, detail: string, remediation: string): void => {
+    blockers.push({ code, field, detail, remediation });
+  };
+  for (const blocker of input.phase.evidence.blockers) {
+    add(
+      `phase-${blocker.code}`,
+      blocker.dimension ? `phase.evidence.${blocker.dimension}` : 'phase.evidence',
+      blocker.message,
+      blocker.sourceId
+        ? `Select launch evidence that enforces ${blocker.dimension ?? 'the required phase authority'} at ${blocker.sourceId}.`
+        : 'Select a compatible phase, provider, host, sandbox, and tool policy before launch.'
+    );
+  }
+  if (credentials.brokerState === 'blocked') {
+    add(
+      'credential-boundary-unavailable',
+      'credentials',
+      'Task integration credentials do not have an accepted brokered dispatch boundary.',
+      'Select a credential-free preset until a controlled tool or egress boundary is configured.'
+    );
+  }
+  if (runToolCatalogRequiresBridge(input.runToolCatalog)) {
+    const support = runToolBridgeSupport(
+      input.providerRuntimeManifest.provider as ExecutableAgentProvider
+    );
+    if (!support.supported) {
+      add(
+        'run-tool-bridge-unavailable',
+        'tools.catalogDigest',
+        `Credential-bound tools require the system-owned Veritas bridge. ${support.reason}`,
+        'Select a provider with verified run-scoped MCP injection or use a credential-free tool preset.'
+      );
+    }
+  }
+  if (
+    tools.enforcement !== 'enforced' &&
+    (tools.allowed.length > 0 || tools.denied.length > 0 || tools.policyIds.length > 0)
+  ) {
+    add(
+      'tool-policy-unenforceable',
+      'tools',
+      'The profile declares tool restrictions that the selected adapter cannot enforce.',
+      'Select an adapter with tool-policy enforcement or remove the declared restrictions.'
+    );
+  }
+  for (const capability of providerRequirements.capabilities) {
+    if (capability.satisfied) continue;
+    add(
+      'provider-capability-unavailable',
+      `providerRequirements.${capability.id}`,
+      `${capability.id}: ${capability.reason}`,
+      'Select a provider that evidences every required runtime capability.'
+    );
+  }
+  if (tools.enforcement !== 'enforced' && tools.mcpServers.length > 0) {
+    add(
+      'mcp-unavailable',
+      'tools.mcpServers',
+      'The profile declares MCP servers that the selected adapter cannot inject safely.',
+      'Select an adapter with explicit MCP injection or remove the MCP declarations.'
+    );
+  }
+  if (tools.enforcement === 'enforced' && tools.mcpServers.length > 0 && !tools.catalogDigest) {
+    add(
+      'tool-catalog-missing',
+      'tools.catalogDigest',
+      'The launch declares enforced MCP servers without an immutable run-scoped catalog.',
+      'Validate and compile the selected servers through the tool control plane before launch.'
+    );
+  }
+  if (permissions.enforcement !== 'enforced' && permissions.required.length > 0) {
+    add(
+      'permission-unenforceable',
+      'permissions.required',
+      'The profile declares permissions that the selected adapter cannot enforce.',
+      'Select an adapter with permission enforcement or remove the required permissions.'
+    );
+  }
+  if (resources.enforcement !== 'enforced' && resources.skills.length > 0) {
+    add(
+      'skill-resource-unavailable',
+      'resources.skills',
+      'The launch selects skills that the adapter cannot inject and verify.',
+      'Select an adapter with explicit skill injection or remove the selected skills.'
+    );
+  }
+  if (resources.enforcement !== 'enforced' && resources.shared.length > 0) {
+    add(
+      'shared-resource-unavailable',
+      'resources.shared',
+      'The launch selects shared resources that the adapter cannot inject and verify.',
+      'Select an adapter with explicit shared-resource injection or remove the resources.'
+    );
+  }
+  const missingHealthChecks = requiredHealthChecks.filter(
+    (checkId) => !satisfiedHealthChecks.has(checkId)
+  );
+  if (missingHealthChecks.length > 0) {
+    add(
+      'health-check-unavailable',
+      'requiredHealthChecks',
+      `Required profile health checks were not satisfied: ${missingHealthChecks.join(', ')}.`,
+      'Run and satisfy every required profile health check before launch.'
+    );
+  }
+  if (input.sandboxPolicy.decision === 'block') {
+    add(
+      'sandbox-policy-blocked',
+      'sandbox.decision',
+      'The resolved sandbox policy blocks this launch.',
+      input.sandboxPolicy.remediation ?? 'Resolve the sandbox policy blockers before launch.'
+    );
+  } else if (
+    input.sandboxPolicy.preset.enforcement === 'required' &&
+    input.sandboxPolicy.unsupportedRules.length > 0
+  ) {
+    add(
+      'sandbox-policy-unenforceable',
+      'sandbox.unsupportedRules',
+      'The required sandbox policy contains rules the selected adapter cannot enforce.',
+      input.sandboxPolicy.remediation ?? 'Select a compatible adapter or sandbox preset.'
+    );
+  }
+  if (input.workspaceTrust.status === 'untrusted') {
+    add(
+      'workspace-untrusted',
+      'workspaceTrust',
+      'The selected workspace trust posture does not permit launch.',
+      'Trust the workspace explicitly or choose a non-executable profile.'
+    );
+  }
+  if (!input.harnessSupport.enabled || input.harnessSupport.supportTier === 'unsupported') {
+    add(
+      'harness-unavailable',
+      'harnessSupport',
+      sanitizeProviderRuntimeDiagnostic(input.harnessSupport.reason),
+      'Configure a supported executable harness before launch.'
+    );
+  }
+  if (input.providerRuntimeManifest.probe.state === 'failed') {
+    add(
+      'provider-probe-failed',
+      'providerRuntime',
+      'The provider runtime probe failed.',
+      'Resolve the provider runtime diagnostics and probe again.'
+    );
+  }
+  return blockers.sort(
+    (left, right) => left.field.localeCompare(right.field) || left.code.localeCompare(right.code)
+  );
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort((left, right) =>
+    left.localeCompare(right)
+  );
+}
+
+function compileProviderRequirements(
+  providerRuntime: ProviderRuntimeManifest,
+  requiredCapabilities: string[]
+): RunLaunchManifest['providerRequirements'] {
+  const required = uniqueSorted(requiredCapabilities);
+  return {
+    required,
+    capabilities: required.map((id) => {
+      const evidence = providerRuntime.capabilities.find((capability) => capability.id === id);
+      const state = evidence?.state ?? 'unknown';
+      return {
+        id,
+        state,
+        satisfied: state === 'supported' || state === 'advisory',
+        advisory: state === 'advisory',
+        reason: evidence?.reason ?? 'No capability evidence is present.',
+      };
+    }),
+  };
+}
+
+function digestTaskEnvelopeMaterial(taskEnvelope: TaskEnvelope): string {
+  const { digest: _digest, attempt: _attempt, workspace, ...stableEnvelope } = taskEnvelope;
+  const { capturedAt: _capturedAt, ...baseline } = workspace.baseline;
+  const { digest: _launchDigest, ...stableLaunchManifest } = stableEnvelope.launchManifest;
+  return digestRunLaunchValue({
+    ...stableEnvelope,
+    launchManifest: stableLaunchManifest,
+    workspace: {
+      ...workspace,
+      baseline,
+    },
+  });
+}
+
+function digestProviderRuntimeMaterial(providerRuntime: ProviderRuntimeManifest): string {
+  const { digest: _digest, probe, ...stableRuntime } = providerRuntime;
+  const { probedAt: _probedAt, ...stableProbe } = probe;
+  return digestRunLaunchValue({
+    ...stableRuntime,
+    probe: stableProbe,
+  });
+}
+
+function immutableClone<T>(value: T): T {
+  return deepFreeze(structuredClone(value));
+}
+
+function deepFreeze<T>(value: T): T {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  return value;
+}

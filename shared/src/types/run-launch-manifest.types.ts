@@ -1,0 +1,362 @@
+import type { AgentBudgetPolicy } from './agent-budget.types.js';
+import type {
+  PhaseAuthoritySourceKind,
+  PhaseCapabilityEvidence,
+} from './phase-capability.types.js';
+import type { HarnessSupportTier, HarnessTransport } from './provider-runtime.types.js';
+import type { ProviderRuntimeCapabilityState } from './provider-runtime.types.js';
+
+export const RUN_LAUNCH_MANIFEST_SCHEMA_VERSION = 'run-launch-manifest/v1' as const;
+export const RUN_LAUNCH_CREDENTIAL_PLAN_SCHEMA_VERSION = 'run-launch-credential-plan/v1' as const;
+export const FILESYSTEM_SANDBOX_EVIDENCE_SCHEMA_VERSION = 'filesystem-sandbox-evidence/v1' as const;
+
+export type RunLaunchManifestEnforcementState = 'enforced' | 'not-required' | 'unavailable';
+
+export type RunLaunchManifestInstructionKind =
+  'task' | 'profile' | 'template' | 'repository' | 'system' | 'other';
+
+export type RunLaunchManifestOriginScope =
+  | 'run'
+  | 'parent'
+  | 'task-envelope'
+  | 'agent-profile'
+  | 'workflow'
+  | 'template'
+  | 'provider'
+  | 'workspace'
+  | 'system-default';
+
+export interface RunLaunchManifestReference {
+  schemaVersion: string;
+  digest: string;
+}
+
+export interface RunLaunchTaskEnvelopeReference extends RunLaunchManifestReference {
+  /** Digest excluding attempt identity and capture timestamps for material drift comparison. */
+  materialDigest: string;
+}
+
+export interface RunLaunchProviderRuntimeReference extends RunLaunchManifestReference {
+  /** Digest excluding probe timestamp for material drift comparison. */
+  materialDigest: string;
+  probeRevision: number;
+  provider: string;
+  adapter: string;
+  protocolVersion: string;
+  providerVersion: string;
+  providerBuild?: string;
+}
+
+export interface RunLaunchHarnessSupport {
+  profileId: string;
+  adapterId?: string;
+  transport: HarnessTransport;
+  supportTier: HarnessSupportTier;
+}
+
+export interface RunLaunchProviderRequirement {
+  id: string;
+  state: ProviderRuntimeCapabilityState;
+  satisfied: boolean;
+  advisory: boolean;
+  reason: string;
+}
+
+export interface RunLaunchProviderRequirements {
+  required: string[];
+  capabilities: RunLaunchProviderRequirement[];
+}
+
+export interface RunLaunchRouting {
+  requestedAgent: string;
+  selectedAgent: string;
+  selectedHost: string;
+  reason: string;
+  fallbackAgent: string | null;
+  fallbackAllowed: boolean;
+  /** Captured recovery policy. Optional only for legacy v1 manifests. */
+  fallbackOnFailure?: boolean;
+  /** Captured retry bound. Optional only for legacy v1 manifests. */
+  maxRetries?: number;
+}
+
+export interface RunLaunchProfileReference {
+  id: string;
+  version: string;
+  role: string;
+}
+
+export interface RunLaunchReadiness {
+  ready: boolean;
+  overridden: boolean;
+  passed: number;
+  total: number;
+  missingRequired: string[];
+  warnings: string[];
+  overrideReasonDigest?: string;
+}
+
+export interface RunLaunchInstructionReference {
+  id: string;
+  kind: RunLaunchManifestInstructionKind;
+  digest: string;
+  /** Digest with attempt-local identifiers normalized for material drift comparison. */
+  materialDigest: string;
+  byteLength: number;
+  origin: string;
+  precedence: number;
+}
+
+export interface RunLaunchRuntime {
+  model?: string;
+  command: string;
+  args: string[];
+  workingDirectory: 'task-worktree' | 'workspace' | 'provider-managed';
+  worktree: 'required' | 'supported' | 'provider-managed';
+  environmentKeys: string[];
+  credentialReferences: string[];
+}
+
+export type RunLaunchCredentialClass =
+  'harness-boot-authentication' | 'task-integration' | 'compatibility-passthrough';
+
+export type RunLaunchCredentialDelivery =
+  'provider-native-environment' | 'brokered-boundary' | 'raw-environment' | 'blocked';
+
+export interface RunLaunchCredentialReference {
+  reference: string;
+  classification: RunLaunchCredentialClass;
+  delivery: RunLaunchCredentialDelivery;
+  boundary: 'provider-process' | 'tool-control-plane' | 'egress-gateway' | 'unavailable';
+  risk: 'provider-required' | 'brokered' | 'high-risk' | 'blocked';
+}
+
+export interface RunLaunchCredentialPlan {
+  schemaVersion: typeof RUN_LAUNCH_CREDENTIAL_PLAN_SCHEMA_VERSION;
+  digest: string;
+  mode: import('./sandbox-policy.types.js').SandboxCredentialMode;
+  brokerState: 'not-required' | 'supported' | 'blocked';
+  providerRuntimeManifestDigest: string;
+  providerRuntimeProbeRevision: number;
+  references: RunLaunchCredentialReference[];
+}
+
+export interface RunLaunchWorkspace {
+  worktreeId: string;
+  worktreeManifestId?: string;
+  ownershipLeaseId?: string;
+  ownershipAttemptId?: string;
+  repo: string;
+  branch: string;
+  baseBranch: string;
+  resolvedBaseCommit: string;
+  baseResolutionSource:
+    import('./worktree-manifest.types.js').WorktreeBaseSource | 'legacy-launch-head';
+}
+
+export interface RunLaunchTools {
+  allowed: string[];
+  denied: string[];
+  policyIds: string[];
+  mcpServers: string[];
+  /** Immutable run-scoped catalog evidence compiled by the tool control plane. */
+  catalogDigest?: string;
+  enforcement: RunLaunchManifestEnforcementState;
+}
+
+export interface RunLaunchPermissions {
+  level: 'intern' | 'specialist' | 'lead';
+  required: string[];
+  enforcement: RunLaunchManifestEnforcementState;
+}
+
+export interface RunLaunchResources {
+  skills: string[];
+  shared: string[];
+  enforcement: RunLaunchManifestEnforcementState;
+}
+
+export interface RunLaunchSandboxRule {
+  id: string;
+  capability: string;
+  status: 'supported' | 'unsupported' | 'advisory';
+}
+
+export type RunLaunchFilesystemRootAccess = 'read' | 'write' | 'deny' | 'protected';
+export type RunLaunchFilesystemRootScope =
+  | 'platform-runtime'
+  | 'protected-metadata'
+  | 'workspace'
+  | 'home'
+  | 'absolute'
+  | 'run-temp'
+  | 'run-cache'
+  | 'run-artifact';
+
+export interface RunLaunchFilesystemRootEvidence {
+  id: string;
+  access: RunLaunchFilesystemRootAccess;
+  scope: RunLaunchFilesystemRootScope;
+  pathDigest: string;
+}
+
+export interface RunLaunchFilesystemSandboxEvidence {
+  schemaVersion: typeof FILESYSTEM_SANDBOX_EVIDENCE_SCHEMA_VERSION;
+  providerRuntimeManifestDigest: string;
+  backend: import('./sandbox-policy.types.js').FilesystemSandboxBackendId;
+  state: 'enforced' | 'native' | 'advisory' | 'unavailable';
+  platformBackend:
+    'seatbelt' | 'landlock-bubblewrap' | 'restricted-token' | 'provider-native' | 'none';
+  capabilityVersion: string;
+  backendVersion?: string;
+  backendExecutableDigest?: string;
+  policyHash: string;
+  roots: RunLaunchFilesystemRootEvidence[];
+  protectedPaths: string[];
+  dotfileMasking: boolean;
+  descendantsEnforced: boolean;
+  cleanupOwner: 'run-supervisor' | 'provider-native' | 'none';
+}
+
+export interface RunLaunchSandbox {
+  presetId: string;
+  enforcement: 'required' | 'advisory';
+  decision: 'allow' | 'warn' | 'block';
+  effective: {
+    sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access';
+    networkAccessEnabled: boolean;
+    environmentKeys: string[];
+    credentialReferences: string[];
+  };
+  unsupportedRules: RunLaunchSandboxRule[];
+  warnings: string[];
+  /** Present on manifests compiled after filesystem-sandbox-evidence/v1 shipped. */
+  filesystem?: RunLaunchFilesystemSandboxEvidence;
+}
+
+export interface RunLaunchWorkspaceTrustEvidence {
+  schemaVersion: import('./workspace-execution-trust.types.js').WorkspaceExecutionTrustEvaluation['schemaVersion'];
+  status: import('./workspace-execution-trust.types.js').WorkspaceExecutionTrustStatus;
+  source: string;
+  policyVersion: number;
+  identityDigest: string;
+  inventoryDigest: string;
+  inventoryEntryCount: number;
+  containsExecutableConfiguration: boolean;
+  requestedCapabilities: string[];
+  decisionId?: string;
+  decisionMode?: import('./workspace-execution-trust.types.js').WorkspaceExecutionTrustDecisionMode;
+  decisionExpiresAt?: string;
+  inventory: Array<{
+    id: string;
+    pathDigest: string;
+    kind: import('./workspace-execution-trust.types.js').WorkspaceExecutionTrustComponentKind;
+    posture: import('./workspace-execution-trust.types.js').WorkspaceExecutionTrustPosture;
+    sourceFingerprint: string;
+    requestedCapabilities: string[];
+  }>;
+}
+
+export interface LegacyRunLaunchWorkspaceTrust {
+  status: 'trusted' | 'untrusted' | 'not-required';
+  source: string;
+}
+
+export type RunLaunchWorkspaceTrust =
+  RunLaunchWorkspaceTrustEvidence | LegacyRunLaunchWorkspaceTrust;
+
+export interface RunLaunchManifestOrigin {
+  field: string;
+  scope: RunLaunchManifestOriginScope;
+  source: string;
+  precedence: number;
+}
+
+export interface RunLaunchPhaseSourceReference {
+  sourceId: string;
+  kind: PhaseAuthoritySourceKind;
+  originScope: RunLaunchManifestOriginScope;
+  sourceDigest: string;
+  parentAttemptId?: string;
+  parentManifestDigest?: string;
+  parentEvidenceDigest?: string;
+}
+
+/**
+ * Immutable effective phase authority and the exact source snapshots that
+ * produced it. `phase-capability-evidence/v1` carries no credential values.
+ */
+export interface RunLaunchPhaseAuthority {
+  evidence: PhaseCapabilityEvidence;
+  sourceReferences: RunLaunchPhaseSourceReference[];
+}
+
+export interface RunLaunchManifestBlocker {
+  code: string;
+  field: string;
+  detail: string;
+  remediation: string;
+}
+
+export interface RunLaunchManifestEnforcement {
+  enforceable: boolean;
+  blockers: RunLaunchManifestBlocker[];
+  warnings: string[];
+}
+
+/**
+ * Immutable, redacted record of the effective launch inputs and their origin.
+ *
+ * Prompt content and credential values are intentionally excluded. References
+ * and fingerprints let operators prove what was selected without disclosing it.
+ */
+export interface RunLaunchManifest {
+  schemaVersion: typeof RUN_LAUNCH_MANIFEST_SCHEMA_VERSION;
+  digest: string;
+  createdAt: string;
+  taskId: string;
+  attemptId: string;
+  taskEnvelope: RunLaunchTaskEnvelopeReference;
+  providerRuntime: RunLaunchProviderRuntimeReference;
+  providerRequirements: RunLaunchProviderRequirements;
+  harnessSupport: RunLaunchHarnessSupport;
+  routing: RunLaunchRouting;
+  profile?: RunLaunchProfileReference;
+  /** Present on manifests compiled after phase launch propagation shipped. */
+  phase?: RunLaunchPhaseAuthority;
+  readiness: RunLaunchReadiness;
+  instructions: RunLaunchInstructionReference[];
+  /** Present on newly compiled manifests; absent only on pre-6.0 legacy records. */
+  workspace?: RunLaunchWorkspace;
+  runtime: RunLaunchRuntime;
+  /** Present on newly compiled manifests; absent only on pre-6.0 legacy records. */
+  credentials?: RunLaunchCredentialPlan;
+  tools: RunLaunchTools;
+  permissions: RunLaunchPermissions;
+  resources: RunLaunchResources;
+  requiredHealthChecks: string[];
+  sandbox: RunLaunchSandbox;
+  budget: AgentBudgetPolicy;
+  workspaceTrust: RunLaunchWorkspaceTrust;
+  origins: RunLaunchManifestOrigin[];
+  enforcement: RunLaunchManifestEnforcement;
+}
+
+export interface RunLaunchManifestDrift {
+  field: string;
+  beforeDigest: string;
+  afterDigest: string;
+}
+
+export interface RunLaunchManifestDriftResult {
+  material: boolean;
+  changes: RunLaunchManifestDrift[];
+}
+
+export interface RunLaunchManifestPreview {
+  manifest: RunLaunchManifest;
+  /** Current redacted provider and selected-host circuit posture for launch explain surfaces. */
+  dependencyCircuits?: import('./dependency-circuit.types.js').RunDependencyCircuitEvidence;
+  parentAttemptId?: string;
+  drift?: RunLaunchManifestDriftResult;
+}

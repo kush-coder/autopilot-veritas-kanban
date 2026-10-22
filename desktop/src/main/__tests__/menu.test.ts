@@ -1,0 +1,214 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { createDesktopMenuTemplate } from '../menu.js';
+import type { DesktopStatusSnapshot } from '../types.js';
+import type { DesktopUpdateStatus } from '../../shared/desktop-bridge-contracts.js';
+
+function status(state: DesktopStatusSnapshot['server']['state'] = 'ready'): DesktopStatusSnapshot {
+  return {
+    mode: 'local-dev',
+    profile: 'fresh',
+    workspace: 'local',
+    server: {
+      name: 'server',
+      state,
+      pid: 1,
+      port: 3001,
+      lastError: null,
+      startedAt: '2026-05-31T00:00:00.000Z',
+      exitedAt: null,
+    },
+    web: undefined,
+    serverOrigin: 'http://127.0.0.1:3001',
+    rendererOrigin: 'http://127.0.0.1:3000',
+    appHome: '/tmp/veritas',
+    dataDir: '/tmp/veritas/data',
+    configDir: '/tmp/veritas/config',
+    logsDir: '/tmp/veritas/logs',
+    secretsBackedByKeychain: true,
+    warnings: [],
+    lastError: null,
+  };
+}
+
+function updateStatus(state: DesktopUpdateStatus['state']): DesktopUpdateStatus {
+  return {
+    state,
+    currentVersion: '4.3.2',
+    channel: 'stable',
+    checkedAt: '2026-05-31T00:00:00.000Z',
+  };
+}
+
+describe('desktop native menu', () => {
+  it('exposes common actions with keyboard shortcuts', () => {
+    const dispatch = vi.fn();
+    const copyVersionInfo = vi.fn();
+    const template = createDesktopMenuTemplate({
+      status: status(),
+      dispatch,
+      copyVersionInfo,
+      openHelp: vi.fn(),
+    });
+    const labels = template.flatMap((item) =>
+      Array.isArray(item.submenu) ? item.submenu.map((child) => child.label) : []
+    );
+
+    expect(labels).toContain('New Task');
+    expect(labels).toContain('Setup & Diagnostics');
+    expect(labels).toContain('Command Center');
+    expect(labels).toContain('Search');
+    expect(labels).toContain('Settings');
+    expect(labels).toContain('Restart Local Server');
+    expect(labels).toContain('Reset Window Layout');
+
+    const appMenu = template.find((item) => item.label === 'Veritas Kanban');
+    const appItems = Array.isArray(appMenu?.submenu) ? appMenu.submenu : [];
+    expect(appItems[0]).toMatchObject({ role: 'about', label: 'About Veritas Kanban' });
+    expect(appItems[1]).toMatchObject({ type: 'separator' });
+    const copyVersion = appItems.find((item) => item.label === 'Copy Version Information');
+    copyVersion?.click?.(undefined as never, undefined as never, undefined as never);
+    expect(copyVersionInfo).toHaveBeenCalledOnce();
+
+    const fileMenu = template.find((item) => item.label === 'File');
+    const newTask = Array.isArray(fileMenu?.submenu)
+      ? fileMenu.submenu.find((item) => item.label === 'New Task')
+      : null;
+    newTask?.click?.(undefined as never, undefined as never, undefined as never);
+
+    expect(newTask?.accelerator).toBe('CommandOrControl+N');
+    expect(dispatch).toHaveBeenCalledWith('new-task');
+  });
+
+  it('exposes the native edit menu so macOS text fields receive standard shortcuts', () => {
+    const template = createDesktopMenuTemplate({
+      status: status(),
+      dispatch: vi.fn(),
+      copyVersionInfo: vi.fn(),
+      openHelp: vi.fn(),
+    });
+
+    expect(template.some((item) => item.role === 'editMenu')).toBe(true);
+  });
+
+  it('keeps external delivery test status-aware', () => {
+    const desktopMenu = createDesktopMenuTemplate({
+      status: status('failed'),
+      dispatch: vi.fn(),
+      copyVersionInfo: vi.fn(),
+      openHelp: vi.fn(),
+    }).find((item) => item.label === 'Desktop');
+    const externalTest = Array.isArray(desktopMenu?.submenu)
+      ? desktopMenu.submenu.find((item) => item.label === 'Test External Delivery')
+      : null;
+
+    expect(externalTest?.enabled).toBe(false);
+  });
+
+  it('keeps update install actions tied to updater state', () => {
+    const appMenu = createDesktopMenuTemplate({
+      status: status(),
+      updateStatus: updateStatus('available'),
+      dispatch: vi.fn(),
+      copyVersionInfo: vi.fn(),
+      openHelp: vi.fn(),
+    }).find((item) => item.label === 'Veritas Kanban');
+    const downloadUpdate = Array.isArray(appMenu?.submenu)
+      ? appMenu.submenu.find((item) => item.label === 'Download Update')
+      : null;
+    const installUpdate = Array.isArray(appMenu?.submenu)
+      ? appMenu.submenu.find((item) => item.label === 'Install Update')
+      : null;
+
+    expect(downloadUpdate?.enabled).toBe(true);
+    expect(installUpdate?.enabled).toBe(false);
+  });
+
+  it.each(['starting', 'ready', 'failed'] as const)(
+    'keeps the standard macOS Window and Help menus available while the server is %s',
+    (serverState) => {
+      const dispatch = vi.fn();
+      const openHelp = vi.fn();
+      const template = createDesktopMenuTemplate({
+        status: status(serverState),
+        dispatch,
+        copyVersionInfo: vi.fn(),
+        openHelp,
+        platform: 'darwin',
+      });
+
+      expect(template.map((item) => item.role ?? item.label)).toEqual([
+        'Veritas Kanban',
+        'File',
+        'editMenu',
+        'View',
+        'Navigate',
+        'Desktop',
+        'windowMenu',
+        'help',
+      ]);
+
+      const helpMenu = template.find((item) => item.role === 'help');
+      const helpItems = Array.isArray(helpMenu?.submenu) ? helpMenu.submenu : [];
+      const productHelp = helpItems.find((item) => item.label === 'Veritas Kanban Help');
+      const onboarding = helpItems.find((item) => item.label === 'Show Setup && Diagnostics');
+
+      expect(productHelp?.enabled).not.toBe(false);
+      expect(onboarding?.enabled).toBe(true);
+      productHelp?.click?.(undefined as never, undefined as never, undefined as never);
+      onboarding?.click?.(undefined as never, undefined as never, undefined as never);
+      expect(openHelp).toHaveBeenCalledOnce();
+      expect(dispatch).toHaveBeenCalledWith('open-onboarding');
+    }
+  );
+
+  it('does not add macOS-only menus on other platforms', () => {
+    const template = createDesktopMenuTemplate({
+      status: status(),
+      dispatch: vi.fn(),
+      copyVersionInfo: vi.fn(),
+      openHelp: vi.fn(),
+      platform: 'linux',
+    });
+
+    expect(template.some((item) => item.role === 'windowMenu')).toBe(false);
+    expect(template.some((item) => item.role === 'help')).toBe(false);
+  });
+});
+
+describe('standard platform menu roles', () => {
+  const roles = (platform: NodeJS.Platform) =>
+    createDesktopMenuTemplate({
+      platform,
+      status: status(),
+      dispatch: vi.fn(),
+      copyVersionInfo: vi.fn(),
+      openHelp: vi.fn(),
+    }).flatMap((item) => (Array.isArray(item.submenu) ? item.submenu : [item]));
+  it('declares standard macOS roles and accelerators while retaining custom actions', () => {
+    const items = roles('darwin');
+    for (const [role, accelerator] of [
+      ['quit', 'CommandOrControl+Q'],
+      ['close', 'CommandOrControl+W'],
+      ['hide', 'Command+H'],
+      ['hideOthers', 'Command+Alt+H'],
+      ['resetZoom', 'CommandOrControl+0'],
+      ['zoomIn', 'CommandOrControl+Plus'],
+      ['zoomOut', 'CommandOrControl+-'],
+      ['togglefullscreen', 'Control+Command+F'],
+    ]) {
+      expect(items.find((item) => item.role === role)).toMatchObject({ accelerator });
+    }
+    expect(items.some((item) => item.role === 'services')).toBe(true);
+    expect(items.some((item) => item.role === 'unhide')).toBe(true);
+    // The native quit role emits app.before-quit, which owns managed shutdown.
+    expect(items.find((item) => item.role === 'quit')?.click).toBeUndefined();
+  });
+  it.each(['linux', 'win32'] as const)('does not install Mac-only roles on %s', (platform) => {
+    const items = roles(platform);
+    expect(
+      items.some((item) => ['services', 'hide', 'hideOthers', 'unhide'].includes(item.role ?? ''))
+    ).toBe(false);
+    expect(items.find((item) => item.role === 'togglefullscreen')?.accelerator).toBe('F11');
+  });
+});

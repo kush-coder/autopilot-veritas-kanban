@@ -1,0 +1,6481 @@
+# Veritas Kanban — API Reference
+
+**Version**: 6.1.3
+**Last Updated**: 2026-08-30
+**Base URL**: `http://localhost:3001/api`
+**Canonical prefix**: `/api/v1` (alias: `/api`)
+
+> This is the source-of-truth companion to the Swagger/OpenAPI spec. For workflow-engine-specific endpoints, see [API-WORKFLOWS.md](API-WORKFLOWS.md).
+
+---
+
+## Table of Contents
+
+1. [Authentication](#authentication)
+2. [Base URLs & Environments](#base-urls--environments)
+3. [Error Model](#error-model)
+4. [Tasks](#tasks)
+5. [Time Tracking](#time-tracking)
+6. [Observations](#observations)
+7. [Analytics](#analytics)
+8. [Configuration](#configuration)
+9. [Settings](#settings)
+10. [Lifecycle Hooks](#lifecycle-hooks)
+11. [Chat & Squad](#chat--squad)
+12. [Agent Status](#agent-status)
+13. [Auth & Diagnostics](#auth--diagnostics)
+14. [Identity & Workspaces](#identity--workspaces)
+15. [Telemetry](#telemetry)
+16. [Health](#health)
+17. [WebSocket](#websocket)
+18. [Shared Run Sessions](#shared-run-sessions)
+19. [Run Approvals](#run-approvals)
+20. [Run Terminal Control](#run-terminal-control)
+21. [Task Verification](#task-verification)
+22. [Task Comments](#task-comments)
+23. [Task Subtasks](#task-subtasks)
+24. [Task Deliverables](#task-deliverables)
+25. [Recurring Work Scheduler](#recurring-work-scheduler)
+26. [Queue Intake Monitors](#queue-intake-monitors)
+27. [Task Archive](#task-archive)
+28. [Attachments](#attachments)
+29. [Agent Permissions](#agent-permissions)
+30. [Workspace Execution Trust](#workspace-execution-trust)
+31. [Agent Routing](#agent-routing)
+32. [Sandbox Policies](#sandbox-policies)
+33. [Shared Resources](#shared-resources)
+34. [Skill Capability Profiles](#skill-capability-profiles-apiskillscapabilities)
+35. [Skill Security Scanner](#skill-security-scanner-apiskillssecurity)
+36. [Doc Freshness](#doc-freshness)
+37. [Cost Prediction](#cost-prediction)
+38. [Error Learning](#error-learning)
+39. [Reflection-to-Memory Promotion](#reflection-to-memory-promotion)
+40. [External Tracker Introspection](#external-tracker-introspection)
+41. [Run-scoped Tool Control Plane](#run-scoped-tool-control-plane)
+42. [Tool Policies](#tool-policies)
+43. [Watcher Continuation Policies](#watcher-continuation-policies)
+44. [Traces](#traces)
+45. [Ceremony Requirements](#ceremony-requirements-apiceremonies)
+46. [Governance Decision Traces](#governance-decision-traces-apigovernancetraces)
+47. [Audit](#audit)
+48. [Maintenance Center](#maintenance-center-apiv1maintenance)
+49. [Common Workflows](#common-workflows)
+50. [Versioning & Deprecation](#versioning--deprecation)
+51. [Rate Limits](#rate-limits)
+52. [Additional Endpoint Groups](#additional-endpoint-groups)
+53. [Execution Admission](#execution-admission)
+54. [Durable Goals](#durable-goals)
+55. [Knowledge Collections](#knowledge-collections)
+
+---
+
+## Authentication
+
+VK supports three authentication methods. All are optional when running locally with `VERITAS_AUTH_ENABLED=false`.
+
+### Methods
+
+| Method             | Header / Param                    | Use Case                          |
+| ------------------ | --------------------------------- | --------------------------------- |
+| **Session Cookie** | `veritas_session` cookie          | Local-owner browser UI login      |
+| **API Key**        | `X-API-Key: <key>`                | Agent integrations, scripts       |
+| **Device Session** | `Authorization: Bearer vk_dev_…`  | Paired desktop/mobile/PWA clients |
+| **WS Query Param** | `ws://host:port/ws?api_key=<key>` | WebSocket connections             |
+
+### Roles
+
+| Role        | Permissions                                                      |
+| ----------- | ---------------------------------------------------------------- |
+| `admin`     | Full access — all endpoints, destructive operations, deep health |
+| `agent`     | Read/write tasks, time tracking, observations, chat, telemetry   |
+| `read-only` | Read-only access to all GET endpoints                            |
+
+### v5 Permission Context
+
+Protected REST handlers and WebSocket connections receive a shared auth context:
+`role`, `userId`, `workspaceId`, `actorType`, `authMethod`, `tokenName`, and
+role-derived `permissions`. Device sessions also include `deviceSessionId`,
+`deviceId`, `clientId`, `clientMode`, `capabilities`, and `degradedReason` when
+a current workspace role downgrade trimmed the approved scopes. Existing
+endpoints still accept the compatibility roles above, but new v5 route work
+should declare the specific permission it requires, such as `task:read`,
+`task:write`, `workflow:execute`, or `admin:manage`.
+
+Production keeps unauthenticated localhost bypass disabled. A password session
+that passes the local-owner loopback `Host`/`Origin`/`Referer` checks receives
+only the explicit `local-agent:run` client capability needed by packaged desktop
+agent controls. Remote password-session cookies remain invalid.
+
+Password sessions are intentionally local-owner only for v5 GA. Remote,
+server-mode, PWA, CLI, MCP, and multi-user clients must use device sessions or
+scoped API tokens; those credentials are revalidated against workspace
+membership and revocation state.
+
+### Localhost Bypass
+
+When `VERITAS_AUTH_LOCALHOST_BYPASS=true`, requests from `127.0.0.1` / `::1` are authenticated automatically with the role set by `VERITAS_AUTH_LOCALHOST_ROLE` (default: `read-only`).
+
+### API Key Configuration
+
+Set via environment:
+
+```bash
+# Admin key
+VERITAS_ADMIN_KEY=your-admin-key
+
+# Additional keys (format: name:key:role, comma-separated)
+VERITAS_API_KEYS=agent1:key123:agent,readonly:key456:read-only
+```
+
+---
+
+## Base URLs & Environments
+
+| Environment | Base URL                             | Notes                        |
+| ----------- | ------------------------------------ | ---------------------------- |
+| Local dev   | `http://localhost:3001/api`          | Default port                 |
+| Production  | Deploy behind reverse proxy with TLS | Add rate limiting externally |
+
+Both `/api/v1/...` and `/api/...` resolve to the same handlers. Use `/api` for brevity.
+
+---
+
+## Error Model
+
+All errors return a consistent JSON envelope:
+
+```json
+{
+  "error": "Human-readable message",
+  "code": "OPTIONAL_ERROR_CODE",
+  "details": {}
+}
+```
+
+### Status Codes
+
+| Code  | Meaning                                               |
+| ----- | ----------------------------------------------------- |
+| `200` | Success                                               |
+| `201` | Created                                               |
+| `400` | Bad request — invalid body, missing fields            |
+| `401` | Not authenticated                                     |
+| `403` | Forbidden — insufficient role                         |
+| `404` | Resource not found                                    |
+| `409` | Conflict — duplicate, state violation, stale revision |
+| `429` | Rate limited                                          |
+| `503` | Service degraded (health checks)                      |
+
+---
+
+## Tasks
+
+All task routes are mounted at `/api/tasks`.
+
+### Task Revisions and Conflict Handling
+
+Task reads and writes include optimistic-concurrency metadata:
+
+- `GET /api/tasks/:id`, `POST /api/tasks`, and successful task mutations return
+  `ETag: "task:<taskId>:<revision>"`.
+- The same revision is also returned as `X-Resource-Revision`.
+- Clients that edit a loaded task should send `If-Match` with the last ETag, or
+  `X-Resource-Revision` with the last numeric revision.
+- Tasks include `revision`, `createdBy`, and `updatedBy`. Comments include
+  `revision`, `createdBy`, and `updatedBy` when created or edited through the
+  v5 routes.
+
+When the supplied revision is stale, the API returns `409 CONFLICT` and includes
+the latest resource so the client can reload or reapply the edit:
+
+```json
+{
+  "code": "CONFLICT",
+  "message": "task task_20260531_abcd has changed since it was loaded. Reload and retry with the latest revision.",
+  "details": {
+    "resourceType": "task",
+    "resourceId": "task_20260531_abcd",
+    "expectedRevision": 3,
+    "currentRevision": 4,
+    "current": {
+      "id": "task_20260531_abcd",
+      "title": "Latest task title",
+      "revision": 4
+    }
+  }
+}
+```
+
+### Duplicate Task Identity Diagnostics
+
+File-backed boards validate task identity directly from markdown files so stale
+cache entries cannot hide duplicate cards. The scanner detects:
+
+- duplicate task `id` values across active, backlog, and archive task files
+- duplicate GitHub issue identities such as `github:BradGroux/veritas-kanban#377`
+- duplicate Git pull request identities such as `git-pr:BradGroux/veritas-kanban#123`
+
+`GET /api/tasks` and `GET /api/backlog` keep their existing response data shape.
+When conflicts exist, enveloped API responses include
+`meta.taskIdentityDiagnostics`, and the response includes
+`X-Veritas-Task-Identity-Conflicts` with the number of conflicts.
+
+Mutating or moving a task with a duplicate identity fails with `409 CONFLICT`
+instead of silently selecting one matching file. The error details include the
+operation, target task ID, duplicate IDs, source paths, and destination path when
+the operation moves a task:
+
+```json
+{
+  "code": "CONFLICT",
+  "message": "Duplicate task identity detected",
+  "details": {
+    "operation": "backlog.promote",
+    "taskId": "task_20260603_dup",
+    "destinationPath": "active",
+    "duplicateIds": ["task_20260603_dup"],
+    "conflicts": [
+      {
+        "kind": "task-id",
+        "id": "task_20260603_dup",
+        "sources": [
+          { "location": "active", "path": "active/task_20260603_dup-active.md" },
+          { "location": "backlog", "path": "backlog/task_20260603_dup-backlog.md" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### List Tasks
+
+```
+GET /api/tasks
+```
+
+Returns all active tasks. Supports query filters.
+
+**Response** `200` (abridged manifest assessments):
+
+```json
+{
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "title": "Implement login",
+      "status": "in-progress",
+      "priority": "high",
+      "project": "rubicon",
+      "assignee": "agent-1",
+      "createdAt": "2026-03-01T10:00:00Z"
+    }
+  ]
+}
+```
+
+### Get Task Counts
+
+```
+GET /api/tasks/counts
+```
+
+Returns task counts grouped by status.
+
+### Create Task
+
+```
+POST /api/tasks
+```
+
+**Body**:
+
+```json
+{
+  "title": "Fix auth bug",
+  "description": "Session tokens not refreshing",
+  "priority": "high",
+  "project": "rubicon",
+  "type": "bug"
+}
+```
+
+**Response** `201`: The created task object.
+
+### Get Task
+
+```
+GET /api/tasks/:id
+```
+
+### Update Task
+
+```
+PATCH /api/tasks/:id
+```
+
+**Body**: Partial task fields to update (title, description, status, priority, assignee, etc.).
+
+Managed attempt state is owned by the run lifecycle APIs. Generic task updates reject an `attempt` replacement when the current attempt contains runtime, launch, admission, supervision, or other server-owned evidence. Ordinary task fields remain editable. Historical attempts containing only the legacy editor fields remain editable through this endpoint.
+
+**Headers**:
+
+```http
+If-Match: "task:task_20260531_abcd:3"
+```
+
+If the task has been updated since revision `3`, the API returns `409 CONFLICT`
+with the latest task in `details.current`.
+
+### Delete Task
+
+```
+DELETE /api/tasks/:id
+```
+
+### Reorder Tasks
+
+```
+POST /api/tasks/reorder
+```
+
+**Body**: `{ "taskIds": ["TASK-003", "TASK-001", "TASK-002"] }`
+
+### Move Task on the Board
+
+```
+POST /api/tasks/:id/move
+```
+
+Atomically changes a task's column and destination order. Send the revision from
+the loaded task with `If-Match` and a UUID `operationId`; retrying the same
+operation is idempotent and returns `replayed: true` without another task write.
+
+**Headers**:
+
+```http
+If-Match: "task:TASK-001:4"
+```
+
+**Body**:
+
+```json
+{
+  "operationId": "c570c646-2982-4f74-82fb-6b7da81ab58b",
+  "sourceStatus": "todo",
+  "sourcePosition": 0,
+  "destinationStatus": "blocked",
+  "destinationIndex": 1
+}
+```
+
+**Response** `200`:
+
+```json
+{
+  "task": { "id": "TASK-001", "status": "blocked", "revision": 5 },
+  "operationId": "c570c646-2982-4f74-82fb-6b7da81ab58b",
+  "orderedTaskIds": ["TASK-004", "TASK-001", "TASK-007"],
+  "replayed": false
+}
+```
+
+A stale revision or source state returns `409 CONFLICT` with the current task in
+`details.current`. Reusing an operation ID with different move input also
+returns `409 CONFLICT`.
+
+### Bulk Update
+
+```
+POST /api/tasks/bulk-update
+```
+
+**Body**: `{ "taskIds": ["TASK-001", "TASK-002"], "updates": { "status": "done" } }`
+
+### Bulk Archive
+
+```
+POST /api/tasks/bulk-archive-by-ids
+```
+
+**Body**: `{ "taskIds": ["TASK-001", "TASK-002"] }`
+
+### Blocking Status
+
+```
+GET /api/tasks/:id/blocking-status
+```
+
+Returns whether a task is blocked by unresolved dependencies.
+
+### Dependencies
+
+```
+POST   /api/tasks/:id/dependencies          # Add dependency
+DELETE /api/tasks/:id/dependencies/:targetId # Remove dependency
+GET    /api/tasks/:id/dependencies           # List dependencies
+GET    /api/tasks/:id/dependency-graph       # Full dependency graph
+```
+
+### Progress & Checkpointing
+
+```
+GET  /api/tasks/:id/progress         # Get progress
+PUT  /api/tasks/:id/progress         # Set progress
+POST /api/tasks/:id/progress/append  # Append progress entry
+
+POST   /api/tasks/:id/checkpoint     # Save checkpoint
+GET    /api/tasks/:id/checkpoint     # Get checkpoint
+DELETE /api/tasks/:id/checkpoint     # Clear checkpoint
+```
+
+### Context
+
+```
+GET /api/tasks/:id/context
+```
+
+Returns enriched context for agent consumption (task + dependencies + observations).
+
+### Worktree (Git)
+
+```
+GET    /api/tasks/worktrees/cleanup-preview     # Preview expired cleanup candidates
+POST   /api/tasks/:id/worktree                  # Resolve base and create worktree
+POST   /api/tasks/:id/worktree/adopt            # Admin: validate and adopt a legacy worktree
+GET    /api/tasks/:id/worktree                   # Get status and manifest evidence
+GET    /api/tasks/:id/worktree/cleanup-preview   # Preview destructive-operation safety
+DELETE /api/tasks/:id/worktree                   # Remove worktree when safe
+POST   /api/tasks/:id/worktree/rebase            # Fetch and rebase onto an exact commit
+POST   /api/tasks/:id/worktree/merge             # Integrate without changing primary checkout
+GET    /api/tasks/:id/worktree/open              # Open in editor
+```
+
+Creation fetches the configured base from `origin`, resolves the exact commit,
+and persists `worktree-manifest/v1` before Git mutates the repository. A fetch
+failure returns `409`. Offline creation requires an explicit acknowledgement:
+
+```json
+{
+  "allowStaleBase": true,
+  "staleBaseAcknowledgement": {
+    "reason": "Operator confirmed the repository is intentionally offline."
+  }
+}
+```
+
+The response includes the manifest ID, ownership lease, exact base commit and
+source, lifecycle state, remote freshness, ahead/behind counts, and cleanup
+preview. Agent launch claims the same lease for the exact attempt; the task
+envelope and run launch manifest retain the manifest, lease, attempt, and base
+commit references.
+
+Deletion is preview-first. Active attempts cannot be overridden. Dirty,
+untracked, unpushed, unmerged, or externally held worktrees require
+`force=true` plus a reason, which is persisted in the manifest:
+
+```text
+DELETE /api/tasks/:id/worktree?force=true&reason=Operator%20accepted%20the%20risk
+```
+
+Safe cleanup remains available with `task:write`, but a forced cleanup requires
+`admin:manage`. An unavailable external-process inspection is incomplete
+evidence and therefore also requires an admin override. An unexpired attempt
+lease, active run, branch mismatch, or manifest mismatch cannot be overridden.
+
+Pre-6.0 tasks that have a `git.worktreePath` but no manifest are not silently
+trusted. An admin can call `POST /api/tasks/:id/worktree/adopt`; Veritas requires
+an exact registered path and branch, matching common Git directory and remote
+fingerprint, a unique cross-task allocation, and a freshly resolved remote base
+that is proven to be an ancestor of the legacy HEAD before creating the
+manifest. The baseline source is recorded as `legacy-adopted`, not as original
+creation provenance. Local tracked and untracked changes are preserved and
+appear in cleanup preview.
+
+Branch and base names must pass Git's canonical branch validation. Pull-request
+creation is available only for an active manifest-backed worktree whose task,
+configured repository, origin, path, lease, branch, and base still match. A
+caller-supplied PR base may only repeat the manifest base. Veritas publishes the
+captured managed commit to the exact fully qualified task branch on the verified
+origin, requires a successful non-force push, and verifies the remote commit
+before creating or linking the pull request in that repository. Legacy worktrees
+must use the adoption endpoint first.
+
+Merge creates a detached integration worktree from the latest exact remote
+base, merges the task branch there, and pushes `HEAD` to the base without
+force. It never checks out, pulls, stages, commits, or otherwise changes the
+configured primary checkout. Interrupted create, rebase, push, and cleanup
+states remain recorded with a recoverable error and path. Restart recovery
+reconciles persisted preparing, merging, pushing, integrated, rebasing, and
+cleanup states against Git and the fetched remote before resuming.
+
+### Apply Template
+
+```
+POST /api/tasks/:id/apply-template
+```
+
+### Demote Task
+
+```
+POST /api/tasks/:id/demote
+```
+
+Moves a task back to backlog.
+
+---
+
+## Time Tracking
+
+Mounted at `/api/tasks`.
+
+### Summary
+
+```
+GET /api/tasks/time/summary
+```
+
+Returns aggregate time tracking data across all tasks.
+
+### Start Timer
+
+```
+POST /api/tasks/:id/time/start
+```
+
+### Stop Timer
+
+```
+POST /api/tasks/:id/time/stop
+```
+
+### Add Manual Entry
+
+```
+POST /api/tasks/:id/time/entry
+```
+
+**Body**:
+
+```json
+{
+  "durationMs": 3600000,
+  "description": "Code review"
+}
+```
+
+### Delete Entry
+
+```
+DELETE /api/tasks/:id/time/entry/:entryId
+```
+
+---
+
+## Observations
+
+Observational memory for tasks — agents record learnings, blockers, and notes.
+
+### Add Observation
+
+```
+POST /api/tasks/:id/observations
+```
+
+**Body**:
+
+```json
+{
+  "content": "Rate limiter needs Redis for distributed deployments",
+  "type": "insight",
+  "agent": "codex-1"
+}
+```
+
+### List Observations
+
+```
+GET /api/tasks/:id/observations
+```
+
+### Delete Observation
+
+```
+DELETE /api/tasks/:id/observations/:obsId
+```
+
+### Search Observations (cross-task)
+
+```
+GET /api/observations?q=redis&type=insight
+```
+
+---
+
+## Analytics
+
+```
+GET /api/analytics/timeline   # Task completion timeline
+GET /api/analytics/metrics    # Throughput, cycle time, WIP
+GET /api/analytics/health     # Board health indicators
+```
+
+---
+
+## Configuration
+
+Mounted at `/api/config`.
+
+### Get Config
+
+```
+GET /api/config
+```
+
+### Repository Management
+
+```
+GET    /api/config/repos               # List repos
+POST   /api/config/repos               # Add repo
+PATCH  /api/config/repos/:name         # Update repo
+DELETE /api/config/repos/:name         # Remove repo
+POST   /api/config/repos/validate      # Validate repo config
+GET    /api/config/repos/:name/branches # List branches
+```
+
+### Agent Configuration
+
+```
+GET /api/config/agents        # List configured agents
+GET /api/config/agent-support # Redacted live harness support tiers and remediation
+PUT /api/config/agents        # Update agent config
+PUT /api/config/default-agent # Set default agent
+```
+
+`GET /api/config/agent-support` is the canonical operator projection used by
+Settings and `vk doctor`. Each row identifies the agent type, support profile,
+explicit adapter and transport, enabled state, tier, redacted reason/failure
+class, executable/authentication posture, version/build evidence, manifest
+digest, safe diagnostic commands, and remediation. It never returns credential
+values.
+
+---
+
+## Settings
+
+```
+GET   /api/settings/features   # Get feature flags
+PATCH /api/settings/features   # Toggle feature flags
+```
+
+**Body** (PATCH):
+
+```json
+{
+  "darkMode": true,
+  "squadChat": true,
+  "analyticsEnabled": true,
+  "enforcement": {
+    "ceremonyDesignReview": "block",
+    "ceremonyFailureRetrospective": "warn"
+  }
+}
+```
+
+Ceremony enforcement modes are `off`, `warn`, or `block`. `block` prevents task
+completion until the matching ceremony is completed; `warn` records a pending
+ceremony and governance trace without blocking completion.
+
+---
+
+## Lifecycle Hooks
+
+Event-driven hooks that fire on task state transitions.
+
+```
+GET    /api/hooks                # List hooks
+GET    /api/hooks/executions     # List recent executions
+POST   /api/hooks                # Create hook
+PATCH  /api/hooks/:id            # Update hook
+DELETE /api/hooks/:id            # Delete hook
+POST   /api/hooks/fire           # Manually fire a hook
+```
+
+**Create Hook Body**:
+
+```json
+{
+  "name": "notify-on-done",
+  "event": "task.status.changed",
+  "filter": { "newStatus": "done" },
+  "action": {
+    "type": "webhook",
+    "url": "https://example.com/webhook"
+  }
+}
+```
+
+---
+
+## Chat & Squad
+
+### Squad Chat
+
+Post messages to the squad chat channel (agent coordination).
+
+```
+POST /api/chat/squad
+```
+
+**Body**:
+
+```json
+{
+  "agent": "VERITAS",
+  "message": "Starting cleanup - 14 steps",
+  "model": "claude-opus-4.6",
+  "tags": ["cleanup"],
+  "replyToId": "msg_parent",
+  "mentions": [{ "target": "case", "kind": "agent" }],
+  "taskId": "task-123",
+  "runId": "run-456",
+  "pinned": false,
+  "decision": false
+}
+```
+
+```
+GET /api/chat/squad
+```
+
+Returns recent squad messages. Supports `?limit=N`, `?agent=AGENT`, `?since=ISO`, and `?includeSystem=false`.
+
+```
+GET  /api/chat/squad/search?q=review&limit=20
+GET  /api/chat/squad/unread?actor=case
+POST /api/chat/squad/read
+GET  /api/chat/squad/:messageId/thread
+POST /api/chat/squad/:messageId/pin
+POST /api/chat/squad/:messageId/react
+```
+
+**Read body**:
+
+```json
+{
+  "actor": "case",
+  "messageId": "msg_latest"
+}
+```
+
+**Pin/decision body**:
+
+```json
+{
+  "pinned": true,
+  "decision": true
+}
+```
+
+**Reaction body**:
+
+```json
+{
+  "actor": "case",
+  "reaction": "ack"
+}
+```
+
+Search returns redacted snippets only. Mention notifications link back to the squad message and do not include raw secrets beyond the existing redaction rules.
+
+### Communication Adapters
+
+Communication adapters live under integrations. Microsoft Teams provides the
+existing human reply/send posture. Buzz adds a native signed-event bridge
+between one mapped community channel and Squad Chat. External thread mappings,
+Buzz event coordinates, delivery audits, and replay cursors remain separate
+from message content.
+
+```
+GET  /api/integrations/communication/adapters
+PUT  /api/integrations/communication/adapters/:adapterId
+GET  /api/integrations/communication/adapters/:adapterId/health
+POST /api/integrations/communication/adapters/:adapterId/test
+POST /api/integrations/communication/adapters/:adapterId/send
+POST /api/integrations/communication/adapters/:adapterId/replies
+POST /api/integrations/communication/adapters/:adapterId/poll
+POST /api/integrations/communication/adapters/:adapterId/disconnect
+GET  /api/integrations/communication/adapters/:adapterId/buzz/channels
+PUT  /api/integrations/communication/adapters/:adapterId/buzz/channels/:channelId
+POST /api/integrations/communication/adapters/:adapterId/buzz/channels/:channelId/disable
+GET  /api/integrations/communication/adapters/:adapterId/buzz/definitions
+GET  /api/integrations/communication/adapters/:adapterId/buzz/definitions/links
+POST /api/integrations/communication/adapters/:adapterId/buzz/definitions/preview
+POST /api/integrations/communication/adapters/:adapterId/buzz/definitions/import
+GET  /api/integrations/communication/mappings
+GET  /api/integrations/communication/deliveries
+```
+
+Adapter setup uses `settings:write`. External reply ingestion uses
+`comment:write`; approval-targeted replies also require `workflow:execute`,
+`task:write`, or admin authority. Reply ingestion sanitizes the body, redacts
+secret-like text, dedupes `externalReplyId`, creates a Squad Chat reply through
+the normal chat service, and broadcasts it to connected clients.
+
+**Configure body**:
+
+```json
+{
+  "kind": "msteams",
+  "displayName": "Microsoft Teams",
+  "enabled": true,
+  "deliveryMode": "webhook",
+  "destinationType": "channel",
+  "tenantId": "tenant-id",
+  "teamId": "team-id",
+  "channelId": "channel-id",
+  "webhookUrl": "https://example.com/teams-adapter",
+  "credential": "write-only-token"
+}
+```
+
+Responses never return credentials or raw webhook query strings. Redacted
+posture appears as `webhookUrlConfigured`, `webhookUrlRedacted`, and
+`hasCredential`.
+
+**Buzz configure body**:
+
+```json
+{
+  "kind": "buzz",
+  "displayName": "Buzz",
+  "enabled": true,
+  "relayHttpUrl": "https://community.example.com",
+  "relayWebSocketUrl": "wss://community.example.com",
+  "expectedCommunity": "community.example.com",
+  "publicKey": "<64-hex-public-key>",
+  "credentialRef": "env:BUZZ_PRIVATE_KEY",
+  "authTagRef": "env:BUZZ_AUTH_TAG",
+  "allowLocalhost": false,
+  "allowPrivateNetwork": false,
+  "command": {
+    "executable": "buzz",
+    "args": []
+  }
+}
+```
+
+Buzz rejects raw credentials, URL userinfo/query/fragment components, and
+credential-like command arguments. Health returns an exact status and
+`reasonCode`, redacted configured/resolved endpoints, expected/observed
+community, public-key fingerprint, tested Buzz release/commit, probe revision,
+relay contract, independent verification checks, optional command diagnostics,
+and runtime transport/subscription/cursor/send facets.
+
+`POST .../buzz-default/test` runs the read-only compatibility probe. It does
+not send. Runtime `canSend` additionally requires an enabled mapped channel;
+`canReceiveReplies` requires an active authenticated subscription.
+
+Send `null` for `relayWebSocketUrl`, `expectedCommunity`, `authTagRef`, or
+`command` to clear that optional setting. Omitting one preserves its current
+value.
+
+**Buzz channel mapping body**:
+
+```json
+{
+  "target": { "kind": "squad" },
+  "enabled": true,
+  "actor": "operator"
+}
+```
+
+The `channelId` path value is a Buzz channel UUID. One enabled channel may map
+to Squad Chat. Disabling retains the mapping and cursor.
+
+**Buzz send body**:
+
+```json
+{
+  "target": {
+    "kind": "squad",
+    "squadMessageId": "msg_local_reply"
+  },
+  "replyToSquadMessageId": "msg_local_root",
+  "message": "Reply from Veritas",
+  "actor": "VERITAS"
+}
+```
+
+Omit `replyToSquadMessageId` for a root. The response includes the signed Buzz
+coordinate and a delivery status. `delivery_unknown` is a durable visible
+state, not a failure alias. `POST .../poll` queries the event ID before any
+safe resubmission. See [Buzz Communication Adapter](BUZZ-INTEGRATION.md).
+
+**Buzz definition preview body**:
+
+```json
+{
+  "coordinate": {
+    "authorPubkey": "<64-hex-public-key>",
+    "kind": 30175,
+    "dTag": "security-reviewer"
+  },
+  "action": "create"
+}
+```
+
+The list returns only signature-verified NIP-33 persona and team heads from the
+current healthy Buzz connection. Preview returns the exact event/content hash,
+mapped/source-only/ignored/rejected field report, proposed disabled
+profile/roster, collisions, unresolved same-author persona slugs, and an
+optimistic `expectedLocalRevision` when a local target or linked persona
+dependency participates in the proposed materialization.
+
+**Buzz definition import body**:
+
+```json
+{
+  "coordinate": {
+    "authorPubkey": "<64-hex-public-key>",
+    "kind": 30175,
+    "dTag": "security-reviewer"
+  },
+  "action": "refresh",
+  "targetId": "buzz-security-reviewer",
+  "expectedEventId": "<64-hex-event-id>",
+  "expectedLocalRevision": "<64-hex-revision>"
+}
+```
+
+Actions are `create`, `link`, `refresh`, or `skip`. Source replacement,
+concurrent local changes, and unresolved collisions return `409`. Created
+profiles, rosters, and roster members are disabled. The link-status endpoint
+reports `current`, `changed`, `missing`, or `unavailable` without deleting the
+local materialization. Preview requires `settings:read`; import requires
+`settings:write`. No endpoint writes definitions back to Buzz.
+
+**Reply ingest body**:
+
+```json
+{
+  "externalThreadId": "teams-thread-1",
+  "externalReplyId": "reply-42",
+  "actor": "alice@example.com",
+  "displayName": "Alice",
+  "message": "Looks good. Please ship it.",
+  "target": {
+    "kind": "squad",
+    "squadMessageId": "msg_parent",
+    "taskId": "task-123"
+  }
+}
+```
+
+### Chat Sessions
+
+```
+POST   /api/chat/send                 # Send message to a session
+GET    /api/chat/sessions              # List sessions
+GET    /api/chat/sessions/:id          # Get session
+GET    /api/chat/sessions/:id/history  # Get session history
+DELETE /api/chat/sessions/:id          # Delete session
+```
+
+---
+
+## Agent Status
+
+Real-time agent activity indicator for the board.
+
+```
+GET  /api/agent/status   # Current status
+POST /api/agent/status   # Update status
+```
+
+**Update Body**:
+
+```json
+{
+  "status": "working",
+  "subAgentCount": 2,
+  "activeAgents": [
+    { "agent": "TARS", "status": "working", "taskTitle": "Fix auth" },
+    { "agent": "CASE", "status": "working", "taskTitle": "Add tests" }
+  ]
+}
+```
+
+### Delegation Violation
+
+```
+POST /api/agent/status/delegation-violation
+```
+
+Reports when an agent violates delegation rules.
+
+---
+
+## Auth & Diagnostics
+
+```
+GET  /api/auth/status           # Check auth status & current role
+POST /api/auth/setup            # Initial admin setup
+POST /api/auth/login            # Login (returns JWT)
+POST /api/auth/logout           # Logout / invalidate token
+POST /api/auth/recover          # Account recovery
+POST /api/auth/change-password  # Change password
+POST /api/auth/rotate-secret    # Rotate JWT secret
+GET  /api/auth/rotation-status  # JWT rotation status
+POST /api/auth/device-pairing/exchange # Redeem a one-time pairing payload
+```
+
+### Login Example
+
+```
+POST /api/auth/login
+```
+
+**Body**: `{ "password": "admin-password" }`
+
+**Response** `200`:
+
+```json
+{
+  "token": "<jwt-token>",
+  "role": "admin",
+  "expiresIn": "24h"
+}
+```
+
+---
+
+## Identity & Workspaces
+
+v5 adds SQLite-backed identity management for users, workspaces, memberships,
+roles, and invitations. These endpoints are mounted at `/api/identity` and
+`/api/v1/identity`.
+
+| Method   | Path                                                               | Description                                           |
+| -------- | ------------------------------------------------------------------ | ----------------------------------------------------- |
+| `GET`    | `/api/identity/profile`                                            | Current user profile plus workspace memberships.      |
+| `GET`    | `/api/identity/workspaces`                                         | Workspaces available to the current user.             |
+| `POST`   | `/api/identity/workspaces/switch`                                  | Validate/select an active workspace membership.       |
+| `GET`    | `/api/identity/workspaces/:workspaceId/members`                    | List active workspace members.                        |
+| `GET`    | `/api/identity/workspaces/:workspaceId/invitations`                | List invitations. Requires admin.                     |
+| `POST`   | `/api/identity/workspaces/:workspaceId/invitations`                | Create an invitation. Requires admin.                 |
+| `POST`   | `/api/identity/invitations/accept`                                 | Accept an invitation.                                 |
+| `POST`   | `/api/auth/invitations/accept`                                     | Accept an invitation before login.                    |
+| `POST`   | `/api/identity/invitations/:id/revoke`                             | Revoke a pending invitation. Requires admin.          |
+| `PATCH`  | `/api/identity/workspaces/:workspaceId/members/:id`                | Update a member role. Requires admin.                 |
+| `DELETE` | `/api/identity/workspaces/:workspaceId/members/:id`                | Remove a member. Requires admin.                      |
+| `GET`    | `/api/identity/workspaces/:workspaceId/device-sessions`            | List trusted device sessions. Requires admin.         |
+| `POST`   | `/api/identity/workspaces/:workspaceId/device-pairing-codes`       | Create a short-lived pairing payload. Requires admin. |
+| `POST`   | `/api/identity/workspaces/:workspaceId/device-sessions/:id/test`   | Test current device session state. Requires admin.    |
+| `POST`   | `/api/identity/workspaces/:workspaceId/device-sessions/:id/revoke` | Revoke a trusted device session. Requires admin.      |
+
+### Create Invitation
+
+```http
+POST /api/identity/workspaces/local/invitations
+```
+
+```json
+{
+  "email": "reviewer@example.com",
+  "role": "reviewer"
+}
+```
+
+The response includes the plaintext invitation token once. SQLite stores only
+the token hash.
+
+### Accept Invitation
+
+```http
+POST /api/auth/invitations/accept
+```
+
+```json
+{
+  "token": "plaintext-token-from-invite",
+  "displayName": "Reviewer",
+  "email": "reviewer@example.com"
+}
+```
+
+Membership mutations are recorded in audit and activity history.
+
+### Device Pairing
+
+```http
+POST /api/identity/workspaces/local/device-pairing-codes
+```
+
+```json
+{
+  "deviceName": "Brad phone",
+  "clientMode": "mobile-pwa",
+  "capabilities": ["workspace:read", "task:read"],
+  "scopes": ["workspace:read", "task:read"],
+  "role": "read-only"
+}
+```
+
+The response returns a plaintext `code` and `veritas://pair?...` link once.
+SQLite stores only hashes for pairing codes and device session secrets. Clients
+redeem the returned payload through:
+
+```http
+POST /api/auth/device-pairing/exchange
+```
+
+Pairing payloads include client id, client mode, capabilities, device id,
+scopes, role, workspace, nonce, signed timestamp, and signature. Codes expire
+quickly, cannot be reused, and failed attempts are rate-limited and audited.
+
+---
+
+## Telemetry
+
+Run events, token usage, and metrics — powers the dashboard graphs.
+
+### Post Event
+
+```
+POST /api/telemetry/events
+```
+
+**Body** (run started):
+
+```json
+{
+  "type": "run.started",
+  "taskId": "TASK-001",
+  "agent": "veritas"
+}
+```
+
+**Body** (run completed):
+
+```json
+{
+  "type": "run.completed",
+  "taskId": "TASK-001",
+  "agent": "veritas",
+  "durationMs": 45000,
+  "success": true
+}
+```
+
+**Body** (token usage):
+
+```json
+{
+  "type": "run.tokens",
+  "taskId": "TASK-001",
+  "agent": "veritas",
+  "model": "claude-opus-4.6",
+  "inputTokens": 12000,
+  "outputTokens": 3500,
+  "cacheTokens": 8000,
+  "cost": 0.15
+}
+```
+
+### Bulk Events
+
+```
+POST /api/telemetry/events/bulk
+```
+
+**Body**: `{ "events": [ ... ] }`
+
+### Query Events
+
+```
+GET /api/telemetry/events                  # All events (?type=, ?limit=, ?taskId=)
+GET /api/telemetry/events/task/:taskId     # Events for a specific task
+GET /api/telemetry/status                  # Telemetry subsystem status
+GET /api/telemetry/count                   # Event counts
+GET /api/telemetry/export                  # Export events (CSV/JSON)
+```
+
+The run-scoped gateway emits `network.egress` events internally. These records
+contain run and gateway keys, policy digest, hashed host key, protocol, port,
+decision, reason, and optional approval correlation. They never contain full
+URLs, query strings, headers, bodies, proxy credentials, or raw paths.
+
+---
+
+## Health
+
+Three-tier health check system for container orchestration.
+
+| Endpoint               | Auth  | Purpose                                                |
+| ---------------------- | ----- | ------------------------------------------------------ |
+| `GET /health`          | None  | Alias for `/health/live`                               |
+| `GET /health/live`     | None  | Liveness probe — process running                       |
+| `GET /health/ready`    | None  | Readiness probe — storage, disk, memory                |
+| `GET /health/deep`     | Admin | Full diagnostics — version, WS count, circuit breakers |
+| `GET /api/health`      | None  | Lightweight API liveness signal                        |
+| `GET /api/health/deep` | Admin | Same as `/health/deep`, under `/api`                   |
+
+Authenticated deep-health responses include `dependencyCircuits.summary`, redacted durable circuit snapshots, and active expiring overrides for provider/model calls, selected agent hosts, MCP servers and tools, outbound integrations, and storage operations. Dependency IDs are opaque, and secret-bearing request and response data is never returned.
+
+| Endpoint                                           | Auth  | Purpose                                                 |
+| -------------------------------------------------- | ----- | ------------------------------------------------------- |
+| `POST /health/dependency-circuits/:key/reset`      | Admin | Reset one known circuit with an audited operator reason |
+| `POST /health/dependency-circuits/:key/override`   | Admin | Create an audited expiring `allow` or `block` override  |
+| `DELETE /health/dependency-circuits/:key/override` | Admin | Clear the active override for one circuit               |
+
+Reset accepts `{ "reason": "at least 8 characters" }`. Override accepts `{ "mode": "allow" | "block", "reason": "at least 8 characters", "durationSeconds": 60..3600 }`; `allow` bypasses admission without erasing unhealthy circuit evidence, while `block` rejects new work. Unknown reset targets and missing overrides return `404`.
+
+**Readiness Response**:
+
+```json
+{
+  "status": "ok",
+  "checks": { "storage": "ok", "memory": "ok", "disk": "ok" },
+  "timestamp": "2026-03-02T07:00:00Z"
+}
+```
+
+Authenticated deep-health responses include an optional top-level `sqlite`
+object after SQLite initializes successfully. The same redacted
+`sqlite-storage/v1` contract is returned by the Maintenance summary:
+
+| Field                               | Meaning                                                                                |
+| ----------------------------------- | -------------------------------------------------------------------------------------- |
+| `schemaVersion`                     | Always `sqlite-storage/v1`                                                             |
+| `databaseLocation`                  | `memory`, `configured`, or `runtime-default`; never a raw path                         |
+| `platform`                          | Runtime platform used for classification                                               |
+| `filesystemType`                    | Normalized filesystem type or conservative sentinel                                    |
+| `filesystemPosture`                 | `supported-local`, `known-unsafe`, `unknown`, or `not-applicable`                      |
+| `detectionSource` / `reasonCode`    | Redacted evidence and decision reason                                                  |
+| `journalMode`                       | `wal`, `delete`, `memory`, `refused`, or `unknown`                                     |
+| `decisionSource` / `overrideSource` | Automatic, memory, compatibility, or expert-override decision provenance               |
+| `healthPosture` / `lockingPosture`  | Healthy/degraded/refused posture and WAL or single-host ownership-lock state           |
+| `override`                          | Optional redacted policy ID, source, status, expiry, host binding, and restart posture |
+| `lastIntegrityCheck`                | Optional timestamp, `ok`/`failed` status, and bounded result from `PRAGMA quick_check` |
+
+Raw database paths, mount points, and mount sources are intentionally omitted.
+Unsafe or unknown startup posture cannot be queried through health because the
+server refuses to bind; use the redacted startup/supervisor log instead.
+
+### SQLite Journal Maintenance
+
+Journal-mode changes are staged through the authenticated API and execute only
+during the next server bootstrap, before route modules or SQLite-backed services
+load. Requests always target the configured authoritative database; clients
+cannot submit an arbitrary filesystem path.
+
+| Endpoint                                               | Permission     | Purpose                                                        |
+| ------------------------------------------------------ | -------------- | -------------------------------------------------------------- |
+| `POST /api/maintenance/sqlite/journal/preview`         | `backup:write` | Preview posture, sidecars, ownership, backup class, and risks  |
+| `POST /api/maintenance/sqlite/journal/apply`           | `admin:manage` | Schedule a confirmed preview for the next restart              |
+| `GET /api/maintenance/sqlite/journal/status`           | `backup:read`  | Read the scheduled operation and active override summary       |
+| `GET /api/maintenance/sqlite/journal/operations/:id`   | `backup:read`  | Read one redacted operation result                             |
+| `POST /api/maintenance/sqlite/journal/override/revoke` | `admin:manage` | Revoke compatibility/override policy; restart remains required |
+
+Preview body:
+
+```json
+{
+  "targetMode": "delete",
+  "singleHost": true,
+  "overrideReason": "Temporary single-host compatibility",
+  "expiresAt": "2026-07-16T00:00:00.000Z"
+}
+```
+
+`delete` mode and any expert override require an explicit single-host
+acknowledgement, a reason, a bounded future expiry,
+`VERITAS_SQLITE_TOPOLOGY=single-host`, and a stable
+`VERITAS_SQLITE_HOST_ID`. Known-unsafe filesystems cannot be overridden.
+
+Apply body:
+
+```json
+{
+  "previewId": "98af3a58-1b8b-41b3-8162-dfdb1f257740",
+  "previewToken": "<one-time token from preview>",
+  "confirm": "98af3a58-1b8b-41b3-8162-dfdb1f257740",
+  "acknowledgeRisks": true
+}
+```
+
+Apply returns `202` with `state: "scheduled"`. Restart the server once; the
+bootstrap takes an ownership lock, creates and verifies a local backup,
+checkpoints WAL, closes and reopens the source across the mode change, verifies
+the effective mode and full integrity, then commits policy. A pre-close failure
+reverts journal mode in place while exclusivity is still held. After the first
+close, recovery only completes a verified current mode; it never replaces the
+database with an older backup. A `recovery-required` result fails startup
+closed. Auth-disabled and
+localhost-bypass requests cannot schedule or revoke maintenance even when their
+implicit role is admin.
+
+---
+
+## WebSocket
+
+**Endpoint**: `ws://localhost:3001/ws`
+
+### Connection
+
+```javascript
+const ws = new WebSocket('ws://localhost:3001/ws?api_key=YOUR_API_KEY');
+```
+
+- Max connections: 50
+- Heartbeat: server pings every 30s; clients must pong within 10s
+- Origin validation enforced (CSWSH protection)
+
+### Authentication
+
+Pass API key as `api_key` query parameter only for WebSocket clients that cannot
+send headers during the upgrade. HTTP requests must use `Authorization: Bearer`
+or `X-API-Key`. In production, do not rely on localhost bypass.
+
+### Client → Server Messages
+
+**Subscribe to task output**:
+
+```json
+{
+  "type": "subscribe",
+  "taskId": "TASK-001",
+  "attemptId": "attempt_001",
+  "afterSequence": 41
+}
+```
+
+`attemptId` defaults to the active/latest attempt. `afterSequence` defaults to
+`0`. The server attaches the live tail before replaying stored events, so
+events appended during replay are delivered once and in sequence. The
+`subscribed` confirmation returns the resolved `attemptId` and current
+`cursor`.
+
+**Subscribe to chat session**:
+
+```json
+{ "type": "chat:subscribe", "sessionId": "session-abc" }
+```
+
+**Subscribe to shared run session events**:
+
+```json
+{ "type": "run-session:subscribe" }
+```
+
+The server confirms with `run-session:subscribed` after the connection has
+`task:read` access in the current workspace.
+
+### Server → Client Messages
+
+**Task change broadcast**:
+
+```json
+{ "type": "task:updated", "task": { "id": "TASK-001", "status": "done" } }
+```
+
+**Durable agent event**:
+
+```json
+{
+  "type": "agent:event",
+  "taskId": "TASK-001",
+  "attemptId": "attempt_001",
+  "data": {
+    "schemaVersion": "run-event/v1",
+    "eventId": "runevt_abcdefghijklmnopqr",
+    "taskId": "TASK-001",
+    "runId": "attempt_001",
+    "attemptId": "attempt_001",
+    "sessionId": "provider-session-001",
+    "sequence": 42,
+    "receivedAt": "2026-07-23T20:00:00.000Z",
+    "kind": "message.delta",
+    "source": { "provider": "codex-cli", "adapter": "codex-cli" },
+    "redaction": {
+      "status": "none",
+      "fields": [],
+      "originalBytes": 16,
+      "persistedBytes": 30
+    },
+    "payload": { "content": "Running tests..." },
+    "payloadHash": "<64 lowercase hex characters>"
+  },
+  "timestamp": "2026-07-23T20:00:00.000Z"
+}
+```
+
+Unknown future event kinds remain replayable. Persisted payloads are bounded
+and redacted; `redaction.status: "dropped"` means the provider payload exceeded
+the journal limit and was replaced by safe metadata.
+
+**Legacy agent output projection**:
+
+```json
+{
+  "type": "agent:output",
+  "taskId": "TASK-001",
+  "attemptId": "attempt_001",
+  "outputType": "stdout",
+  "content": "Running tests...",
+  "sequence": 42,
+  "timestamp": "2026-07-23T20:00:00.000Z"
+}
+```
+
+**Chat message**:
+
+```json
+{ "type": "chat:message", "sessionId": "session-abc", "message": { ... } }
+```
+
+**Agent status change**:
+
+```json
+{ "type": "agent:status", "status": "working", "activeAgents": [ ... ] }
+```
+
+**Shared run session event**:
+
+```json
+{
+  "type": "run-session:event",
+  "event": {
+    "id": "run_event_abc",
+    "shareId": "run_share_abc",
+    "taskId": "TASK-001",
+    "attemptId": "attempt_001",
+    "type": "message.sent",
+    "actor": { "id": "editor-1", "label": "Pair Editor" },
+    "message": "Run the focused verification gate",
+    "createdAt": "2026-06-18T10:00:00.000Z"
+  },
+  "workspaceId": "local",
+  "sequence": 42,
+  "timestamp": "2026-06-18T10:00:00.000Z"
+}
+```
+
+---
+
+## Shared Run Sessions
+
+Workspace-scoped live sharing for active task agent runs.
+
+Mounted at `/api/run-sessions`.
+
+| Method  | Path                              | Description                                               | Permissions  |
+| ------- | --------------------------------- | --------------------------------------------------------- | ------------ |
+| `GET`   | `/api/run-sessions`               | List shares in the current workspace. Supports filters.   | `task:read`  |
+| `POST`  | `/api/run-sessions`               | Create a view, edit, or fork share for a task run.        | `task:write` |
+| `GET`   | `/api/run-sessions/:id`           | Read an active share snapshot.                            | `task:read`  |
+| `GET`   | `/api/run-sessions/:id/events`    | Read share lifecycle, message, approval, and fork events. | `task:read`  |
+| `PATCH` | `/api/run-sessions/:id`           | Update permission, expiry, label, or mobile-safe classes. | `task:write` |
+| `POST`  | `/api/run-sessions/:id/revoke`    | Revoke a share.                                           | `task:write` |
+| `POST`  | `/api/run-sessions/:id/messages`  | Send an attributed co-drive message into the run.         | `task:write` |
+| `POST`  | `/api/run-sessions/:id/approvals` | Resolve an exact pending provider request.                | `task:write` |
+| `POST`  | `/api/run-sessions/:id/fork`      | Create a linked fork task without mutating the parent.    | `task:write` |
+
+### Create Share
+
+```http
+POST /api/run-sessions
+```
+
+```json
+{
+  "taskId": "TASK-001",
+  "permission": "view",
+  "expiresAt": "2026-06-19T10:00:00.000Z",
+  "actorLabel": "Release reviewer",
+  "mobileSafeApprovalClasses": ["elicitation"]
+}
+```
+
+`permission` is one of `view`, `edit`, or `fork`.
+
+The response includes `stablePath`, `snapshot`, `mobileSafeApprovalClasses`,
+`status`, and `forkedTaskIds`. The share path is not anonymous public access; it
+still requires workspace authentication and task read/write permissions.
+
+### Co-drive Message
+
+```http
+POST /api/run-sessions/run_share_abc/messages
+```
+
+```json
+{
+  "message": "Run the focused verification gate before release."
+}
+```
+
+The server records the request actor on the resulting `message.sent` event and
+forwards the message to the active run when the backing provider exposes an
+interactive stream. If interactive stdin is unavailable, the message is still
+recorded and streamed as session history.
+
+### Mobile-safe Approval
+
+```http
+POST /api/run-sessions/run_share_abc/approvals
+```
+
+```json
+{
+  "approvalId": "runapproval_cQBUv6oGPvQrBT9y8C14",
+  "actionClass": "elicitation",
+  "response": "approved",
+  "expectedRevision": 1,
+  "expectedActionHash": "c8a1f6f26c61b770694b5136f9a9ae9b08fd068cb8919ffebae4f2e88ec791f0",
+  "note": "Use the release branch.",
+  "responseData": {
+    "answers": {
+      "branch": { "answers": ["release/v6.0.2"] }
+    }
+  }
+}
+```
+
+The response is delivered to the exact paused provider request only after the
+broker accepts the revision and action hash. Mobile/PWA clients require both an
+approval marked `mobileSafe` by the provider adapter and an action class listed
+on the share. Unsafe, stale, changed, expired, or already-resolved requests fail
+closed.
+
+### Fork Session
+
+```http
+POST /api/run-sessions/run_share_abc/fork
+```
+
+```json
+{
+  "title": "Investigate forked run",
+  "priority": "high",
+  "reason": "Continue independently without changing the parent run."
+}
+```
+
+Forking creates a new task linked to the parent task and attempt. The fork
+description includes redacted parent context and a redacted run excerpt when
+available, but it does not inherit worktrees, thread IDs, credentials, or
+local-only handles.
+
+Revoked and expired shares fail closed for reads, messages, approvals, and
+forks. Share lists are scoped to the current workspace.
+
+---
+
+## Run Approvals
+
+Durable provider-native approval and elicitation requests. Mounted at
+`/api/run-approvals`.
+
+| Method | Path                                      | Description                                                      | Permissions |
+| ------ | ----------------------------------------- | ---------------------------------------------------------------- | ----------- |
+| `GET`  | `/api/run-approvals`                      | List workspace requests; filter by status, task, attempt, agent. | `task:read` |
+| `GET`  | `/api/run-approvals/:approvalId`          | Read one workspace-scoped request.                               | `task:read` |
+| `POST` | `/api/run-approvals/:approvalId/decision` | Atomically approve or reject the exact pending request.          | `admin`     |
+
+Action classes are `tool`, `shell`, `filesystem`, `network`, `budget`,
+`workflow`, and `elicitation`. Status is `pending`, `approved`, `rejected`,
+`expired`, or `cancelled`.
+
+### List Pending Requests
+
+```http
+GET /api/run-approvals?status=pending&taskId=TASK-001&attemptId=attempt_001
+```
+
+```json
+[
+  {
+    "schemaVersion": "run-approval/v1",
+    "id": "runapproval_cQBUv6oGPvQrBT9y8C14",
+    "workspaceId": "local",
+    "taskId": "TASK-001",
+    "attemptId": "attempt_001",
+    "provider": "codex-app-server",
+    "agentId": "codex-app-server",
+    "requestKind": "approval",
+    "actionClass": "shell",
+    "action": "Execute command: pnpm test",
+    "actionHash": "c8a1f6f26c61b770694b5136f9a9ae9b08fd068cb8919ffebae4f2e88ec791f0",
+    "resourceScope": ["/workspace/veritas-kanban"],
+    "workingDirectory": "/workspace/veritas-kanban",
+    "riskClass": "high",
+    "evidenceRevision": "sha256:provider-runtime-manifest",
+    "providerRequestId": "string:approval-1",
+    "mobileSafe": false,
+    "status": "pending",
+    "revision": 1,
+    "createdAt": "2026-07-23T12:00:00.000Z",
+    "updatedAt": "2026-07-23T12:00:00.000Z",
+    "expiresAt": "2026-07-23T12:05:00.000Z"
+  }
+]
+```
+
+The exact provider arguments are hashed but are not persisted or sent to
+remote clients. Display text, bounded resource scope, working directory, risk,
+policy reason, runtime evidence revision, and expiry provide the review
+context. Secrets in displayed or persisted fields are redacted.
+Structured response values are delivered only to the waiting provider process;
+they are not persisted or broadcast. The durable resolution records only that
+a response payload was provided.
+
+### Decide a Request
+
+```http
+POST /api/run-approvals/runapproval_cQBUv6oGPvQrBT9y8C14/decision
+```
+
+```json
+{
+  "decision": "approved",
+  "expectedRevision": 1,
+  "expectedActionHash": "c8a1f6f26c61b770694b5136f9a9ae9b08fd068cb8919ffebae4f2e88ec791f0",
+  "note": "Focused command approved once."
+}
+```
+
+Reviewer identity and authentication time come from the verified request
+context; caller-supplied identity fields are rejected. Critical-risk decisions
+require authentication no older than five minutes. The transition is a single
+compare-and-set from `pending`. Duplicate, stale, out-of-order, changed-action,
+expired, and cancelled decisions return a conflict or authorization error and
+cannot resume the provider action.
+
+Each request and resolution is appended to `run-event/v1` with the same
+approval ID, action hash, and provider correlation ID. Attempt interruption or
+cancellation resolves every remaining pending request as `cancelled`.
+
+Subscribers to the `run-sessions` WebSocket channel receive
+`run-approval:changed` messages for requests in their workspace:
+
+```json
+{
+  "type": "run-approval:changed",
+  "approval": {
+    "id": "runapproval_cQBUv6oGPvQrBT9y8C14",
+    "taskId": "TASK-001",
+    "status": "approved",
+    "revision": 2
+  },
+  "workspaceId": "local",
+  "sequence": 43,
+  "timestamp": "2026-07-23T12:01:00.000Z"
+}
+```
+
+---
+
+## Run Terminal Control
+
+Provider-neutral execution and supervision for commands owned by an active run attempt. Mounted at `/api/v1/run-terminals` with the standard `/api/run-terminals` compatibility alias.
+
+| Method | Path                                                                        | Description                                       | Permissions   |
+| ------ | --------------------------------------------------------------------------- | ------------------------------------------------- | ------------- |
+| `POST` | `/api/v1/run-terminals/runs/:taskId/:attemptId/execute`                     | Request approval or start one exact command.      | `agent:write` |
+| `GET`  | `/api/v1/run-terminals/runs/:taskId/:attemptId`                             | List handles for the exact active attempt.        | `agent:read`  |
+| `GET`  | `/api/v1/run-terminals/runs/:taskId/:attemptId/handles/:handleId`           | Read one scoped handle.                           | `agent:read`  |
+| `GET`  | `/api/v1/run-terminals/runs/:taskId/:attemptId/handles/:handleId/output`    | Read bounded output after a cursor.               | `agent:read`  |
+| `POST` | `/api/v1/run-terminals/runs/:taskId/:attemptId/handles/:handleId/wait`      | Wait up to 300 seconds for one handle.            | `agent:write` |
+| `POST` | `/api/v1/run-terminals/runs/:taskId/:attemptId/wait-any`                    | Wait for any of up to 64 unique handles.          | `agent:write` |
+| `POST` | `/api/v1/run-terminals/runs/:taskId/:attemptId/wait-all`                    | Wait for all of up to 64 unique handles.          | `agent:write` |
+| `POST` | `/api/v1/run-terminals/runs/:taskId/:attemptId/handles/:handleId/detach`    | Detach a foreground handle without disowning it.  | `agent:write` |
+| `POST` | `/api/v1/run-terminals/runs/:taskId/:attemptId/handles/:handleId/terminate` | Gracefully terminate, then escalate if necessary. | `agent:write` |
+
+Output accepts `afterCursor` and `limit` query parameters. Single waits accept `{"timeoutMs": 25000}`. Multi-handle waits accept `{"handleIds": ["terminal_1", "terminal_2"], "timeoutMs": 25000}`.
+
+Every route resolves the current active attempt before checking the handle's workspace, task, and attempt identity. Stale attempts and cross-scope handles return `404`. Output and wait limits return `400` when invalid.
+
+Execution accepts a stable caller-owned request ID, an executable plus argument array, explicit pipe or PTY posture, start mode, optional worktree-relative cwd, and environment names only:
+
+```json
+{
+  "requestId": "verify-build-1",
+  "command": "pnpm",
+  "args": ["build"],
+  "mode": "pipe",
+  "startMode": "background",
+  "cwd": ".",
+  "environmentKeys": ["PATH"]
+}
+```
+
+The first valid request returns `202` with `status: "approval-required"` and an exact-action run approval. Resolve that approval through `/api/v1/run-approvals/:approvalId/decision`, then retry the identical request. An approved retry returns `201` with `status: "started"` and the run-owned handle. Reusing `requestId` with a changed command or changed referenced-file evidence returns `409`; retrying an already-started exact request returns the original handle.
+
+The server, not the caller, supplies environment values and applies the active run's filesystem wrapper and network-egress environment. Commands are launched without a shell. Supported direct executable, interpreter, loader, config, and archive paths are hashed and joined to exact provenance or launch-baseline evidence. External, downloaded, attachment, connector, stale, gap, or unknown executable bytes require a critical human-only approval and are rehashed immediately before spawn. Project policy can require human review or deny agent, command, and tool-created inputs, but cannot lower the external-source floor. Unsupported indirect execution and uncertified file identities return typed `409` blockers. See [Run File Execution Approval v1](architecture/RUN-FILE-EXECUTION-APPROVAL-V1.md).
+
+---
+
+## Task Verification
+
+Verification step checklists for tasks — define acceptance criteria that must be checked off before a task is considered truly complete.
+
+Mounted at `/api/tasks`.
+
+### Add Verification Step
+
+```
+POST /api/tasks/:id/verification
+```
+
+**Body**:
+
+```json
+{
+  "description": "All unit tests passing"
+}
+```
+
+**Response** `201`: The updated task object with the new verification step added.
+
+### Update Verification Step
+
+```
+PATCH /api/tasks/:id/verification/:stepId
+```
+
+**Body** (partial):
+
+```json
+{
+  "checked": true
+}
+```
+
+When `checked` changes, `checkedAt` is automatically set (or cleared).
+
+**Response** `200`: The updated task object.
+
+### Delete Verification Step
+
+```
+DELETE /api/tasks/:id/verification/:stepId
+```
+
+**Response** `200`: The updated task object with the step removed.
+
+---
+
+## Task Comments
+
+Comment threads on tasks — supports adding, editing, and deleting comments. Comments auto-sync to linked GitHub issues.
+
+Comment mutations use the parent task revision. Send the latest task `ETag` in
+`If-Match` when adding, editing, or deleting comments. A stale comment edit
+returns the same `409 CONFLICT` shape documented in [Tasks](#tasks), with the
+latest task and comments in `details.current`.
+
+Mounted at `/api/tasks`.
+
+### Add Comment
+
+```
+POST /api/tasks/:id/comments
+```
+
+**Body**:
+
+```json
+{
+  "author": "veritas",
+  "text": "Root cause identified — auth middleware skips token refresh"
+}
+```
+
+**Response** `201`: The updated task object with the new comment.
+
+### Edit Comment
+
+```
+PATCH /api/tasks/:id/comments/:commentId
+```
+
+**Body**:
+
+```json
+{
+  "text": "Updated analysis — the issue is in the session store"
+}
+```
+
+### Delete Comment
+
+```
+DELETE /api/tasks/:id/comments/:commentId
+```
+
+---
+
+## Task Subtasks
+
+Break tasks into smaller work items with optional acceptance criteria per subtask.
+
+Mounted at `/api/tasks`.
+
+### Add Subtask
+
+```
+POST /api/tasks/:id/subtasks
+```
+
+**Body**:
+
+```json
+{
+  "title": "Add input validation",
+  "acceptanceCriteria": ["Rejects empty strings", "Returns 400 on invalid input"]
+}
+```
+
+**Response** `201`: The updated task object.
+
+### Update Subtask
+
+```
+PATCH /api/tasks/:id/subtasks/:subtaskId
+```
+
+**Body** (partial):
+
+```json
+{
+  "completed": true
+}
+```
+
+### Delete Subtask
+
+```
+DELETE /api/tasks/:id/subtasks/:subtaskId
+```
+
+### Toggle Acceptance Criterion
+
+```
+PATCH /api/tasks/:id/subtasks/:subtaskId/criteria
+```
+
+**Body**:
+
+```json
+{
+  "criteriaIndex": 0
+}
+```
+
+Toggles the checked state of a specific acceptance criterion on a subtask.
+
+---
+
+## Task Deliverables
+
+Track deliverable artifacts (files, PRs, docs) produced by agents working on a task.
+
+Mounted at `/api/tasks`.
+
+### List Deliverables
+
+```
+GET /api/tasks/:id/deliverables
+```
+
+### Add Deliverable
+
+```
+POST /api/tasks/:id/deliverables
+```
+
+**Body**:
+
+```json
+{
+  "title": "API endpoint implementation",
+  "type": "code",
+  "path": "server/src/routes/new-feature.ts",
+  "agent": "codex-1",
+  "description": "REST endpoints for the new feature"
+}
+```
+
+**Response** `201`: The updated task object.
+
+### Update Deliverable
+
+```
+PATCH /api/tasks/:id/deliverables/:deliverableId
+```
+
+**Body** (partial): Any of `title`, `type`, `path`, `status`, `description`.
+
+### Delete Deliverable
+
+```
+DELETE /api/tasks/:id/deliverables/:deliverableId
+```
+
+---
+
+## Recurring Work Scheduler
+
+Inspect and control recurring work across scheduled deliverables and scheduled workflow definitions.
+
+Mounted at `/api/scheduler`.
+
+### List Scheduler Items
+
+```
+GET /api/scheduler
+```
+
+Returns scheduler summary counts, scheduler items, retry state, health, and recent events.
+
+### Read Item
+
+```
+GET /api/scheduler/items/:id
+```
+
+Item IDs use the source prefix:
+
+- `scheduled-deliverable:<deliverableId>`
+- `workflow:<workflowId>`
+- `queue-monitor:<monitorId>`
+- `automation:<bindingId>`
+
+### Run Item Now
+
+```
+POST /api/scheduler/items/:id/run
+```
+
+Runs one scheduler item immediately. Deliverables execute through the scheduled deliverables runner. Workflows start a normal workflow run and return the started run ID.
+
+### Pause Item
+
+```
+POST /api/scheduler/items/:id/pause
+```
+
+Pauses the underlying scheduled deliverable or workflow schedule.
+
+### Resume Item
+
+```
+POST /api/scheduler/items/:id/resume
+```
+
+Re-enables the underlying scheduled deliverable or workflow schedule and clears scheduler retry delay.
+
+### Validate Item
+
+```
+POST /api/scheduler/items/:id/validate
+```
+
+Returns validation issues. Custom cron schedules are visible and manually runnable, but automatic due-run execution is not enabled until a cron adapter is configured.
+
+### Run Due Items
+
+```
+POST /api/scheduler/due/run
+```
+
+Runs all due standard schedules and refuses overlapping due-run passes.
+
+### Preview an Automation Draft
+
+```
+POST /api/scheduler/drafts/preview
+```
+
+Accepts `intent`, a stable `requestId`, and optional structured `hints`. Returns an export-safe `automation-draft/v1` with normalized cron and timezone values, three future-run examples, field origins and statuses, standing scope, budgets, stop conditions, and exact validation blockers. This endpoint requires `workflow:read` and performs no scheduler or execution mutation.
+
+### Save and Inspect Inactive Drafts
+
+```
+POST /api/scheduler/drafts
+GET /api/scheduler/drafts
+GET /api/scheduler/drafts/:id?revision=2
+```
+
+Saving appends only an inactive draft record. It does not create or enable a scheduler definition. Replaying an identical stable `requestId` returns the saved draft; reusing it with different input returns `409`. List returns the latest revision of each draft; the item endpoint can read the latest or an exact immutable revision.
+
+### Revise, Clone, or Delete an Inactive Draft
+
+```
+POST /api/scheduler/drafts/:id/revisions
+POST /api/scheduler/drafts/:id/clone
+DELETE /api/scheduler/drafts/:id?confirm=:id
+```
+
+Revision accepts the same body as preview and appends an immutable version. Clone requires a new stable `requestId`. Delete requires the exact draft ID in the `confirm` query parameter and removes only inactive draft revisions. These write endpoints require `workflow:write`; none can activate recurring work.
+
+### Preview and Activate an Immutable Automation Version
+
+```
+POST /api/scheduler/drafts/:id/activation-preview
+POST /api/scheduler/drafts/:id/activate
+```
+
+Preview accepts a stable `requestId` and optional exact draft `revision`. It returns `automation-activation-preview/v1`, including the effective Run Access ceiling, safe tool/integration/target names, current workflow and provider evidence, expiry, budgets, blockers, and deterministic `requestRevision`.
+
+Activate requires the same request identity plus `expectedRequestRevision`. Without `approvalId`, it creates a critical exact-action Run Approval and returns `202`. After human approval, retry the identical body with the approval ID. A current-evidence mismatch returns `409`; an enforceability blocker returns a validation error. Success returns the immutable `automation-version/v1` and its compare-and-set scheduler binding.
+
+### Inspect and Control Active Automations
+
+```
+GET /api/scheduler/automations
+POST /api/scheduler/automations/:bindingId/pause
+POST /api/scheduler/automations/:bindingId/resume
+POST /api/scheduler/automations/:bindingId/revoke
+```
+
+The list returns immutable versions, current bindings, and recent durable run claims. Control bodies require `expectedRevision` and `reason`. Revocation is permanent. Every due or manual run claims one exact due window before entering normal workflow admission; duplicate claims never create a second provider-side launch.
+
+---
+
+## Operations Digest
+
+`GET /api/digest/operations` returns the deterministic operations source bundle.
+Use `hours`, `from`, `to`, `project`, `repo`, and `cwd` to scope both JSON and
+Markdown output. `format=markdown` returns the briefing generated from the same
+filtered bundle.
+
+The response distinguishes two time models:
+
+- `active`, `blocked`, and `stuck` are current task-state snapshots. `stuck` is
+  the active subset whose task `updated` timestamp is at least two hours before
+  the selected window end.
+- `completed`, `failed`, `runs`, token usage/cost, active runtime, and observed
+  wall time are restricted to the selected window. Observed wall time is the
+  span between included signals, never task age.
+
+`inventory` reconciles all board tasks into included tasks or one mutually
+exclusive exclusion reason: filter mismatch, current status, time window, or
+missing metadata required by a selected filter. Every count includes task
+source IDs. `dataQuality` separately identifies matching tasks grouped under an
+unassigned project, unknown repository, or missing CWD so operators can drill
+into incomplete records. Run counts are deduplicated by attempt ID when
+available, otherwise by event ID.
+
+---
+
+## Queue Intake Monitors
+
+Scan bounded GitHub issue and PR queues, build candidate packets, and gate assign/execute actions through policy, budget, sandbox, auth, and workflow preflight checks.
+
+Mounted at `/api/queue-monitors`.
+
+| Method | Path                              | Description                                                |
+| ------ | --------------------------------- | ---------------------------------------------------------- |
+| `GET`  | `/api/queue-monitors`             | List monitors, health, candidate packet state, and events  |
+| `GET`  | `/api/queue-monitors/:id`         | Read one monitor                                           |
+| `PUT`  | `/api/queue-monitors/:id`         | Update mode, runner, labels, caps, workflow, and guardrail |
+| `GET`  | `/api/queue-monitors/:id/health`  | Read health and visible action item state                  |
+| `GET`  | `/api/queue-monitors/:id/explain` | Build a fresh packet and planned action without mutation   |
+| `POST` | `/api/queue-monitors/:id/run`     | Run one monitor now                                        |
+| `POST` | `/api/queue-monitors/:id/pause`   | Pause one monitor                                          |
+| `POST` | `/api/queue-monitors/:id/resume`  | Resume one monitor                                         |
+
+### Monitor Modes
+
+- `dry-run` records the selected candidate and skipped reasons without assigning or starting work.
+- `assign-only` can assign the selected GitHub issue/PR only after watcher policy, budget, sandbox, and stop-condition checks pass.
+- `draft-plan` records a local plan intent without GitHub mutation or workflow launch.
+- `execute` can start `workflowId` only after watcher policy, budget, sandbox, workflow dry-run, auth, and stop-condition checks pass.
+
+`runner: "local"` is executable in this version. `runner: "github-actions"` is persisted for monitor definitions but launch is blocked until a workflow-dispatch adapter is configured.
+
+Local queue sandbox preflight probes the configured Codex runtime and evaluates
+the preset against that exact manifest. If no valid manifest can be resolved,
+capability-dependent presets fail closed instead of using provider-name
+assumptions.
+
+### Candidate Packet
+
+Each run stores a bounded packet with:
+
+- `candidates`: issue/PR records with labels, assignees, CI state, score, reasons, and blockers
+- `selected`: first unblocked candidate after deterministic scoring
+- `skipped`: candidate IDs and skipped-work reasons
+- `checks`: GitHub scan, watcher policy, sandbox, budget, and workflow gate checks
+
+Repeated `failed` or `blocked` runs increment `failureStreak`. When the monitor reaches `stopConditions.maxFailureStreak`, health becomes `blocked` and `actionItem` explains what must be fixed before resuming.
+
+Queue monitor events are included in the operations digest when they fall inside the selected digest window.
+
+---
+
+## Task Archive
+
+Archive completed tasks (by sprint or individually) and restore them. Archived tasks are removed from the active board.
+
+Mounted at `/api/tasks`.
+
+| Method | Path                                | Description                        |
+| ------ | ----------------------------------- | ---------------------------------- |
+| `GET`  | `/api/tasks/archived`               | List all archived tasks            |
+| `GET`  | `/api/tasks/archive/suggestions`    | Get sprints ready for archival     |
+| `POST` | `/api/tasks/archive/sprint/:sprint` | Archive all done tasks in a sprint |
+| `POST` | `/api/tasks/bulk-archive`           | Archive by sprint name             |
+| `POST` | `/api/tasks/bulk-archive-by-ids`    | Archive specific task IDs          |
+| `POST` | `/api/tasks/:id/archive`            | Archive a single task              |
+| `POST` | `/api/tasks/:id/restore`            | Restore a task from archive        |
+
+### Archive by Sprint
+
+```
+POST /api/tasks/archive/sprint/:sprint
+```
+
+Archives all completed tasks in the given sprint.
+
+**Response** `200`:
+
+```json
+{
+  "archived": 5
+}
+```
+
+### Archive Single Task
+
+```
+POST /api/tasks/:id/archive
+```
+
+**Auth**: Requires `admin` or `agent` role. Emits audit log entry.
+
+### Restore Task
+
+```
+POST /api/tasks/:id/restore
+```
+
+Restores an archived task back to active status (`done`).
+
+---
+
+## Attachments
+
+File upload/download for task attachments with automatic text extraction (PDF, DOCX, etc.).
+
+Mounted at `/api/tasks`.
+
+| Method   | Path                                         | Description                      |
+| -------- | -------------------------------------------- | -------------------------------- |
+| `POST`   | `/api/tasks/:id/attachments`                 | Upload files (multipart, max 20) |
+| `GET`    | `/api/tasks/:id/attachments`                 | List all attachments             |
+| `GET`    | `/api/tasks/:id/attachments/:attId`          | Get attachment metadata          |
+| `GET`    | `/api/tasks/:id/attachments/:attId/download` | Download file                    |
+| `GET`    | `/api/tasks/:id/attachments/:attId/text`     | Get extracted text               |
+| `DELETE` | `/api/tasks/:id/attachments/:attId`          | Delete attachment                |
+
+### Upload Attachments
+
+```
+POST /api/tasks/:id/attachments
+Content-Type: multipart/form-data
+```
+
+**Field**: `files` — one or more files (max 20 per request).
+
+Files undergo MIME validation via magic bytes. Text is automatically extracted from supported formats.
+
+**Response** `200`:
+
+```json
+{
+  "attachments": [
+    {
+      "id": "att_abc123",
+      "filename": "design-spec.pdf",
+      "originalName": "design-spec.pdf",
+      "mimeType": "application/pdf",
+      "size": 245000
+    }
+  ],
+  "task": { "..." },
+  "rejected": []
+}
+```
+
+### Get Extracted Text
+
+```
+GET /api/tasks/:id/attachments/:attId/text
+```
+
+**Response** `200`:
+
+```json
+{
+  "attachmentId": "att_abc123",
+  "text": "Extracted document content...",
+  "hasText": true
+}
+```
+
+---
+
+## Agent Permissions
+
+Role-based permission levels for agents: `intern`, `specialist`, `lead`. Interns require approval for certain actions.
+
+Mounted at `/api/agents/permissions`.
+
+| Method  | Path                                    | Description                       |
+| ------- | --------------------------------------- | --------------------------------- |
+| `GET`   | `/api/agents/permissions`               | List all agent permissions        |
+| `GET`   | `/api/agents/permissions/:id`           | Get agent permission config       |
+| `PUT`   | `/api/agents/permissions/:id/level`     | Set permission level              |
+| `PATCH` | `/api/agents/permissions/:id`           | Update permission fields          |
+| `POST`  | `/api/agents/permissions/check`         | Check if agent can perform action |
+| `POST`  | `/api/agents/permissions/approvals`     | Request approval (intern)         |
+| `GET`   | `/api/agents/permissions/approvals`     | List pending approvals            |
+| `POST`  | `/api/agents/permissions/approvals/:id` | Review approval request           |
+
+### Set Permission Level
+
+```
+PUT /api/agents/permissions/:id/level
+```
+
+**Body**:
+
+```json
+{
+  "level": "specialist"
+}
+```
+
+Valid levels: `intern`, `specialist`, `lead`.
+
+### Check Permission
+
+```
+POST /api/agents/permissions/check
+```
+
+**Body**:
+
+```json
+{
+  "agentId": "codex-1",
+  "action": "deploy"
+}
+```
+
+**Response** `200`:
+
+```json
+{
+  "allowed": true,
+  "requiresApproval": false,
+  "traceId": "govtrace_1760000000000_ab12cd"
+}
+```
+
+### Update Permission Fields
+
+```
+PATCH /api/agents/permissions/:id
+```
+
+**Body** (partial):
+
+```json
+{
+  "trustedDomains": ["github.com"],
+  "canCreateTasks": true,
+  "canDelegate": false,
+  "canApprove": false,
+  "restrictions": ["no-deploy"]
+}
+```
+
+### Request Approval
+
+```
+POST /api/agents/permissions/approvals
+```
+
+Used by intern-level agents to request approval for restricted actions.
+
+### Review Approval
+
+```
+POST /api/agents/permissions/approvals/:id
+```
+
+Approve or reject a pending approval request.
+
+---
+
+## Workspace Execution Trust
+
+Scans repository-controlled execution inputs for a task's exact registered
+worktree and manages append-only operator decisions.
+
+Mounted at `/api/agents/:taskId/workspace-trust`.
+
+| Method | Path                                            | Description                              | Permission     |
+| ------ | ----------------------------------------------- | ---------------------------------------- | -------------- |
+| `GET`  | `/api/agents/:taskId/workspace-trust`           | Scan inventory and show current decision | `agent:read`   |
+| `POST` | `/api/agents/:taskId/workspace-trust/decisions` | Record an exact-inventory decision       | `admin:manage` |
+| `POST` | `/api/agents/:taskId/workspace-trust/revoke`    | Revoke the current decision              | `admin:manage` |
+
+All routes resolve the worktree from the task record. Callers cannot submit an
+arbitrary filesystem path.
+
+### Scan
+
+```
+GET /api/agents/TASK-001/workspace-trust
+```
+
+The response contains `workspace-execution-trust-inventory/v1`, stable
+credential-redacted identity evidence, classified entries and requested
+capabilities, the project maximum, and the latest decision when one exists.
+Source contents are never returned.
+
+### Record a Decision
+
+```
+POST /api/agents/TASK-001/workspace-trust/decisions
+```
+
+```json
+{
+  "inventoryDigest": "sha256:...",
+  "mode": "restricted",
+  "reason": "Reviewed instructions; retain read-only execution",
+  "expiresAt": "2026-08-01T00:00:00.000Z"
+}
+```
+
+`mode` accepts `trusted`, `restricted`, or `denied`. `expiresAt` is optional.
+If the inventory changed after review, the server returns `409` and does not
+record the decision.
+
+### Revoke
+
+```
+POST /api/agents/TASK-001/workspace-trust/revoke
+```
+
+```json
+{
+  "inventoryDigest": "sha256:...",
+  "reason": "Repository ownership changed"
+}
+```
+
+The revocation identifies the superseded decision and remains in the audit
+history. See
+[Workspace Execution Trust](architecture/WORKSPACE-EXECUTION-TRUST.md) for
+identity, inventory, restricted-mode, and launch-binding rules.
+
+---
+
+## Agent Routing
+
+Automatic agent resolution — determines the best agent for a task based on configurable routing rules.
+
+Mounted at `/api/agents`.
+
+| Method | Path                  | Description                   |
+| ------ | --------------------- | ----------------------------- |
+| `POST` | `/api/agents/route`   | Resolve best agent for a task |
+| `GET`  | `/api/agents/routing` | Get routing configuration     |
+| `PUT`  | `/api/agents/routing` | Update routing configuration  |
+
+### Resolve Agent
+
+```
+POST /api/agents/route
+```
+
+Accepts either a task ID or ad-hoc metadata: Metadata `subtaskCount` must be an integer from 0 through 500; it is evaluated as a count without creating task records.
+
+**By task ID**:
+
+```json
+{
+  "taskId": "TASK-001",
+  "requiredRuntimeCapabilities": ["run.resume", "tool.mcp"]
+}
+```
+
+**By metadata**:
+
+```json
+{
+  "type": "bug",
+  "priority": "high",
+  "project": "rubicon",
+  "subtaskCount": 3,
+  "requiredRuntimeCapabilities": ["run.resume", "tool.mcp"]
+}
+```
+
+**Response** `200`:
+
+```json
+{
+  "agent": "codex-1",
+  "model": "gpt-5.5",
+  "rule": "high-priority-bugs",
+  "reason": "Matched rule: High priority bugs. Selected manifest sha256:... with supported capability evidence.",
+  "runtimeSelection": {
+    "requiredCapabilities": ["run.resume", "tool.mcp"],
+    "compatible": true,
+    "selectedManifest": {
+      "manifestDigest": "sha256:...",
+      "provider": "codex-cli",
+      "compatible": true
+    },
+    "candidates": [
+      {
+        "manifestDigest": "sha256:...",
+        "provider": "codex-cli",
+        "compatible": true
+      }
+    ]
+  },
+  "runtimeCandidates": [
+    {
+      "agent": "codex-1",
+      "available": true,
+      "selected": true,
+      "reason": "Agent is healthy",
+      "selection": {
+        "requiredCapabilities": ["run.resume", "tool.mcp"],
+        "compatible": true,
+        "selectedManifest": {
+          "manifestDigest": "sha256:...",
+          "provider": "codex-cli",
+          "compatible": true
+        },
+        "candidates": [
+          {
+            "manifestDigest": "sha256:...",
+            "provider": "codex-cli",
+            "compatible": true
+          }
+        ]
+      }
+    }
+  ],
+  "traceId": "govtrace_1760000000000_ab12cd"
+}
+```
+
+When an enabled team roster exists, `/api/agents/route` evaluates the roster
+before legacy routing rules. Roster-selected responses use a `team-roster:`
+rule prefix.
+When runtime requirements are present, `runtimeCandidates` preserves every
+agent manifest evaluation attempted by the rule/fallback chain. Exactly one
+entry is marked `selected` on success; terminal `409 Conflict` details preserve
+all rejected entries and their structured manifest assessments.
+
+### Get/Update Routing Configuration
+
+```
+GET /api/agents/routing
+PUT /api/agents/routing
+```
+
+**PUT Body**:
+
+```json
+{
+  "enabled": true,
+  "rules": [
+    {
+      "id": "high-bugs",
+      "name": "High priority bugs",
+      "match": { "type": "bug", "priority": "high" },
+      "agent": "codex-1",
+      "model": "claude-sonnet-4.5",
+      "enabled": true
+    }
+  ],
+  "defaultAgent": "veritas",
+  "fallbackOnFailure": true,
+  "maxRetries": 2
+}
+```
+
+### Start Agent And Require Runtime Capabilities
+
+```
+POST /api/agents/:taskId/launch-preview
+POST /api/agents/:taskId/start
+```
+
+The preview and start endpoints accept the same request. Preview compiles the
+effective `run-launch-manifest/v1` without creating an attempt or dispatching a
+provider. Callers can select an agent or portable profile package, require
+additional runtime capabilities, and compare against a parent attempt:
+
+```json
+{
+  "profileId": "docs-reviewer",
+  "sandboxPresetId": "codex-repo-contained",
+  "phase": "implement",
+  "requiredRuntimeCapabilities": ["tool.mcp", "output.structured"],
+  "commitPolicy": "allowed",
+  "parentAttemptId": "attempt_parent"
+}
+```
+
+The launch path resolves the package runtime against configured provider
+profiles, applies package model/sandbox/budget posture, and renders bounded
+package instructions in an attributed section of the provider-owned transport.
+It also records the profile ID and version. Baseline launch
+capabilities plus caller, profile, sandbox, and budget requirements must be
+`supported` or `advisory` in one valid manifest before attempt state is
+mutated. Failure returns `409 Conflict` with `requiredCapabilities`, reasons,
+manifest identity, and remediation.
+
+The preview response contains `manifest`, current redacted provider and selected-host posture under `dependencyCircuits`, plus optional `parentAttemptId` and `drift`. The manifest contains redacted effective runtime inputs, instruction
+fingerprints, compiled phase evidence and source references, per-field origins,
+and an `enforcement` object. Prompt content, readiness override text,
+credential values, and raw local output paths are excluded. Preview and start
+apply the same readiness gate; an accepted operator override is represented by
+its digest and run-level origin. Start records the same contract in the active
+attempt, history, run log, and a policy governance trace before provider
+dispatch. Named tool/MCP/permission restrictions and required profile health
+checks block launch when the adapter cannot enforce them explicitly.
+
+`phase` accepts `explore`, `plan`, `implement`, `verify`, or `publish`.
+Compilation intersects the requested profile with the exact parent launch or
+current transition evidence before attempt mutation. Descendants, retries,
+fallbacks, and provider changes cannot widen parent authority. An unsupported
+phase dimension returns `409 Conflict` with typed `phase-*` enforcement
+blockers. Omitting `phase` creates explicit legacy evidence only when no
+profile-authoritative parent exists. ACP stdio can enforce the required
+pre-execution command and external-action mediation. Other adapters return
+typed blockers for explicit phases instead of treating prompts or
+post-execution events as enforcement.
+
+Codex app-server and Claude Code accept a positive MCP catalog through native,
+run-scoped configuration. Other task adapters reject non-empty MCP selections.
+Approval-required tools are omitted from native provider configuration and use
+the mediated tool-call API below. Prompt text is never accepted as equivalent
+enforcement.
+
+### Durable Phase Transitions
+
+```
+GET  /api/agents/:taskId/phase?attemptId=attempt_123&limit=100
+POST /api/agents/:taskId/phase/transitions
+```
+
+The GET endpoint returns a server-owned `phase` snapshot plus compatible
+`current` and bounded append-only `history` fields for one exact run. The
+snapshot includes the launch phase, effective evidence, manifest digest,
+transition sequence, and history. A launch with no transition is therefore
+visible before the first journal record. The POST body is a compare-and-set
+request:
+
+```json
+{
+  "attemptId": "attempt_123",
+  "operationId": "move-to-implement",
+  "expectedSequence": 1,
+  "expectedPhaseEvidenceDigest": "sha256:...",
+  "expectedManifestDigest": "sha256:...",
+  "reason": "The approved plan is ready to implement.",
+  "targetEvidence": {
+    "schemaVersion": "phase-capability-evidence/v1"
+  }
+}
+```
+
+`targetEvidence` must be the complete compiled evidence document with a valid
+content digest. The first transition also includes `fromEvidence`; subsequent
+requests must match the journal's current sequence and evidence. The active
+attempt and persisted launch-manifest digest must still match.
+
+Same-authority and narrowing transitions return `201` with `status: "applied"`.
+Expansion creates an exact-action run approval and returns `202` with
+`status: "approval-required"`. After approval, retry the identical operation
+with its `approvalId`. Emergency expansion accepts
+`emergencyOverride: { justification, expiresAt }`, requires `admin:manage`, and
+cannot last more than 24 hours. Expiry appends a system-attributed restoration
+of the prior evidence.
+
+Reads require `agent:read`; transition requests require `task:write`. Approval
+decisions use `/api/run-approvals/:approvalId/decision` and require an
+administrator. See
+[Phase Transition Journal](architecture/PHASE-TRANSITION-JOURNAL.md) for
+storage, idempotency, and delivery boundaries.
+
+### Effective Run Access
+
+```
+GET /api/agents/:taskId/access?attemptId=attempt_123
+```
+
+The endpoint returns `run-access-summary/v1` for one exact attempt. `current`
+is the launch authority or latest phase transition; `history` preserves prior
+immutable versions. The projection joins the launch manifest, phase evidence,
+provider capability manifest, tool catalog, brokered integration metadata, and
+admission reservation. Every section names its source digest, and missing or
+conflicting source records return typed blockers instead of inferred access.
+
+Reads require `agent:read`. Responses omit credential values, raw environment
+and header values, local filesystem paths, and URL paths or query strings. See
+[Run Access Summary v1](architecture/RUN-ACCESS-SUMMARY-V1.md) for the full
+contract and failure states.
+
+### Governed Run Access Changes
+
+```
+POST /api/agents/:taskId/access/changes/preview
+POST /api/agents/:taskId/access/changes
+```
+
+The preview endpoint accepts the exact attempt, stable request ID,
+`transition-phase` operation, target phase, reason, Run Access summary digest,
+transition sequence, phase-evidence digest, and launch-manifest digest.
+It compiles the target from built-in server profiles and the immutable launch
+authority ceiling. The response is `run-access-change-preview/v1`: an exact
+before/after authority delta, affected tool and integration names, unchanged
+budget projection, approval class, provider enforcement decision, safe boundary,
+and deterministic request revision. Callers cannot submit mutable target evidence
+through this surface.
+
+Applying the change repeats the preview input with `requestRevision`. The server
+recompiles and rejects a stale sequence, digest, manifest, request revision, or
+changed reuse of the request ID before delegating to the append-only phase
+transition journal. Added scopes require exact-action approval. Retry the same
+request and approval ID after approval; rejected and expired approvals cannot
+mutate authority. Removals apply without widening only when the active provider
+can prove atomic enforcement.
+
+ACP stdio currently supports live mediated command, external-action, and plan
+artifact changes. Filesystem, network, and credential boundary changes return a
+typed `pause-before-relaunch` blocker. Other providers return a typed unsupported
+blocker for any live authority change. Preview requires `agent:read`; apply
+requires `task:write`.
+
+### Automatic Run Recovery
+
+```
+GET  /api/agents/:taskId/recovery
+POST /api/agents/:taskId/recovery/cancel
+POST /api/workflows/runs/:runId/recovery/cancel
+```
+
+The GET endpoint returns the latest durable `run-recovery/v1` decision or
+`null`. Cancellation requires the exact parent attempt:
+
+```json
+{ "attemptId": "attempt_parent" }
+```
+
+Only a `scheduled` or `launching` recovery can be cancelled. A stale attempt
+ID, already launched child, or terminal recovery returns `409 Conflict`.
+Recovery records expose the normalized failure class, action, state, root and
+parent IDs, sequence, backoff and not-before time, selected route, manifest
+digests, cumulative budget, and any operator handoff.
+
+Workflow cancellation requires the exact step and causal parent:
+
+```json
+{
+  "stepId": "implement",
+  "parentRunId": "run_123:implement:0"
+}
+```
+
+The caller must have execute permission on the workflow.
+
+### Progress Watchdog
+
+```http
+GET  /api/agents/:taskId/watchdog?attemptId=attempt_123
+POST /api/agents/:taskId/watchdog/:findingId/override
+```
+
+The GET endpoint returns typed `progress-watchdog-finding/v1`,
+`progress-watchdog-action/v1`, and `progress-watchdog-override/v1` records
+rehydrated from the exact attempt's causal journal. Findings expose only
+redacted event IDs and fingerprint hashes, detector confidence, policy
+version, suppressed event IDs, chosen action, and remaining recovery budget.
+Reading requires `agent:read`.
+
+An `agent:write` principal with local run-control authority can resolve a
+paused, failed, or operator-required decision:
+
+```json
+{
+  "attemptId": "attempt_123",
+  "resolution": "acknowledge",
+  "reason": "Operator reviewed the evidence and accepts the current terminal state."
+}
+```
+
+`resolution` accepts `acknowledge`, `continue`, or `cancel`. Continue launches
+a provider-native resume from the exact terminal attempt with a stable
+idempotency key and an instruction to use materially different evidence.
+Cancel targets only the exact active attempt. Each request and result is
+append-only and actor-attributed; a conflicting second resolution returns
+`409 Conflict`.
+
+### Conversation Lifecycle
+
+```
+POST /api/agents/:taskId/conversation/resume
+POST /api/agents/:taskId/conversation/follow-up
+POST /api/agents/:taskId/conversation/fork
+POST /api/agents/:taskId/conversation/steer
+POST /api/agents/:taskId/conversation/interrupt
+POST /api/agents/:taskId/conversation/compact
+POST /api/agents/:taskId/conversation/archive
+POST /api/agents/:taskId/conversation/close
+```
+
+Resume, follow-up, and fork require a terminal source attempt with durable
+provider identity:
+
+```json
+{
+  "sourceAttemptId": "attempt_parent",
+  "message": "Continue from the verified history",
+  "forkTurnId": "turn_7",
+  "phase": "verify",
+  "commitPolicy": "allowed",
+  "idempotencyKey": "operator-generated-key"
+}
+```
+
+`forkTurnId` is accepted only for fork. The remaining controls require the
+exact active `attemptId`; steer also requires `message`. Every action validates
+capability and immutable launch evidence before invoking a provider-native
+operation. Unsupported steering fails with an explicit capability error, and
+any recorded-only fallback returns `delivered: false` with a reason. Veritas
+does not claim that recording a message or writing process stdin reached the
+provider.
+
+Fresh, resume, follow-up, and fork launches accept `idempotencyKey` in the JSON
+body or `X-Idempotency-Key` in the request headers; the header takes precedence.
+Veritas hashes the value before persistence. Repeating an admitted or queued
+request with the same key returns the same durable admission outcome instead of
+launching duplicate work.
+
+Resume, follow-up, and fork bind the exact source attempt as the phase parent.
+An optional `phase` may narrow that authority but cannot widen it. Omitting the
+field inherits a profile-authoritative parent; a legacy source remains
+explicitly legacy.
+
+### Workspace Checkpoint Rewind
+
+```
+POST /api/agents/:taskId/workspace/checkpoints/rewind
+```
+
+An `agent:write` principal with local run-control authority can request a preview-first rewind for the exact active attempt:
+
+```json
+{
+  "attemptId": "attempt_123",
+  "targetCheckpointId": "checkpoint_target",
+  "descendantCheckpointId": "checkpoint_descendant",
+  "requestId": "operator-generated-idempotency-key",
+  "resolutions": [
+    { "path": "src/agent-change.ts", "decision": "accept" },
+    { "path": "src/operator-change.ts", "decision": "reject" },
+    { "path": "notes/local.md", "decision": "leave-untouched" }
+  ]
+}
+```
+
+`resolutions` is optional. An unresolved attribution conflict returns `409` with its exact path. Re-submit with one decision per conflicted path: `accept` includes the path in the rewind, while `reject` and `leave-untouched` preserve its descendant content. Unknown paths, duplicate decisions, current-state divergence, Git/index conflicts, exclusions, and incomplete inventories still fail closed. The canonical decisions and selected paths are included in the preview digest, approval action, transaction digest, and recovery record.
+
+`X-Idempotency-Key` may supply `requestId` and takes precedence over the body. A conflict-free or fully resolved first request returns `202` with a critical, non-mobile approval bound to the checkpoint IDs, stable preview evidence, selected paths, resolutions, runtime state, provider evidence revision, and estimated data loss. Repeating the same request after approval revalidates all evidence, quiesces the provider, commits the recoverable storage transaction, and then recovers provider history from the approved checkpoint cursor.
+
+Production runtime recovery currently supports only an active Codex app-server thread with an earlier exact turn cursor in the same thread. Item-level cursors, the currently interrupted turn, other threads, stale runtime evidence, unresolved workspace conflicts, and providers without native fork return `409 Conflict`. A successful response records a new live provider thread plus the checkpoint cursor used as its rewind anchor; it does not pretend the provider reused the old thread ID.
+
+`commitPolicy` accepts `forbidden`, `allowed`, or `required`. A run value
+overrides `task.executionPolicy.commitPolicy`, then the legacy
+`features.agents.autoCommitOnComplete` setting. Legacy `true` maps to
+`required`; `false` or an absent value maps to the compatible `allowed`
+default. Unknown policy fields or values return `400 Validation failed`.
+
+`GET /api/agents/:taskId/status` returns the active manifest and its derived
+controls:
+
+```json
+{
+  "running": true,
+  "attemptId": "attempt_123",
+  "provider": "codex-cli",
+  "providerRuntimeManifest": { "digest": "sha256:..." },
+  "runLaunchManifest": {
+    "schemaVersion": "run-launch-manifest/v1",
+    "digest": "sha256:...",
+    "providerRuntime": {
+      "digest": "sha256:...",
+      "provider": "codex-cli",
+      "probeRevision": 10
+    },
+    "runtime": {
+      "command": "codex",
+      "model": "gpt-5.5"
+    },
+    "enforcement": {
+      "enforceable": true,
+      "blockers": [],
+      "warnings": []
+    }
+  },
+  "taskEnvelope": {
+    "schemaVersion": "task-envelope/v1",
+    "digest": "sha256:...",
+    "commitPolicy": "allowed",
+    "workspace": {
+      "baseline": {
+        "headSha": "0123456789abcdef0123456789abcdef01234567",
+        "dirty": false,
+        "files": []
+      }
+    }
+  },
+  "controls": {
+    "manifestDigest": "sha256:...",
+    "probeState": "ready",
+    "controls": [
+      {
+        "action": "stop",
+        "label": "Stop run",
+        "capabilityId": "run.stop",
+        "state": "supported",
+        "available": true,
+        "advisory": false,
+        "reason": "The adapter terminates the supervised provider process."
+      }
+    ]
+  }
+}
+```
+
+Stop, message, completion, token-reporting, and attempt-log endpoints re-check
+both persisted snapshots. Invalid or active/persisted provider or run-launch
+digest mismatches return `409 Conflict`; unsupported capability states return
+the same structured control evidence.
+
+Durable run events can be replayed independently of the Markdown attempt log:
+
+```http
+GET /api/agents/TASK-001/attempts/attempt_123/events?afterSequence=41&limit=200
+```
+
+The response contains `schemaVersion`, `taskId`, `attemptId`, ordered `events`,
+`nextCursor`, and `hasMore`. `afterSequence` must be non-negative and `limit`
+must be between 1 and 500. Access uses the same `run.logs` capability check as
+attempt logs. Clients should persist `nextCursor` and reconnect with it rather
+than inferring order from timestamps. `sessionId`, `turnId`, and `itemId` are
+separate optional identities and appear only when the provider reports them.
+
+Run payloads above the inline event limit are redacted before being persisted
+as `run-output-artifact/v1`. The event keeps a `run-output-preview/v1` under
+`payload.outputArtifact` with the opaque artifact ID, media/content class,
+original and preview byte counts, truncation reason, state, and allowed query
+operations. No response exposes the host storage path.
+
+Authorized readers query the artifact within the exact workspace, task, run,
+and attempt scope:
+
+```http
+GET /api/agents/TASK-001/output-artifacts/spill_abc123...?runId=attempt_123&attemptId=attempt_123
+GET /api/agents/TASK-001/output-artifacts/spill_abc123...?runId=attempt_123&attemptId=attempt_123&operation=byte-range&offset=0&length=4096
+GET /api/agents/TASK-001/output-artifacts/spill_abc123...?runId=attempt_123&attemptId=attempt_123&operation=line-range&startLine=100&lineCount=50
+GET /api/agents/TASK-001/output-artifacts/spill_abc123...?runId=attempt_123&attemptId=attempt_123&operation=json-path&jsonPath=$.rows[0]
+GET /api/agents/TASK-001/output-artifacts/spill_abc123.../download?runId=attempt_123&attemptId=attempt_123&offset=0&length=4194304
+```
+
+Metadata reads remain available after expiry or quarantine so event references
+do not break silently. Content queries are bounded and rate-limited. Download
+ranges revalidate the stored hash and secret shapes first; a mismatch
+quarantines the body. Invalid UTF-8, binary, and compressed content is
+metadata-only unless an explicit storage policy allows it. Cleanup honors
+active-run leases, removes eligible bodies deterministically, retains
+tombstones, and reports reclaimed bytes.
+
+Stop and message requests must carry the `attemptId` returned by status so a
+delayed control cannot affect a replacement run:
+
+```json
+{ "attemptId": "attempt_123" }
+```
+
+`POST /api/agents/:taskId/message` adds the attributed `message` (and optional
+`actor`) to that body. `POST /api/agents/:taskId/tokens` also requires the exact
+`attemptId`; the server never falls back to the task's current attempt.
+
+OpenClaw completion callbacks must identify the exact run that produced them:
+
+```json
+{
+  "attemptId": "attempt_123",
+  "providerRuntimeManifestDigest": "sha256:<64 lowercase hex characters>",
+  "success": true,
+  "summary": "Implemented and verified the requested change"
+}
+```
+
+`POST /api/agents/:taskId/complete` rejects OpenClaw callbacks whose attempt or
+manifest digest does not match the active run. The bounded legacy body above
+remains supported. A callback can instead send an explicit `status`
+(`success`, `blocked`, `failed`, `interrupted`, or `partial`) plus bounded
+`blockers`, provider `evidence`, `artifacts`, `verification`, and
+`continuation`. The route fixes the terminal source to `callback`; clients
+cannot spoof process, stream, or operator ownership. Only OpenClaw attempts
+accept callback or remote-session completion; process and SDK providers return
+`409 Conflict` for that transport.
+
+Every terminal path persists one digest-bound `completion-result/v1` on the
+current attempt and attempt history. It includes `digest`, `idempotencyKey`,
+`completedAt`, `terminalSource`, envelope/runtime bindings, normalized status,
+bounded redacted claims, harness evidence, attributable files and artifacts,
+verification, side effects, continuation, and phase evidence when the launch
+was phase-bound. Phase evidence identifies the launch digest, final effective
+authority, transition sequence, and every authority-expanding transition.
+Exact duplicate callbacks return success without mutating the task again,
+including after restart. Conflicting terminal claims return `409 Conflict`.
+Startup reconciliation also persists `interrupted` completion results for
+harness-owned process or stream attempts that were still running when the
+server restarted. OpenClaw attempts remain eligible for their authoritative
+callback after restart.
+
+Codex CLI, Codex SDK, Codex app-server, Claude Code, and Hermes do not call this
+endpoint; Veritas captures their terminal process or stream output and owns
+completion normalization. Codex app-server completion is authoritative only
+after a schema-valid `turn/completed` notification for the correlated task
+thread and turn.
+Claimed success becomes `partial` when required harness evidence is absent,
+commit policy is violated, a required output is missing, or an unauthorized
+side effect is observed. `success` maps the task to `done`, `blocked` maps it
+to `blocked`, and `failed`, `interrupted`, or `partial` leaves it in
+`in-progress` recovery. Token reports likewise bind
+telemetry and budget mutation to their required `attemptId`, so a late event
+from a prior attempt cannot charge or stop a replacement run.
+
+### Provider Runtime Manifest On Attempts
+
+Every executable task adapter is probed before the attempt mutates task state.
+Task and trace responses can therefore include the immutable
+`providerRuntimeManifest` used at launch:
+
+```json
+{
+  "schemaVersion": "provider-runtime-manifest/v1",
+  "probeRevision": 5,
+  "provider": "codex-cli",
+  "adapter": "codex-cli",
+  "protocolVersion": "codex-exec-json/v1",
+  "providerVersion": "codex-cli 0.144.0",
+  "models": ["gpt-5.5"],
+  "capabilities": [
+    {
+      "id": "run.streaming",
+      "state": "supported",
+      "source": "contract-test",
+      "reason": "Codex JSONL output is streamed into run events."
+    }
+  ],
+  "probe": {
+    "state": "ready",
+    "probedAt": "2026-07-16T01:30:00.000Z",
+    "source": "codex --version",
+    "diagnostics": []
+  },
+  "digest": "sha256:<64 lowercase hex characters>"
+}
+```
+
+### Task Envelope On Attempts
+
+The start API builds the immutable envelope only after readiness, runtime
+manifest, and sandbox decisions succeed, but before provider execution. The
+same `taskEnvelope` is returned by start/status and persisted on the current
+attempt and attempt history. Its digest covers the provider-neutral task,
+workspace baseline, policy, expected outputs, gates, and launch-manifest
+reference. Dirty baseline entries include `indexBlobHash` and
+`worktreeSha256`, allowing completion attribution to distinguish staged and
+unstaged pre-launch content. Baseline capture is sequential, retries up to
+three times when HEAD, status, or fingerprints move, and fails closed if the
+worktree never stabilizes. Existing attempt records without an envelope remain
+readable.
+
+New envelopes may also include `subject.memory`, a maximum of eight ranked,
+human-accepted reflection lessons. Each item carries `reflectionId`, source
+task/run/event IDs, confidence, relevance, observed retrieval count, and the
+retrieval timestamp. The persisted envelope is the authoritative record of
+which reviewed memory influenced an attempt. Preview attempts select the same
+bounded context without incrementing observed use.
+
+Task create/update payloads may set reusable defaults under
+`executionPolicy`:
+
+```json
+{
+  "executionPolicy": {
+    "commitPolicy": "forbidden",
+    "allowedSideEffects": [{ "kind": "filesystem-write", "scope": "." }],
+    "fileExecution": {
+      "agentCreated": "human-approval",
+      "commandCreated": "standard-approval",
+      "toolCreated": "deny"
+    }
+  }
+}
+```
+
+Run-time allowed side effects are intersected with the effective sandbox and
+manifest posture; a task policy cannot grant a capability that launch policy
+does not authorize. Path scopes wider than the assigned worktree are clamped to
+the worktree, while disjoint path scopes are dropped. Generic task PATCH calls
+cannot set `attempt.taskEnvelope` or `attempt.completionResult`; only the
+launch and finalization services may persist those authoritative contracts.
+`fileExecution` accepts `standard-approval`, `human-approval`, or `deny` for
+agent, command, and tool-created inputs and is frozen into the task envelope.
+External, attachment, connector, downloaded, stale, gap, and unknown sources
+always retain the human-only floor.
+
+Before dispatch, the selected adapter renders the envelope through an immutable
+`provider-task-envelope-transport/v1` request. Built-in renderers exist for
+OpenClaw, Codex CLI, Codex SDK, Codex app-server, Claude Code, and Hermes.
+Every rendered request includes the envelope and runtime identity, objective
+and bounded context, workspace baseline, explicit commit policy, allowed side
+effects, outputs, verification gates, and completion evidence contract.
+Profile instructions and task checkpoint state are separate attributed
+sections capped at 20,000 characters each. The exact rendered content is
+fingerprinted in the run launch manifest as
+`instructions.effective-task-request`.
+
+OpenClaw's transport includes the attempt-bound completion callback. Codex CLI,
+Codex SDK, Codex app-server, Claude Code, and Hermes transports explicitly
+forbid calling that
+callback and return terminal output through harness-owned process or stream
+capture.
+Provider and adapter identity must match the envelope before dispatch. Veritas
+does not infer native structured-output support from prompt rendering and owns
+completion validation and normalization.
+
+The full manifest contains one entry for every known runtime and sandbox
+capability. A provider version/build change invalidates cached conformance
+evidence. Failed probes and unknown versions are not positively cached.
+Explicitly configured providers without a task execution adapter fail with
+`409 Conflict` instead of falling back to OpenClaw.
+
+### Runtime Manifest Registration And Routing
+
+`POST /api/agents/register` and
+`POST /api/agents/register/:id/heartbeat` accept an optional
+`providerRuntimeManifest` object using the contract above. The server validates
+the complete capability inventory and recomputes the canonical digest before
+storing it. Secret-like evidence and unknown request fields are rejected rather
+than silently stored or stripped. Invalid persisted manifests are ignored on
+restart so capability routing fails closed. An agent may write its own manifest
+when its authenticated key/token identity matches the registry ID; otherwise
+`agent:write` is required in addition to registry write access. Every later
+mutation of that authoritative record remains identity-bound. Changing the
+registered provider, model, or version without replacement evidence invalidates
+the prior manifest.
+
+`POST /api/agents/route` and `POST /api/agents/hosts/preview` accept:
+
+```json
+{
+  "requiredRuntimeCapabilities": ["run.resume", "tool.mcp"]
+}
+```
+
+Host provider, model, `tool.*`, and sandbox posture is aggregated from validated
+manifests. Legacy registry fields are returned as display-only posture and
+cannot satisfy these requirements. A single manifest must match the requested
+provider and model and satisfy every required capability. `supported` evidence
+qualifies; `advisory` qualifies with a warning; `unsupported`, `unknown`,
+missing, or failed-probe evidence rejects the candidate with structured reasons.
+Custom provider identifiers use the same schema and selection path without a
+central provider branch. Registration enables discovery and routing only; an
+execution adapter is still required before launch.
+
+Only live registrations with a heartbeat no older than five minutes contribute
+runtime evidence. `requiredTools` values using `tool.*` are evaluated through
+the same single-manifest path; legacy named tools cannot qualify a host.
+Launch-time sandbox preset rules and active run controls use the exact manifest
+persisted on the attempt. Provider events, status, logs, completion, stop,
+steer, token usage, and artifacts reject missing, invalid, failed-probe, or
+active/persisted digest-mismatched snapshots.
+
+---
+
+## Team Roster Manifests
+
+Team rosters define the workspace coordinator, enabled agent members, roles,
+capabilities, routing rules, fallbacks, and reviewers. The manifest is stored in
+app config as `teamRoster`.
+
+Mounted at `/api/config/team-roster`.
+
+| Method | Path                                         | Description                                   | Permissions      |
+| ------ | -------------------------------------------- | --------------------------------------------- | ---------------- |
+| `GET`  | `/api/config/team-roster`                    | Return the stored roster or `null`            | `settings:read`  |
+| `PUT`  | `/api/config/team-roster`                    | Replace the roster manifest                   | `settings:write` |
+| `POST` | `/api/config/team-roster/validate`           | Validate a roster object or YAML/JSON content | `settings:read`  |
+| `POST` | `/api/config/team-roster/import`             | Import and store YAML/JSON roster content     | `settings:write` |
+| `GET`  | `/api/config/team-roster/export?format=yaml` | Export the stored roster as YAML or JSON      | `settings:read`  |
+| `POST` | `/api/config/team-roster/preview-route`      | Preview the selected member for task metadata | `settings:read`  |
+
+### Preview Route
+
+```json
+{
+  "type": "docs",
+  "priority": "medium",
+  "project": "docs",
+  "path": "docs/API-REFERENCE.md",
+  "capabilities": ["docs"],
+  "subtaskCount": 2
+}
+```
+
+Preview responses include the matched member, fallback member when used,
+reviewer members, selected agent/profile, reason, and validation issues.
+Invalid rosters never route agent launches.
+
+---
+
+## Workspace Capability Discovery
+
+Workspace capability manifests let a board publish what work it accepts and
+register trusted peer manifests for delegated intake. Manifest data is stored in
+app config as `workspaceCapability`, `trustedWorkspaceCapabilities`, and
+`workspaceDelegations`.
+
+Mounted at `/api/workspace-capabilities`.
+
+| Method   | Path                                                  | Description                                      | Permissions      |
+| -------- | ----------------------------------------------------- | ------------------------------------------------ | ---------------- |
+| `GET`    | `/api/workspace-capabilities/manifest`                | Return the local published manifest or `null`    | `workspace:read` |
+| `PUT`    | `/api/workspace-capabilities/manifest`                | Replace the local published manifest             | `settings:write` |
+| `POST`   | `/api/workspace-capabilities/manifest/validate`       | Validate a manifest object or YAML/JSON content  | `workspace:read` |
+| `POST`   | `/api/workspace-capabilities/manifest/import`         | Import and store the local manifest              | `settings:write` |
+| `GET`    | `/api/workspace-capabilities/manifest/export`         | Export the local manifest as YAML or JSON        | `workspace:read` |
+| `GET`    | `/api/workspace-capabilities/trusted`                 | List trusted peer manifests                      | `workspace:read` |
+| `POST`   | `/api/workspace-capabilities/trusted`                 | Register or replace a trusted peer manifest      | `settings:write` |
+| `DELETE` | `/api/workspace-capabilities/trusted/:workspaceId`    | Remove a trusted peer manifest                   | `settings:write` |
+| `GET`    | `/api/workspace-capabilities/discover`                | Return local plus trusted manifests for browsing | `workspace:read` |
+| `POST`   | `/api/workspace-capabilities/intake`                  | Create delegated task intake from a trusted peer | `task:write`     |
+| `GET`    | `/api/workspace-capabilities/delegations`             | List stored delegation records                   | `task:read`      |
+| `POST`   | `/api/workspace-capabilities/delegations/:id/refresh` | Refresh latest target state                      | `task:write`     |
+
+### Manifest Shape
+
+```json
+{
+  "id": "local-board",
+  "schemaVersion": "workspace-capability/v1",
+  "workspaceId": "local",
+  "name": "Local Board",
+  "enabled": true,
+  "boardUrl": "https://veritas.example",
+  "capabilities": [
+    {
+      "id": "docs",
+      "name": "Documentation",
+      "acceptedTaskTypes": ["docs"],
+      "defaultLabels": ["docs"],
+      "defaultProject": "handbook",
+      "defaultPriority": "medium",
+      "requiredContextFields": ["acceptance"],
+      "intakeTargets": ["task"]
+    }
+  ]
+}
+```
+
+Validation rejects duplicate capability IDs and secret-like manifest fields such
+as `token`, `password`, `apiKey`, or `privateKey`. Discovery responses redact
+manifest import source metadata.
+
+### Delegated Intake
+
+```json
+{
+  "source": {
+    "workspaceId": "source",
+    "workspaceName": "Source Board",
+    "taskId": "task_20260626_source",
+    "taskUrl": "https://source.example/tasks/task_20260626_source"
+  },
+  "capabilityId": "docs",
+  "title": "Write operator handoff docs",
+  "context": "Document the delegated queue handoff.",
+  "contextFields": {
+    "acceptance": "Includes handoff and rollback steps"
+  },
+  "type": "docs",
+  "labels": ["handoff"],
+  "requestedBy": "user:brad"
+}
+```
+
+Intake fails closed unless the source workspace is trusted by the local manifest
+or registered as a trusted peer manifest. Successful task intake stores a
+delegation record and, when the source task exists locally, appends a
+`delegatedWork` status link to that originating task.
+
+CLI support is available under `vk workspaces`:
+
+```bash
+vk workspaces discover
+vk workspaces validate ./workspace-capability.yaml
+vk workspaces trust ./peer-workspace.yaml
+vk workspaces intake --source-workspace source --capability docs --title "Write docs" --context "Document handoff" --context-field acceptance="Includes rollback steps"
+```
+
+---
+
+## Agent Profile Packages
+
+Reusable YAML/JSON packages for agent role, runtime, prompt, tools, permissions, policy posture, workflow entrypoint, and health metadata.
+
+Mounted at `/api/config/agent-profiles`.
+
+| Method   | Path                                                | Description                                       | Permissions      |
+| -------- | --------------------------------------------------- | ------------------------------------------------- | ---------------- |
+| `GET`    | `/api/config/agent-profiles`                        | List imported profile package summaries           | `settings:read`  |
+| `POST`   | `/api/config/agent-profiles/validate`               | Validate YAML/JSON content with field-path errors | `settings:read`  |
+| `POST`   | `/api/config/agent-profiles/import`                 | Import or replace a profile package               | `settings:write` |
+| `GET`    | `/api/config/agent-profiles/:id`                    | Get one stored profile package                    | `settings:read`  |
+| `GET`    | `/api/config/agent-profiles/:id/export?format=yaml` | Export a package as YAML or JSON                  | `settings:read`  |
+| `PATCH`  | `/api/config/agent-profiles/:id`                    | Edit metadata and enablement                      | `settings:write` |
+| `DELETE` | `/api/config/agent-profiles/:id`                    | Remove a package                                  | `settings:write` |
+
+### Import Package
+
+```json
+{
+  "format": "yaml",
+  "source": "settings",
+  "content": "id: docs-reviewer\nschemaVersion: agent-profile-package/v1\nversion: 1.0.0\n..."
+}
+```
+
+Invalid packages return `valid: false` from `/validate` with issues like `$.runtime.agent: Required`. Import rejects invalid packages and never installs third-party binaries, tools, credentials, or MCP servers.
+
+---
+
+## Sandbox Policies
+
+Reusable filesystem, network, environment, and credential presets for agent
+and workflow launch guardrails.
+
+Mounted at `/api/sandbox-policies`.
+
+| Method   | Path                             | Description                                    | Permissions                 |
+| -------- | -------------------------------- | ---------------------------------------------- | --------------------------- |
+| `GET`    | `/api/sandbox-policies`          | List built-in and custom presets               | `policy:read`               |
+| `GET`    | `/api/sandbox-policies/:id`      | Get one preset                                 | `policy:read`               |
+| `POST`   | `/api/sandbox-policies`          | Create a custom preset                         | `policy:write` + admin role |
+| `PUT`    | `/api/sandbox-policies/:id`      | Update a custom preset                         | `policy:write` + admin role |
+| `DELETE` | `/api/sandbox-policies/:id`      | Delete a custom preset                         | `policy:write` + admin role |
+| `POST`   | `/api/sandbox-policies/validate` | Dry-run a preset against provider capabilities | `policy:read`, `agent:read` |
+
+Built-in presets are immutable. Custom presets live in the shared app config.
+Agent profiles, workflow agents, and one-off agent starts can reference a preset
+with `sandboxPresetId`.
+
+### Create Preset
+
+```
+POST /api/sandbox-policies
+```
+
+**Body**:
+
+```json
+{
+  "id": "repo-contained-no-network",
+  "name": "Repo contained, no network",
+  "enabled": true,
+  "enforcement": "required",
+  "requiredCapabilities": ["filesystem.write"],
+  "filesystem": {
+    "readPaths": ["."],
+    "writePaths": ["."],
+    "deniedPaths": ["~/.ssh", "~/.aws", "~/.config/gh"],
+    "dotfileMasking": true,
+    "localOnlyHandles": true
+  },
+  "network": {
+    "defaultEgress": "deny",
+    "allowedHosts": [],
+    "deniedHosts": ["metadata.example.internal"],
+    "allowedMethods": [],
+    "allowedPathPrefixes": [],
+    "blockPrivateNetwork": true,
+    "blockMetadataEndpoints": true,
+    "blockLoopback": false,
+    "allowApprovals": false,
+    "dangerouslyAllowGlobalWildcard": false
+  },
+  "environment": {
+    "passthrough": ["CODEX_HOME", "OPENAI_API_KEY"],
+    "redactDisplay": true
+  },
+  "credentials": {
+    "mode": "brokered",
+    "brokerRefs": ["openai-api-key"]
+  }
+}
+```
+
+**Response** `201`: Created preset with `createdAt` and `updatedAt`.
+
+### Validate Preset
+
+```
+POST /api/sandbox-policies/validate
+```
+
+**Body**:
+
+```json
+{
+  "presetId": "repo-contained-no-network",
+  "provider": "codex-sdk",
+  "providerRuntimeManifestDigest": "sha256:<64 lowercase hex characters>",
+  "workspacePath": "/workspace/veritas-kanban",
+  "requiredCapabilities": ["filesystem.write"]
+}
+```
+
+The digest must belong to a manifest currently registered by a live agent host
+and must match `provider`. The API rejects caller-supplied manifest objects,
+unknown or expired digests, and provider mismatches. Internal launch checks use
+the immutable manifest already selected and persisted for the attempt.
+
+**Response** `200`:
+
+```json
+{
+  "decision": "allow",
+  "provider": "codex-sdk",
+  "effective": {
+    "sandboxMode": "workspace-write",
+    "networkAccessEnabled": false,
+    "envPassthrough": ["CODEX_HOME", "OPENAI_API_KEY"],
+    "credentialRefs": ["openai-api-key"],
+    "networkPolicy": {
+      "schemaVersion": "run-egress-policy/v1",
+      "policyHash": "sha256:<64 lowercase hex characters>",
+      "defaultEgress": "deny",
+      "allowedHosts": [],
+      "deniedHosts": [
+        {
+          "kind": "exact",
+          "value": "metadata.example.internal"
+        }
+      ],
+      "allowedMethods": [],
+      "allowedPathPrefixes": [],
+      "blockPrivateNetwork": true,
+      "blockMetadataEndpoints": true,
+      "blockLoopback": false,
+      "allowApprovals": false,
+      "tlsInspection": "disabled"
+    }
+  },
+  "unsupportedRules": [],
+  "warnings": [],
+  "traceId": "govtrace_1760000000000_ab12cd"
+}
+```
+
+`decision` is `allow`, `warn`, or `block`. Required unsupported controls block
+launches before execution. Advisory unsupported controls continue with warnings.
+Credential references and environment-style `name=value` values are redacted in
+responses and governance traces.
+
+Network host rules are normalized to exact or scoped `*.example.com` entries.
+Explicit deny rules take precedence. A global allow wildcard is rejected unless
+`dangerouslyAllowGlobalWildcard` is set on the preset. The compiled policy has a
+stable digest and is the input to the run-scoped gateway; it does not by itself
+prove that a provider launch is using that gateway. Until gateway launch
+evidence is present, required fine-grained egress rules continue to fail closed.
+
+---
+
+## Credential Broker Definitions
+
+Admin-only registry for metadata-only credential definitions. The API never
+accepts or returns a raw credential value.
+
+Mounted at `/api/credential-broker`.
+
+| Method   | Path                         | Description                                  | Permissions    |
+| -------- | ---------------------------- | -------------------------------------------- | -------------- |
+| `GET`    | `/api/credential-broker`     | List credential definition metadata          | `admin:manage` |
+| `GET`    | `/api/credential-broker/:id` | Get one credential definition                | `admin:manage` |
+| `POST`   | `/api/credential-broker`     | Create a metadata-only credential definition | `admin:manage` |
+| `PUT`    | `/api/credential-broker/:id` | Replace a credential definition              | `admin:manage` |
+| `DELETE` | `/api/credential-broker/:id` | Delete a definition with no active leases    | `admin:manage` |
+
+### Create Definition
+
+```http
+POST /api/credential-broker
+Content-Type: application/json
+```
+
+```json
+{
+  "id": "github-token",
+  "name": "GitHub token",
+  "description": "Read-only repository metadata",
+  "enabled": true,
+  "source": {
+    "kind": "environment",
+    "reference": "VK_GITHUB_TOKEN"
+  },
+  "scope": {
+    "dispatchTypes": ["http"],
+    "hosts": ["api.github.com"],
+    "tools": [],
+    "destinations": ["https://api.github.com"],
+    "methods": ["GET"],
+    "actions": ["issues.read"],
+    "pathPrefixes": ["/repos/"]
+  },
+  "lease": {
+    "ttlSeconds": 60,
+    "maxUses": 1,
+    "renewable": false
+  },
+  "approval": "not-required"
+}
+```
+
+**Response** `201`: the definition plus
+`schemaVersion: "credential-definition/v1"`, a canonical SHA-256 digest, and
+creation/update timestamps. Environment key names and external manager paths
+are references, not values. Metadata containing credential-looking values is
+rejected.
+
+The server exposes no public lease-issue, lease-use, or secret-resolution
+endpoint. Internal controlled boundaries use `credential-lease/v1` records
+whose persisted form contains a handle hash, definition and scope digests,
+task/attempt/launch-manifest binding, exact action fingerprint, expiry, use
+count, SHA-256 fingerprints of unique caller operation IDs, approval reference,
+and terminal state. Raw operation IDs are not persisted. Duplicate operation
+IDs fail closed instead of replaying use or refresh. Raw values exist only
+inside the controlled callback; the server returns a constrained structured
+clone and rejects results that cannot be safely cloned or that contain
+credential material. Binary views and buffers are not valid callback results.
+
+The initial local source resolves an environment key at use time. This is a
+compatibility source, not a replacement for a production secret manager.
+Definitions using an unavailable external source remain metadata-only and
+leases fail closed. Required brokered sandbox presets compile only when the
+selected provider and immutable run catalog prove the system-owned tool bridge
+or another reviewed non-bypassable boundary. Uncovered references still block.
+
+Run completion retries revocation on duplicate terminal delivery. Startup and
+one-minute periodic reconciliation expire, block, or revoke invalid leases.
+Manifest declarations and sandbox `brokerRefs` must be exact definition IDs;
+credential-like `name=value` strings are rejected.
+
+See [Credential Broker](CREDENTIAL-BROKER.md) for lifecycle, limitations, and
+rollback behavior.
+
+---
+
+## Shared Resources
+
+Registry for shared resources (credentials, config files, API keys, docs) that can be mounted to projects.
+
+Mounted at `/api/shared-resources`.
+
+| Method   | Path                                | Description                                          |
+| -------- | ----------------------------------- | ---------------------------------------------------- |
+| `GET`    | `/api/shared-resources`             | List all (filters: `type`, `project`, `tag`, `name`) |
+| `GET`    | `/api/shared-resources/:id`         | Get one resource                                     |
+| `POST`   | `/api/shared-resources`             | Create resource                                      |
+| `PATCH`  | `/api/shared-resources/:id`         | Update resource                                      |
+| `DELETE` | `/api/shared-resources/:id`         | Delete resource                                      |
+| `POST`   | `/api/shared-resources/:id/mount`   | Mount to project(s)                                  |
+| `POST`   | `/api/shared-resources/:id/unmount` | Unmount from project(s)                              |
+
+### Create Resource
+
+```
+POST /api/shared-resources
+```
+
+**Body**:
+
+```json
+{
+  "name": "Production DB Config",
+  "type": "config",
+  "content": "host=db.example.com\nport=5432",
+  "tags": ["database", "production"],
+  "projectIds": ["rubicon"]
+}
+```
+
+### Mount/Unmount
+
+```
+POST /api/shared-resources/:id/mount
+POST /api/shared-resources/:id/unmount
+```
+
+**Body**:
+
+```json
+{
+  "projectIds": ["rubicon", "brainmeld"]
+}
+```
+
+---
+
+## Skill Capability Profiles (`/api/skills/capabilities`)
+
+Declared-vs-observed capability profiles for shared resources with `type:
+"skill"`. Reads require `policy:read`. Creating remediation tasks requires
+`policy:write` and `task:write`.
+
+| Method | Path                                                 | Description                                 |
+| ------ | ---------------------------------------------------- | ------------------------------------------- |
+| `GET`  | `/api/skills/capabilities/taxonomy`                  | List canonical skill capability definitions |
+| `GET`  | `/api/skills/capabilities`                           | List skill profiles with optional filters   |
+| `GET`  | `/api/skills/capabilities/:skillId`                  | Get one skill capability profile            |
+| `POST` | `/api/skills/capabilities/:skillId/remediation-task` | Create a task for capability mismatches     |
+
+List filters:
+
+- `status`: `aligned`, `mismatch`, or `missing-declaration`
+- `severity`: minimum severity, one of `low`, `medium`, `high`, `critical`
+- `capability`: a taxonomy id such as `network.egress`
+- `q`: skill name, id, tag, or finding text search
+
+### Skill Declaration Syntax
+
+Skills declare capabilities in frontmatter:
+
+```markdown
+---
+capabilities:
+  - filesystem.read
+  - network.egress
+---
+```
+
+or in a Markdown section:
+
+```markdown
+## Declared Capabilities
+
+- `filesystem.read`
+- `browser.session`
+```
+
+Canonical capability ids:
+
+| Capability          | Meaning                                      |
+| ------------------- | -------------------------------------------- |
+| `filesystem.read`   | Reads local files or repository content      |
+| `filesystem.write`  | Writes, edits, moves, or deletes files       |
+| `shell.execute`     | Runs shell commands or subprocesses          |
+| `network.egress`    | Calls remote URLs, APIs, or webhooks         |
+| `credential.access` | Reads secrets, tokens, env vars, or keychain |
+| `external.message`  | Sends messages, comments, issues, or PRs     |
+| `memory.write`      | Writes durable agent memory                  |
+| `task.mutate`       | Creates or changes tasks, issues, or PRs     |
+| `schedule.persist`  | Creates recurring or background execution    |
+| `browser.session`   | Uses browser automation or sessions          |
+| `mcp.tool`          | Invokes MCP/plugin/tool runtimes             |
+
+### Profile Response
+
+```json
+{
+  "skillId": "shared_123",
+  "name": "Review Helper",
+  "declaredCapabilities": ["filesystem.read"],
+  "observedCapabilities": [
+    {
+      "capability": "filesystem.read",
+      "confidence": 0.82,
+      "evidence": [{ "source": "content-pattern", "label": "File read reference" }]
+    },
+    {
+      "capability": "network.egress",
+      "confidence": 0.86,
+      "evidence": [{ "source": "content-pattern", "label": "Remote network call reference" }]
+    }
+  ],
+  "undeclaredObservedCapabilities": ["network.egress"],
+  "status": "mismatch",
+  "severity": "high",
+  "findings": [
+    {
+      "kind": "undeclared-observed",
+      "capability": "network.egress",
+      "severity": "high",
+      "message": "network.egress is observed but not declared."
+    }
+  ]
+}
+```
+
+Mismatch detection writes an audit event once per skill version and finding
+signature. Evidence snippets are redacted before they are returned.
+
+### Create Remediation Task
+
+```http
+POST /api/skills/capabilities/shared_123/remediation-task
+```
+
+**Body**:
+
+```json
+{
+  "project": "Security",
+  "priority": "high"
+}
+```
+
+Returns the refreshed profile and created task.
+
+---
+
+## Skill Security Scanner (`/api/skills/security`)
+
+Static security review for local skill directories or a single `SKILL.md`.
+Reads require `policy:read`; scans require `admin:manage` because scan requests
+read local filesystem paths. Scan evidence is redacted before it is returned or
+persisted.
+
+| Method | Path                                                       | Description                                 |
+| ------ | ---------------------------------------------------------- | ------------------------------------------- |
+| `GET`  | `/api/skills/security/patterns`                            | List scanner pattern definitions            |
+| `GET`  | `/api/skills/security/inventory`                           | List shared skill risk inventory            |
+| `POST` | `/api/skills/security/inventory/:skillId/remediation-task` | Create a task for a risky skill             |
+| `POST` | `/api/skills/security/inventory/:skillId/exceptions`       | Add a reviewed temporary install exception  |
+| `POST` | `/api/skills/security/scan`                                | Scan a skill path and optionally persist it |
+| `GET`  | `/api/skills/security/scans`                               | List persisted scan summaries               |
+| `GET`  | `/api/skills/security/scans/:id`                           | Get one persisted JSON report               |
+| `POST` | `/api/maintenance/skill-security/scan`                     | Maintenance action alias for scan execution |
+
+The scanner emits JSON plus a Markdown report when `persist` is not `false`.
+Persisted artifacts are written under
+`.veritas-kanban/skill-security-scans/`.
+
+Detector families:
+
+- Prompt injection: hidden instruction overrides, hidden comments, zero-width
+  text.
+- Credential access: environment, token, API key, keychain, password, and
+  authorization references.
+- Exfiltration: remote egress, remote script fetch/execute, and file-to-network
+  paths.
+- Unsafe execution: shell, subprocess, eval, dynamic code execution.
+- Persistence: cron, launch agents, daemons, watchers, background jobs,
+  self-modification, and durable memory writes.
+- Trigger risk: broad activation language.
+- Capability mismatch: observed behavior that exceeds declared skill
+  capabilities.
+- Dependency risk: unpinned or non-registry package references where statically
+  detectable.
+
+### Scan Request
+
+```http
+POST /api/skills/security/scan
+```
+
+**Body**:
+
+```json
+{
+  "path": "/Users/example/.codex/skills/review-helper",
+  "persist": true,
+  "includeReferencedFiles": true
+}
+```
+
+`path` can point at a directory containing `SKILL.md` or at a single
+`SKILL.md`. Single-file scans include referenced `scripts/` and `assets/` files
+by default.
+
+### Scan Response
+
+```json
+{
+  "id": "skillscan_1770000000000_ab12cd34",
+  "targetType": "skill-directory",
+  "skillName": "Review Helper",
+  "severity": "critical",
+  "riskScore": 90,
+  "recommendation": "do-not-install",
+  "findingCount": 3,
+  "files": [{ "path": "SKILL.md", "role": "skill", "bytes": 420, "truncated": false }],
+  "findings": [
+    {
+      "patternId": "credential.env-harvest",
+      "severity": "critical",
+      "category": "credential-access",
+      "evidence": [{ "file": "SKILL.md", "line": 12, "excerpt": "[REDACTED_API_KEY]" }]
+    }
+  ],
+  "persistedJsonPath": ".../skill-security-scans/skillscan_1770000000000_ab12cd34.json",
+  "persistedMarkdownPath": ".../skill-security-scans/skillscan_1770000000000_ab12cd34.md"
+}
+```
+
+Recommendation values are `safe`, `caution`, and `do-not-install`. A scan also
+writes an audit event with scan id, severity, risk score, recommendation, and
+finding count.
+
+### Risk Inventory and Install Decisions
+
+```http
+GET /api/skills/security/inventory
+```
+
+Returns every shared resource with `type: "skill"` joined to its capability
+profile, latest persisted scan, open remediation task, and active exception.
+Each item includes `scanStatus`, `riskScore`, `severity`, `recommendation`,
+`installDecision`, `declaredCapabilities`, `observedCapabilities`, `mismatches`,
+`findingCount`, and `highOrCriticalFindingCount`.
+
+`installDecision` values:
+
+- `allow`: no blocking scanner or capability findings, or an active reviewed
+  exception exists.
+- `warn`: medium risk or caution findings require acknowledgement or reviewer
+  approval.
+- `block`: high, critical, or `do-not-install` risk blocks install and workflow
+  use by default.
+
+Reviewed exceptions are temporary and require an owner, reason, and future
+expiration:
+
+```http
+POST /api/skills/security/inventory/shared_123/exceptions
+```
+
+```json
+{
+  "owner": "platform",
+  "reason": "Reviewed for the current release candidate.",
+  "expiresAt": "2026-06-10T18:00:00.000Z"
+}
+```
+
+Risk remediation tasks can be created directly from the inventory:
+
+```http
+POST /api/skills/security/inventory/shared_123/remediation-task
+```
+
+```json
+{
+  "project": "Security",
+  "sprint": "v5-ga",
+  "priority": "high"
+}
+```
+
+Both actions write audit events and return the refreshed inventory item.
+
+---
+
+## Doc Freshness
+
+Track documentation freshness — monitor when docs were last reviewed and alert when they go stale.
+
+Mounted at `/api/doc-freshness`.
+
+| Method   | Path                                        | Description                                                  |
+| -------- | ------------------------------------------- | ------------------------------------------------------------ |
+| `GET`    | `/api/doc-freshness`                        | List tracked documents (filters: `project`, `type`, `stale`) |
+| `GET`    | `/api/doc-freshness/:id`                    | Get one tracked document                                     |
+| `POST`   | `/api/doc-freshness`                        | Track a new document                                         |
+| `PATCH`  | `/api/doc-freshness/:id`                    | Update document metadata                                     |
+| `DELETE` | `/api/doc-freshness/:id`                    | Stop tracking                                                |
+| `POST`   | `/api/doc-freshness/:id/review`             | Mark as freshly reviewed                                     |
+| `GET`    | `/api/doc-freshness/alerts`                 | List freshness alerts (filters: `severity`, `acknowledged`)  |
+| `POST`   | `/api/doc-freshness/alerts/:id/acknowledge` | Acknowledge an alert                                         |
+| `GET`    | `/api/doc-freshness/summary`                | Freshness health summary                                     |
+
+### Track a Document
+
+```
+POST /api/doc-freshness
+```
+
+**Body**:
+
+```json
+{
+  "path": "docs/API-REFERENCE.md",
+  "type": "api-reference",
+  "project": "veritas-kanban",
+  "maxAgeDays": 30
+}
+```
+
+### Mark as Reviewed
+
+```
+POST /api/doc-freshness/:id/review
+```
+
+**Body** (optional):
+
+```json
+{
+  "reviewer": "brad",
+  "reviewedAt": "2026-03-08T10:00:00Z"
+}
+```
+
+### Get Freshness Summary
+
+```
+GET /api/doc-freshness/summary
+```
+
+**Response** `200`:
+
+```json
+{
+  "total": 15,
+  "fresh": 12,
+  "stale": 2,
+  "critical": 1,
+  "alertCount": 3
+}
+```
+
+---
+
+## Cost Prediction
+
+Predict token costs for tasks before execution — uses historical telemetry data to estimate.
+
+Mounted at `/api/cost-prediction`.
+
+| Method | Path                                  | Description                             |
+| ------ | ------------------------------------- | --------------------------------------- |
+| `POST` | `/api/cost-prediction/predict`        | Predict cost for a task                 |
+| `GET`  | `/api/cost-prediction/accuracy`       | Prediction accuracy for completed tasks |
+| `GET`  | `/api/cost-prediction/accuracy/stats` | Aggregate accuracy statistics           |
+
+### Predict Cost
+
+```
+POST /api/cost-prediction/predict
+```
+
+Metadata `subtaskCount` accepts integers from 0 through 500. Existing tasks are evaluated using their stored subtask count.
+
+**By task ID**:
+
+```json
+{
+  "taskId": "TASK-001"
+}
+```
+
+**By metadata**:
+
+```json
+{
+  "type": "feature",
+  "priority": "high",
+  "project": "rubicon",
+  "description": "Implement OAuth2 flow",
+  "subtaskCount": 5
+}
+```
+
+**Response** `200`:
+
+```json
+{
+  "estimatedTokens": 45000,
+  "estimatedCost": 0.85,
+  "estimatedDurationMs": 120000,
+  "confidence": 0.78,
+  "basedOn": 12
+}
+```
+
+### Get Accuracy Stats
+
+```
+GET /api/cost-prediction/accuracy/stats
+```
+
+Returns aggregate statistics on prediction accuracy across all completed tasks.
+
+---
+
+## Error Learning
+
+Structured failure analysis — submit errors, record root causes, and search for similar past errors to avoid repeating mistakes.
+
+Mounted at `/api/errors`.
+
+| Method  | Path                 | Description                                                                  |
+| ------- | -------------------- | ---------------------------------------------------------------------------- |
+| `POST`  | `/api/errors/submit` | Submit an error for analysis                                                 |
+| `GET`   | `/api/errors`        | List analyses (filters: `taskId`, `errorType`, `severity`, `agent`, `limit`) |
+| `GET`   | `/api/errors/:id`    | Get specific analysis                                                        |
+| `PATCH` | `/api/errors/:id`    | Update with root cause & fix                                                 |
+| `GET`   | `/api/errors/stats`  | Aggregate error pattern stats                                                |
+| `GET`   | `/api/errors/search` | Search similar past errors (`?q=<query>`)                                    |
+
+### Submit Error
+
+```
+POST /api/errors/submit
+```
+
+**Body**:
+
+```json
+{
+  "taskId": "TASK-001",
+  "agent": "codex-1",
+  "errorMessage": "ECONNREFUSED 127.0.0.1:5432",
+  "errorType": "resource",
+  "rawDetails": "Full stack trace...",
+  "attemptDescription": "Trying to connect to PostgreSQL"
+}
+```
+
+Valid error types: `runtime`, `api`, `validation`, `timeout`, `permission`, `resource`, `model`, `git`, `build`, `test`, `configuration`, `unknown`.
+
+**Response** `201`: The created error analysis object.
+
+### Update Analysis
+
+```
+PATCH /api/errors/:id
+```
+
+**Body** (partial):
+
+```json
+{
+  "rootCause": "PostgreSQL service not running",
+  "severity": "medium",
+  "chosenFix": "Add health check before DB operations",
+  "preventionSteps": ["Add connection retry logic", "Check service status on startup"],
+  "tags": ["database", "connectivity"]
+}
+```
+
+### Search Similar Errors
+
+```
+GET /api/errors/search?q=ECONNREFUSED&limit=5
+```
+
+Returns past errors similar to the query string — useful for avoiding repeated mistakes.
+
+---
+
+## Reflection-to-Memory Promotion
+
+Reviewed queue for turning corrections, repeated mistakes, and failure lessons into durable Veritas records.
+
+Mounted at `/api/reflections`. Requires `workflow:read` for reads and `workflow:write` for writes.
+
+| Method   | Path                                           | Description                                                             |
+| -------- | ---------------------------------------------- | ----------------------------------------------------------------------- |
+| `GET`    | `/api/reflections`                             | List candidates with filters for status, category, source kind, task ID |
+| `POST`   | `/api/reflections`                             | Create a reflection candidate from a linked source                      |
+| `GET`    | `/api/reflections/consolidation/proposals`     | List durable proposals, optionally for one memory domain                |
+| `POST`   | `/api/reflections/consolidation/proposals`     | Create an idempotent proposal from explicit candidate IDs               |
+| `GET`    | `/api/reflections/consolidation/proposals/:id` | Inspect one proposal and its reviewer-facing diff                       |
+| `POST`   | `/api/reflections/:id/accept`                  | Accept a pending candidate and apply its reviewed promotion             |
+| `POST`   | `/api/reflections/:id/reject`                  | Reject a pending candidate without affecting future context             |
+| `POST`   | `/api/reflections/:id/merge`                   | Soft-merge a duplicate into its representative candidate                |
+| `DELETE` | `/api/reflections/:id`                         | Soft-delete a candidate while preserving audit history                  |
+
+Candidates support `session`, `agent`, `team`, `policy`, and `template` categories. Sources can link to `task-run`, `chat-message`, `error`, `user-correction`, `review-feedback`, or `task-observation`.
+
+### Create Candidate
+
+```
+POST /api/reflections
+```
+
+**Body**:
+
+```json
+{
+  "category": "team",
+  "promotionTarget": "task-lesson",
+  "confidence": 0.86,
+  "source": {
+    "kind": "user-correction",
+    "taskId": "task_20260626_reflect",
+    "messageId": "msg_123",
+    "eventIds": ["run_event_456"]
+  },
+  "summary": "The agent guessed a config field instead of reading the schema.",
+  "previousApproach": "Used a remembered field name.",
+  "correction": "Read the live schema and nearby route tests first.",
+  "nextAttempt": "Inspect the current schema before changing config behavior.",
+  "proposedScope": "workspace",
+  "rationale": "The correction applies to schema-backed configuration work.",
+  "applicability": "Use for future configuration changes in this workspace.",
+  "contradictionIds": ["reflection_older_guess"],
+  "evidence": [
+    {
+      "kind": "note",
+      "title": "Correction",
+      "content": "Reviewer corrected the route field during active work."
+    }
+  ],
+  "tags": ["schema", "workflow"]
+}
+```
+
+**Response** `201`: Created pending candidate. `idempotencyKey` can be supplied by
+automated extractors to make candidate creation retry-safe. Tokens,
+credential-looking values, and `/Users/...` private paths are redacted before
+storage. Extracted candidates remain pending and cannot affect task lessons or
+agent context until accepted.
+
+### Create a Consolidation Proposal
+
+```http
+POST /api/reflections/consolidation/proposals
+```
+
+```json
+{
+  "domain": {
+    "kind": "workspace-memory",
+    "id": "primary",
+    "workspaceId": "workspace_1"
+  },
+  "candidateIds": ["reflection_1", "reflection_2"],
+  "policy": {
+    "staleAfterDays": 180,
+    "unusedAfterDays": 90,
+    "minimumConfidence": 0.5,
+    "maxCandidates": 500
+  }
+}
+```
+
+The server locks proposal computation per memory domain, rejects unknown or
+over-limit candidate sets, and persists an idempotent
+`reflection-consolidation-proposal/v1` record. The proposal includes the
+effective policy, source digest, stable duplicate clusters, and inspectable
+merge, contradiction, decay, and wider-promotion review operations. Creating a
+proposal never deletes, accepts, or promotes a candidate.
+
+### Accept Candidate
+
+```
+POST /api/reflections/:id/accept
+```
+
+**Body**:
+
+```json
+{
+  "reviewedBy": "brad",
+  "promotionTarget": "task-lesson",
+  "reviewerNote": "Reusable correction for future agent work."
+}
+```
+
+For `task-lesson`, the candidate must have a linked `source.taskId`;
+acceptance appends a reviewed reflection lesson to that task and adds
+`reflection` lesson tags.
+
+Wider targets fail closed unless the request supplies a matching typed
+`promotion` object. The authenticated actor is the reviewer when `reviewedBy`
+is omitted. For example, a profile capability promotion is:
+
+```json
+{
+  "promotionTarget": "profile",
+  "promotion": {
+    "target": "profile",
+    "profileId": "backend-reviewer",
+    "capabilitiesToAdd": ["schema-review"]
+  },
+  "reviewerNote": "Approved for this profile."
+}
+```
+
+Typed inputs are available for:
+
+- `memory`: `workspaceId`
+- `team`: `rosterId`, `memberId`, and `capabilitiesToAdd`
+- `profile`: `profileId` and `capabilitiesToAdd`
+- `template`: `templateId`; the redacted candidate guidance is appended with a stable reflection marker
+- `decision`: `agentId`, `taskId`, `confidenceLevel`, `riskScore`, and optional `parentDecisionId`
+- `policy`: a complete validated `AgentPolicy`
+
+Each adapter writes through the existing target service, records the applied
+target on the reflection audit event, and is retry-safe for its target. A
+missing adapter, mismatched target, unknown target record, or incomplete typed
+payload rejects the acceptance without marking the candidate accepted.
+
+### Reject or Merge
+
+```
+POST /api/reflections/:id/reject
+POST /api/reflections/:id/merge
+DELETE /api/reflections/:id
+```
+
+Rejected, merged, and deleted candidates remain in the audit trail and do not affect future prompts or policies.
+
+---
+
+## External Tracker Introspection
+
+Configurable external work item schema introspection and mapping lives under `/api/integrations/trackers`. Reads require `settings:read`; writes require `settings:write` through the parent integrations permission guard. External creates also require an explicit `approvedBy` field in the request body.
+
+| Method | Path                                                            | Description                                                   |
+| ------ | --------------------------------------------------------------- | ------------------------------------------------------------- |
+| `GET`  | `/api/integrations/trackers/connection`                         | Return redacted connection posture                            |
+| `PUT`  | `/api/integrations/trackers/connection`                         | Save redacted connection metadata; credential values omitted  |
+| `GET`  | `/api/integrations/trackers/schema`                             | Return the latest normalized tracker schema                   |
+| `POST` | `/api/integrations/trackers/introspect`                         | Run adapter introspection and refresh the schema              |
+| `GET`  | `/api/integrations/trackers/profiles`                           | List mapping profiles                                         |
+| `PUT`  | `/api/integrations/trackers/profiles/:profileId`                | Save a mapping profile after schema validation                |
+| `POST` | `/api/integrations/trackers/profiles/:profileId/validate`       | Validate a saved profile                                      |
+| `POST` | `/api/integrations/trackers/profiles/:profileId/dry-run-create` | Build and validate a create payload without an external write |
+| `POST` | `/api/integrations/trackers/profiles/:profileId/create`         | Create a work item after explicit approval                    |
+| `GET`  | `/api/integrations/trackers/audits`                             | List metadata-only sync audit events                          |
+
+### Introspect Schema
+
+```
+POST /api/integrations/trackers/introspect
+```
+
+**Body**:
+
+```json
+{
+  "provider": "mock",
+  "project": "Veritas Kanban"
+}
+```
+
+**Response** `200`: `ExternalTrackerSchema` with work item types, fields, planning paths, priorities, states, tags, assignees, capabilities, and redacted connection posture.
+
+### Save Mapping Profile
+
+```
+PUT /api/integrations/trackers/profiles/default-mock-profile
+```
+
+**Body**:
+
+```json
+{
+  "id": "default-mock-profile",
+  "name": "Default Mock Tracker Mapping",
+  "provider": "mock",
+  "enabled": true,
+  "defaultWorkItemType": "Task",
+  "defaultProjectPath": "Veritas Kanban",
+  "defaultAreaPath": "Veritas Kanban\\Platform",
+  "defaultIterationPath": "Veritas Kanban\\Next",
+  "fieldMappings": [
+    { "trackerFieldId": "System.Title", "source": "title", "required": true },
+    { "trackerFieldId": "System.Description", "source": "description" },
+    { "trackerFieldId": "Microsoft.VSTS.Common.Priority", "source": "priority" },
+    { "trackerFieldId": "System.State", "source": "status" },
+    { "trackerFieldId": "System.Tags", "source": "literal", "literalValue": "veritas" }
+  ],
+  "backlinkFieldId": "Custom.VeritasBacklink"
+}
+```
+
+Invalid work item types, planning paths, tracker field ids, and required-field gaps return `400 VALIDATION_ERROR`.
+
+### Dry-run Create
+
+```
+POST /api/integrations/trackers/profiles/default-mock-profile/dry-run-create
+```
+
+**Body**:
+
+```json
+{
+  "taskId": "task_20260626_tracker"
+}
+```
+
+**Response** `200`: `ExternalTrackerDryRunCreateResult` with `externalWrite: false`, the mapped payload, and validation errors/warnings.
+
+### Approved Create
+
+```
+POST /api/integrations/trackers/profiles/default-mock-profile/create
+```
+
+**Body**:
+
+```json
+{
+  "taskId": "task_20260626_tracker",
+  "approvedBy": "brad"
+}
+```
+
+Successful creates return `201`, append an `externalWorkItems` backlink to the task, and write metadata-only audit/activity events. Credential values and private payload content are not logged.
+
+---
+
+## Search
+
+QMD-ready retrieval across task markdown and docs. The endpoint uses the configured backend and gracefully falls back to keyword search when QMD is unavailable.
+
+Mounted at `/api/search`.
+
+| Method | Path                        | Description                                     |
+| ------ | --------------------------- | ----------------------------------------------- |
+| `POST` | `/api/search`               | Search task and docs collections with one query |
+| `POST` | `/api/search/index/refresh` | Refresh QMD collections and embeddings          |
+
+### Search Collections
+
+```
+POST /api/search
+```
+
+**Body**:
+
+```json
+{
+  "query": "semantic search duplicate detection",
+  "limit": 10,
+  "collections": ["tasks-active", "tasks-archive", "docs"],
+  "backend": "auto"
+}
+```
+
+`backend` may be `keyword`, `qmd`, or `auto`. QMD is opt-in via `VERITAS_SEARCH_BACKEND=qmd` or per-request `backend: "qmd"`.
+
+**Response** `200`:
+
+```json
+{
+  "query": "semantic search duplicate detection",
+  "backend": "keyword",
+  "degraded": false,
+  "elapsedMs": 12,
+  "results": [
+    {
+      "id": "tasks/active/task_20260504_example.md",
+      "title": "Add semantic search",
+      "path": "tasks/active/task_20260504_example.md",
+      "collection": "tasks-active",
+      "snippet": "Wire QMD retrieval into Veritas.",
+      "score": 4
+    }
+  ]
+}
+```
+
+### QMD Setup
+
+```bash
+npm install -g @tobilu/qmd
+pnpm qmd:setup
+VERITAS_SEARCH_BACKEND=qmd pnpm dev
+```
+
+### QMD Index Refresh
+
+```
+POST /api/search/index/refresh
+```
+
+**Body**:
+
+```json
+{
+  "embed": true
+}
+```
+
+Set `embed` to `false` to run only `qmd update`.
+
+**Response** `200`:
+
+```json
+{
+  "backend": "qmd",
+  "updated": true,
+  "embedded": true,
+  "elapsedMs": 982,
+  "commands": ["update", "embed"]
+}
+```
+
+---
+
+## Run-scoped Tool Control Plane
+
+The canonical endpoints are mounted at `/api/v1/tool-servers`; `/api/tool-servers`
+is the compatibility alias. Definitions and discovery require settings or
+administrator authority. Run catalogs require agent read authority, and
+mediated calls require agent write authority.
+
+| Method   | Path                                                   | Description                                      |
+| -------- | ------------------------------------------------------ | ------------------------------------------------ |
+| `GET`    | `/api/v1/tool-servers`                                 | List definitions                                 |
+| `POST`   | `/api/v1/tool-servers`                                 | Create a validated definition                    |
+| `GET`    | `/api/v1/tool-servers/:id`                             | Read a definition                                |
+| `PUT`    | `/api/v1/tool-servers/:id`                             | Replace a definition                             |
+| `DELETE` | `/api/v1/tool-servers/:id`                             | Delete a definition                              |
+| `POST`   | `/api/v1/tool-servers/:id/discover`                    | Discover tools, optionally bypassing cache       |
+| `GET`    | `/api/v1/tool-servers/runs/:taskId/:attemptId/catalog` | Read the immutable catalog for an attempt        |
+| `POST`   | `/api/v1/tool-servers/call`                            | Invoke one cataloged tool through Veritas policy |
+
+Create and update bodies use `tool-server-definition/v1` input fields:
+
+```json
+{
+  "id": "project-tools",
+  "version": "1.4.0",
+  "displayName": "Project tools",
+  "enabled": true,
+  "transport": {
+    "kind": "stdio",
+    "command": "/opt/project-tools",
+    "args": ["serve"],
+    "environmentKeys": [],
+    "credentialReferences": []
+  },
+  "requirement": "required",
+  "startupTimeoutMs": 10000,
+  "toolTimeoutMs": 30000,
+  "allowedTools": ["read", "search"],
+  "deniedTools": [],
+  "approvalRequiredTools": ["search"],
+  "approvalMode": "never"
+}
+```
+
+Discovery is cached by the exact definition digest, which includes server
+identity and version. A changed definition invalidates that cache. Every launch
+still checks startup, protocol, and the runtime-reported version before reusing
+cached schemas. Required discovery failures block launch; optional failures
+appear as degraded catalog entries. The launch manifest stores the resulting
+catalog digest before provider dispatch.
+
+`POST /api/v1/tool-servers/call` requires the exact active task and attempt,
+the same catalog digest stored in launch evidence, a stable `operationId`, and
+arguments that match the discovered JSON Schema. Denied tools fail before
+dispatch. Approval-required tools create or reuse an exact-action
+`run-approval/v1` request and return its identity until approved. Successful
+and failed dispatches append bounded, redacted causal events, and an operation
+ID cannot dispatch twice.
+
+Raw environment and credential values are never stored in a definition,
+catalog, event, or launch manifest. Credential-bound definitions compile only
+when each reference resolves to an enabled MCP-scoped broker definition and an
+exact environment or HTTP-header target. The catalog persists definition and
+scope digests plus safe target names. Discovery removes source values, and
+native provider configuration omits credential-bound entries.
+
+New launch manifests classify a task reference as a brokered
+tool-control-plane boundary only when the exact run catalog covers it.
+Uncovered references remain blocked. Credential-bound calls derive the exact
+MCP action and receive the active launch-manifest digest from the server, not
+the request body. Values are resolved only inside a one-shot downstream
+dispatch callback; replays, stale evidence, approval mismatch, unavailable
+sources, and credential-bearing results fail closed.
+
+Credential-bound provider runs receive a system-owned `veritas-run` stdio MCP
+bridge. Its opaque handle is accepted only by `GET
+/api/run-tool-bridge/catalog` and `POST /api/run-tool-bridge/call`. Those
+dedicated routes derive task, attempt, catalog, and manifest identity from the
+handle; callers cannot supply or override them. The handle grants no general
+Veritas API authority and is rejected after terminal lifecycle cleanup,
+expiration, or server restart.
+See [Tool Control Plane v1](architecture/TOOL-CONTROL-PLANE-V1.md).
+
+---
+
+## Tool Policies
+
+Role-based tool access restrictions — control which tools each agent role can use.
+
+Mounted at `/api/tool-policies`.
+
+| Method   | Path                                | Description                           |
+| -------- | ----------------------------------- | ------------------------------------- |
+| `GET`    | `/api/tool-policies`                | List all policies                     |
+| `GET`    | `/api/tool-policies/:role`          | Get policy for a role                 |
+| `POST`   | `/api/tool-policies`                | Create a new policy                   |
+| `PUT`    | `/api/tool-policies/:role`          | Update an existing policy             |
+| `DELETE` | `/api/tool-policies/:role`          | Delete a custom policy                |
+| `POST`   | `/api/tool-policies/:role/validate` | Check if a tool is allowed for a role |
+
+### Create Policy
+
+```
+POST /api/tool-policies
+```
+
+**Body**:
+
+```json
+{
+  "role": "intern",
+  "allowed": ["read", "search", "analyze"],
+  "denied": ["deploy", "delete", "admin"],
+  "description": "Restricted access for intern agents"
+}
+```
+
+### Validate Tool Access
+
+```
+POST /api/tool-policies/:role/validate
+```
+
+**Body**:
+
+```json
+{
+  "tool": "deploy"
+}
+```
+
+**Response** `200`:
+
+```json
+{
+  "role": "intern",
+  "tool": "deploy",
+  "allowed": false,
+  "traceId": "govtrace_1760000000000_ab12cd"
+}
+```
+
+---
+
+## Watcher Continuation Policies
+
+Deterministic guardrail endpoint for agent runners that want to continue a run.
+The server decides before execution whether the continuation is allowed, needs
+approval, or is blocked by the global kill switch, dispatch filters, risk
+classes, continuation caps, or spend caps. Decisions are written to the
+hash-chained audit log without storing prompt or command payloads.
+
+Mounted at `/api/watcher-policies`.
+
+| Method | Path                             | Description                                      |
+| ------ | -------------------------------- | ------------------------------------------------ |
+| `GET`  | `/api/watcher-policies`          | Return current watcher continuation settings     |
+| `POST` | `/api/watcher-policies/evaluate` | Evaluate one proposed continuation before launch |
+
+### Evaluate Continuation
+
+```
+POST /api/watcher-policies/evaluate
+```
+
+**Body**:
+
+```json
+{
+  "runId": "run_123",
+  "taskId": "task_456",
+  "project": "core",
+  "agent": "codex",
+  "prompt": "Continue with the next test fix.",
+  "continuationCount": 1,
+  "monthlySpendUsd": 1.25,
+  "hasRecentTestFailures": false,
+  "recentProviderErrors": 0
+}
+```
+
+**Response** `200`:
+
+```json
+{
+  "decision": "allow",
+  "mode": "auto",
+  "riskLevel": "low",
+  "riskClasses": [],
+  "reasons": ["Continuation is within policy, dispatch, and cap limits."],
+  "evidence": [],
+  "caps": {
+    "maxContinuations": 3,
+    "spendCapUsd": 5
+  },
+  "auditLogged": true,
+  "evaluatedAt": "2026-06-04T22:00:00.000Z"
+}
+```
+
+Settings live under `features.watcherContinuations` and are updated through
+`PATCH /api/settings/features`. Defaults preserve current behavior:
+continuations are disabled and the global kill switch is active until explicitly
+configured.
+
+---
+
+## Execution Admission
+
+Direct starts, scheduled work, watcher continuations, conversation resume and
+follow-up, retries, fallbacks, provider handoffs, recovery, child-agent starts,
+workflow roots, and provider-backed workflow steps all pass through the same
+durable admission and queue contract. Each atomically reserves configured run,
+process, and estimated-memory capacity before attempt persistence or provider
+dispatch. Workflow roots use the `workflow-control` admission provider; child
+steps use the resolved execution provider and selected host. Inspection
+requires `agent:read`.
+
+| Method | Path                                          | Description                                                    |
+| ------ | --------------------------------------------- | -------------------------------------------------------------- |
+| `GET`  | `/api/admission`                              | List reservations with optional scope and state filters        |
+| `GET`  | `/api/admission/queue`                        | List the bounded, redacted admission queue view                |
+| `GET`  | `/api/admission/queue/:id`                    | Inspect one redacted queue entry                               |
+| `POST` | `/api/admission/queue/:id/cancel`             | Cancel one queued launch before provider dispatch              |
+| `GET`  | `/api/admission/tree/:rootObjectiveId`        | Summarize one aggregate execution tree and its control state   |
+| `POST` | `/api/admission/tree/:rootObjectiveId/cancel` | Cancel queued and verified running work for one execution tree |
+| `POST` | `/api/admission/tree/:rootObjectiveId/resume` | Safely resume a circuit-breaker-paused execution tree          |
+| `GET`  | `/api/admission/:id`                          | Inspect one durable reservation                                |
+
+List filters are `workspaceId`, `taskId`, `rootTaskId`, `provider`, `hostId`,
+`workflowRunId`, `workflowStepId`, `rootReservationId`, `rootObjectiveId`,
+`nodeId`, `parentNodeId`, repeatable `state` (`active`, `released`, `expired`),
+and `limit` (1-1000).
+
+Queue-list filters are `workspaceId`, `rootObjectiveId`, `nodeId`, repeatable
+`source`, repeatable `state`, raw numeric `priority`, repeatable
+`limitingScope`, `minAgeMs`, `maxAgeMs`, `page`, and `limit` (1-200).
+
+```http
+GET /api/v1/admission/queue?state=queued&source=workflow&minAgeMs=60000&page=1&limit=25
+```
+
+Queue list responses use `admission-queue-list/v1`; individual entries and
+get responses use `admission-queue-inspection/v1`. Every response carries a
+generation timestamp and `conditional: true`. Entries report current
+scheduler position, raw and effective priority, age promotion, readiness,
+lease posture, redacted limiting policies, conditional start factors, and
+persisted selection evidence. Global and per-workspace depth are reported
+against configured queue bounds. Workspace depth includes both the operator
+workspace identifier and its stable redacted key. Safe navigation fields expose
+the workspace, task, attempt, workflow run, workflow step, root objective, and
+execution-tree node identifiers that exist for the entry. Host and root-task
+identities remain hashed.
+
+Pagination is deterministic for the bounded snapshot. `snapshotTruncated`
+signals that older terminal history fell outside the 1,000-entry inspection
+window. Position and readiness can change after generation because arrivals,
+capacity, policy, backoff, and lease state can change. Responses never promise
+an exact start time and never contain raw host or root-task identities, full
+launch payloads, idempotency material, prompts, messages, tool arguments, or
+credentials.
+
+```http
+GET /api/v1/admission?state=active&provider=codex-cli&limit=25
+```
+
+```http
+GET /api/v1/admission?workflowRunId=run_20260725_abc123&state=active
+```
+
+```http
+GET /api/v1/admission/tree/objective_0123456789abcdef?limit=100
+```
+
+The response contains `admission-reservation/v1` records with the versioned
+request, requested capacity, evaluated limit policies, attempt binding, lease,
+revision, and terminal release evidence. It never contains provider
+credentials or prompts. Workflow records identify the run, optional step, and
+root reservation. Overloaded starts return a `409` conflict with
+`details.code` set to `ADMISSION_OVERLOAD`, the limiting scope, and bounded
+`retryAfterMs`. A request larger than a configured ceiling returns
+`ADMISSION_POLICY_DENIED`. A queueable workflow-root or provider-step overload
+instead persists the run or step with admission state `waiting` and status
+`pending`, without creating a partially active provider attempt. Terminal
+policy denial fails the run and releases its root.
+
+Execution-tree reservations include `execution-tree-identity/v1` and durable
+requested, remaining, committed, released-unused, and idempotent usage-event
+state. The tree summary aggregates each node once and returns committed and
+active reserved usage, per-policy remaining limits, the policy that blocks the
+next launch, bounded contributors, truncation evidence, and any durable
+`execution-tree-control/v1` cancellation or circuit-breaker state. Committed
+usage is retained after release; only unused reservation returns to the tree.
+
+Cancellation requests require `admin:manage` and a strict JSON body:
+
+```json
+{
+  "idempotencyKey": "operator-request-20260725-001",
+  "reason": "Operator stopped runaway child-agent expansion."
+}
+```
+
+`POST /api/v1/admission/queue/:id/cancel` terminalizes a queued or leased
+launch before dispatch and releases its reservation. A dispatched entry must
+be controlled through its verified run instead. `POST
+/api/v1/admission/tree/:rootObjectiveId/cancel` first records cancellation on
+the root reservation, then drains queued descendants, releases unbound
+reservations, and interrupts verified running attempts owned by the local
+agent supervisor. The response lists any verified running attempts that could
+not be interrupted so operators can reconcile them explicitly. Reusing the
+same idempotency key is safe; a different key conflicts with existing terminal
+ownership. Veritas stores and returns only the key's SHA-256 identity.
+
+The fan-out circuit breaker is enabled by default under
+`features.admission.fanOutBreaker`. It evaluates durable descendant count,
+depth, active reservations, queued descendants, capacity pressure, and budget
+pressure before a new tree node is admitted. Defaults are 256 descendants,
+depth 16, 64 active reservations, 64 queued descendants, and 95 percent
+capacity or budget pressure after a tree reaches eight descendants. When a
+threshold is reached, Veritas atomically records a durable paused control on
+the root and returns retryable `EXECUTION_TREE_EXPANSION_PAUSED` evidence.
+Harnesses must stop expanding that root; retrying the same launch cannot bypass
+the control.
+
+Operators can inspect the bounded evidence through the tree summary or
+Operations, clear the reported pressure, and resume with the same strict body:
+
+```http
+POST /api/v1/admission/tree/:rootObjectiveId/resume
+```
+
+Resume returns `409 Conflict` with
+`details.code: "EXECUTION_TREE_RESUME_BLOCKED"` while a breaker signal remains
+unsafe. A successful resume records a durable `resumed` control and accepts new
+nodes without discarding the earlier breaker evidence. Cancellation remains
+terminal: once the root cancellation is recorded, late resume, retry, fallback,
+workflow-step, and child-agent launches fail closed before provider dispatch.
+Paused, resumed, and cancelled controls survive restart and are visible through
+the tree summary, Operations, support bundles, telemetry, and
+`vk admission tree`.
+
+Direct `POST /api/v1/agents/:taskId/start` callers may send an opaque
+`X-Idempotency-Key` header (8-240 characters). The header takes precedence
+over the equivalent JSON `idempotencyKey` field and lets a retry reuse the same
+reservation without launching a second attempt. Veritas persists only its
+SHA-256 identity, never the supplied value.
+
+When capacity is temporarily exhausted, every provider-neutral agent launch
+returns `201` with `status: "queued"` instead of creating a provider-specific
+queue or a partial attempt:
+
+```json
+{
+  "taskId": "task_0123456789abcdef",
+  "attemptId": "attempt_01234567",
+  "queueId": "admission_queue_0123456789abcdef",
+  "agent": "codex",
+  "status": "queued",
+  "enqueuedAt": "2026-07-25T12:00:00.000Z",
+  "retryAfterMs": 5000,
+  "limitingScopes": [{ "scope": "global", "scopeId": "global" }]
+}
+```
+
+The response means Veritas durably accepted ownership. Clients and harnesses
+must not create a second launch. The versioned `agent-launch` target preserves
+the bounded provider-neutral options required to reconstruct profiles,
+readiness overrides, sandbox and budget overrides, runtime capability
+requirements, commit policy, phase, conversation resume/follow-up/fork,
+provider handoff, child-agent, retry, and fallback launches. It never stores
+credentials, process handles, leases, or raw idempotency keys. Queue
+inspection, telemetry, Operations, and support bundles expose only redacted
+launch-source and admission evidence; prompts, messages, override text, tool
+arguments, and the full durable target remain internal. Queue inspection is
+available through `GET /api/v1/admission/queue` and
+`GET /api/v1/admission/queue/:id`; reservation inspection remains unchanged.
+
+Scheduled workflows retain `source: "scheduled"` from the root reservation
+through normal provider steps. Queue-monitor continuations retain
+`source: "watcher"`. Retry and fallback steps use their specific replacement
+source while preserving the same root objective and causal parent edge. Queue
+bounds and retry behavior are configured under `features.admission.queue`.
+
+Workflow roots, provider-backed steps, and all agent launches use the same
+durable queue internally. Workflow queue targets preserve the workflow version,
+run revision, task and step identity, retry or fallback sequence,
+execution-tree edge, selected provider and host, and immutable runtime and
+phase digests. They never copy workflow context, prompts, tool arguments, or
+credentials. Agent-launch targets may retain the bounded operator input needed
+for exact replay, but public diagnostics always omit it. Before dispatch,
+Veritas revalidates provider, host, phase authority, budgets, root objective,
+parent edge, and reservation evidence. Drift terminalizes the queue entry
+without calling the provider.
+
+A single versioned scheduler orders agent-launch, legacy direct,
+workflow-root, and workflow-step entries using explicit task priority, bounded
+age promotion, workspace turns, and stable enqueue identity. Capacity-blocked
+entries remain queued while the next compatible entry is evaluated. The
+selected entry persists redacted priority, fairness, readiness,
+limiting-scope, and conditional-start evidence; provider or host metadata
+cannot override this ordering. Scheduler bounds live under
+`features.admission.queue.scheduler`.
+
+A pre-dispatch failure releases capacity and may requeue with bounded backoff.
+Once the queue entry is durably `dispatched`, workflow recovery owns the run.
+Startup reconciliation resumes a root or step that stopped at that ownership
+boundary exactly once; already-running provider work continues to use the
+existing operator-reconciliation rules.
+
+## Durable Goals
+
+Durable goals persist an evidence-gated objective independently of any one
+provider run. Reads require `agent:read`; creation and mutation require
+`admin:manage`. Every endpoint is scoped to the authenticated workspace.
+
+| Method | Path                            | Description                                                 |
+| ------ | ------------------------------- | ----------------------------------------------------------- |
+| `GET`  | `/api/goals`                    | List bounded goals with state and root filters              |
+| `POST` | `/api/goals`                    | Create one evidence-gated goal at revision 1                |
+| `GET`  | `/api/goals/:goalId`            | Inspect one goal and its continuation chain                 |
+| `POST` | `/api/goals/:goalId/transition` | Apply one compare-and-set state transition                  |
+| `POST` | `/api/goals/:goalId/runs`       | Link one task, workflow, or conversation run                |
+| `POST` | `/api/goals/:goalId/rollover`   | Approve and dispatch one bounded fresh-conversation handoff |
+
+List filters are repeatable `state`, `rootTaskId`, `rootWorkflowId`, and
+`limit` (1-1000). Goal states are `active`, `paused`, `blocked`,
+`awaiting-approval`, `usage-limited`, `budget-limited`, `complete`,
+`cancelled`, and `failed`. Complete, cancelled, and failed goals are terminal.
+
+Creation requires an objective, at least one acceptance criterion, exactly one
+task or workflow root, a manual or automatic continuation policy, and at least
+one required completion-evidence contract. Optional constraints and aggregate
+token, cost, time, tool, retry, and fan-out limits are bounded by the same
+budget metric names used elsewhere in the runtime.
+
+```json
+{
+  "objective": "Deliver the provider migration.",
+  "constraints": ["Do not broaden provider authority."],
+  "acceptanceCriteria": ["Focused provider fixtures pass."],
+  "root": { "kind": "task", "taskId": "task_0123456789abcdef" },
+  "continuation": {
+    "mode": "automatic",
+    "maxTurns": 20,
+    "maxRollovers": 2,
+    "compactAfterTokens": 120000,
+    "requireApprovalForRollover": true
+  },
+  "completionRequirements": [
+    {
+      "id": "provider-tests",
+      "description": "Focused provider fixtures pass.",
+      "required": true,
+      "verificationKind": "test"
+    }
+  ]
+}
+```
+
+Transitions require `expectedRevision`, `state`, and an operator reason.
+Entering `blocked` also requires an actionable blocker. Completing a goal
+requires evidence for every required completion item. The server derives the
+workspace, actor, verification timestamp, and evidence verifier from
+authenticated context; these identities cannot be supplied by the caller.
+Stale revisions return `409 Conflict`, terminal states cannot reopen, and
+cross-workspace lookups return `404`.
+
+The `durable-goal/v1` record also exposes `usageEvents` and
+`continuationAttempts`. Each completed provider run contributes one
+idempotency-keyed usage event, verified evidence, and run link. Aggregate goal
+usage is the sum of those deduplicated events.
+
+For an active automatic goal, the supervisor evaluates required evidence,
+blockers, turn limits, and aggregate budgets after the provider completion is
+durable. It persists a `planned` continuation with a stable admission
+idempotency key before calling the normal provider follow-up path. That path
+still enforces runtime capabilities, admission limits, sandbox and phase
+authority, approvals, immutable launch manifests, and the goal's remaining
+budget. The plan becomes `dispatched` only after an attempt or queue identity
+exists.
+
+Startup reconciliation closes the crash window in either direction. If the
+child attempt already exists, the planned continuation is linked without
+launching another provider. Otherwise the same admission idempotency key is
+reused. Failed admission blocks the goal with an actionable reason. Provider
+blockers, missing continuation handles, turn limits, budget limits, and manual
+continuation mode all fail closed instead of creating a hidden retry loop.
+
+When `compactAfterTokens` is reached, or a provider has no verified resume
+handle, the supervisor may plan `kind: "rollover"` only while
+`maxRollovers` has capacity. A rollover starts a fresh provider conversation
+with a bounded handoff containing the objective, constraints, acceptance
+criteria, evidence identifiers, unresolved requirements, recent state
+decisions, prior attempt identities, and cumulative usage. It retains the
+normal parent-attempt, admission, sandbox, phase, launch-manifest, and
+remaining-budget controls without copying transient provider authority.
+
+If `requireApprovalForRollover` is true, the supervisor first transitions the
+goal to `awaiting-approval`. `POST /api/goals/:goalId/rollover` accepts
+`expectedRevision`; the authenticated actor becomes the approver and the
+goal's exact current run becomes the source. The endpoint rejects stale
+revisions, missing current-run evidence, non-active states, and exhausted
+rollover limits. Its planned handoff and admission idempotency key are durable,
+so startup reconciliation cannot duplicate a fresh conversation.
+
+## Knowledge Collections
+
+Knowledge collections establish a workspace-scoped, immutable source catalog for derived project knowledge. Route access requires `work_product:read` for reads and `work_product:write` for writes. Collection policies then apply the authenticated actor's `admin`, `agent`, or `read-only` role and source-classification ceiling.
+
+| Method | Path                                                                                 | Description                        |
+| ------ | ------------------------------------------------------------------------------------ | ---------------------------------- |
+| `GET`  | `/api/knowledge/collections`                                                         | List collections readable by actor |
+| `POST` | `/api/knowledge/collections`                                                         | Create one versioned collection    |
+| `GET`  | `/api/knowledge/collections/:collectionId`                                           | Read collection metadata           |
+| `GET`  | `/api/knowledge/collections/:collectionId/sources`                                   | List immutable source revisions    |
+| `POST` | `/api/knowledge/collections/:collectionId/sources`                                   | Register one source revision       |
+| `GET`  | `/api/knowledge/collections/:collectionId/sources/:sourceId`                         | Read source metadata               |
+| `GET`  | `/api/knowledge/collections/:collectionId/pages`                                     | List derived pages                 |
+| `GET`  | `/api/knowledge/collections/:collectionId/pages/:pageId`                             | Read one cited derived page        |
+| `POST` | `/api/knowledge/collections/:collectionId/pages/:pageId/claims/:claimId/transitions` | Transition one material claim      |
+| `POST` | `/api/knowledge/collections/:collectionId/integrity/lint`                            | Run deterministic integrity lint   |
+| `GET`  | `/api/knowledge/collections/:collectionId/integrity/findings`                        | List durable integrity findings    |
+| `POST` | `/api/knowledge/collections/:collectionId/integrity/findings/:findingId/transitions` | Transition a finding               |
+| `GET`  | `/api/knowledge/collections/:collectionId/integrity/health`                          | Read integrity operational health  |
+| `POST` | `/api/knowledge/collections/:collectionId/search`                                    | Search raw and derived knowledge   |
+| `POST` | `/api/knowledge/collections/:collectionId/search/promotions`                         | Promote selected search results    |
+| `POST` | `/api/knowledge/collections/:collectionId/exports`                                   | Create a cited work product        |
+| `GET`  | `/api/knowledge/collections/:collectionId/ingestion/proposals`                       | List ingestion dry runs            |
+| `POST` | `/api/knowledge/collections/:collectionId/ingestion/proposals`                       | Create an ingestion dry run        |
+| `GET`  | `/api/knowledge/collections/:collectionId/ingestion/proposals/:proposalId`           | Read one dry run                   |
+| `POST` | `/api/knowledge/collections/:collectionId/ingestion/proposals/:proposalId/apply`     | Apply atomically                   |
+| `POST` | `/api/knowledge/collections/:collectionId/ingestion/proposals/:proposalId/reverse`   | Reverse atomically                 |
+| `GET`  | `/api/knowledge/collections/:collectionId/activity`                                  | List ingestion activity            |
+
+Collection, source, page, proposal, and activity lists accept `page` (default `1`) and `limit` (default `100`, maximum `500`). Pagination metadata is returned through the standard API response envelope.
+
+Create operations are idempotent. The operation identity is persisted only as a digest and cannot be reused with changed input.
+
+```json
+{
+  "operationId": "create-product-knowledge",
+  "slug": "product-knowledge",
+  "name": "Product knowledge",
+  "definition": {
+    "schemaVersion": "knowledge-collection-definition/v1",
+    "version": 1,
+    "pageKinds": ["concept", "decision", "overview"],
+    "requiredMetadata": ["owner", "reviewState"],
+    "naming": "stable-id",
+    "links": "bidirectional",
+    "ingestion": "review-required",
+    "maxPageVersions": 25
+  },
+  "accessPolicy": {
+    "readRoles": ["admin", "agent"],
+    "writeRoles": ["admin", "agent"],
+    "maxSourceClassification": "confidential",
+    "exportPolicy": "redacted-only"
+  }
+}
+```
+
+Register an inline snapshot by sending `storage: "content-addressed-blob"` and bounded UTF-8 `content`. Veritas computes its SHA-256 digest and byte count. Register an externally retained source with `storage: "content-addressed-reference"`, `contentHash`, and `contentBytes`; Veritas records the immutable identity without copying content.
+
+```json
+{
+  "operationId": "readme-revision-1",
+  "sourceKey": "product-readme",
+  "uri": "repo://README.md",
+  "mediaType": "text/markdown",
+  "owner": "product",
+  "classification": "internal",
+  "storage": "content-addressed-blob",
+  "content": "# Product"
+}
+```
+
+Repeated source keys create a revision chain rather than replacing prior evidence. Source list and detail responses return metadata only and do not expose stored source content.
+
+Derived pages include Markdown, typed metadata, review state, confidence, stable keys and aliases, outgoing links, computed backlinks, bounded revision history, and claim-level citations to immutable source revision IDs. Page list and detail routes are read-only; reviewed ingestion proposals own mutation so generated synthesis cannot bypass the atomic review workflow.
+
+Create a dry run with selected immutable source revision IDs and one or more page candidates. The response includes complete before and after pages, page and index changes, contradictions, expected digests, and the activity change that apply will append. Creating a proposal does not mutate pages.
+
+```json
+{
+  "operationId": "ingest-readme-2026-07-26",
+  "sourceIds": ["knowledge_source_0123456789abcdef"],
+  "pages": [
+    {
+      "stableKey": "architecture",
+      "title": "Architecture",
+      "pageKind": "concept",
+      "aliases": ["system-design"],
+      "tags": ["product"],
+      "metadata": {
+        "owner": "architecture",
+        "reviewState": "pending"
+      },
+      "markdown": "# Architecture\n\nThe workspace uses a reviewed control plane.",
+      "claims": [
+        {
+          "claimKey": "reviewed-control-plane",
+          "text": "The workspace uses a reviewed control plane.",
+          "citations": [
+            {
+              "sourceId": "knowledge_source_0123456789abcdef",
+              "locator": {
+                "kind": "line-range",
+                "startLine": 10,
+                "endLine": 14
+              }
+            }
+          ],
+          "confidence": 0.92
+        }
+      ],
+      "links": [],
+      "reviewState": "review-required",
+      "confidence": 0.9
+    }
+  ]
+}
+```
+
+Only administrators can apply or reverse. Send the exact current proposal digest:
+
+```json
+{
+  "proposalDigest": "sha256:..."
+}
+```
+
+Apply atomically updates every affected page, proposal state, and append-only activity entry. Reverse requires the applied digest, restores complete prior page records, removes proposal-created pages, and appends reversal activity. Exact retries return the committed state. Blocking contradictions, stale page digests, later conflicting edits, and unsafe graph changes return `409` without partial mutation.
+
+Run deterministic integrity lint with an optional fixed timestamp, freshness
+rules, and research-candidate discovery:
+
+```json
+{
+  "asOf": "2026-07-26T00:00:00.000Z",
+  "freshnessRules": [
+    { "target": "page-kind", "match": "decision", "maxAgeDays": 90 },
+    {
+      "target": "source-media-type",
+      "match": "text/markdown",
+      "maxAgeDays": 30
+    }
+  ],
+  "includeResearchCandidates": true,
+  "includeSemanticCandidates": true,
+  "persistFindings": true,
+  "runId": "nightly-product-knowledge-2026-07-26",
+  "pageLimit": 500
+}
+```
+
+The report counts inspected pages, sources, and claims and returns stable,
+severity-ranked findings for structural, provenance, freshness, and research
+gaps. It contains identifiers but never retained source text. Agent reports are
+limited to resources in the verified launch manifest.
+
+Semantic candidates flag same-key disagreements, near-duplicates,
+source-revision supersession, and low-confidence evidence gaps with both page,
+claim, and source identities. Persisted runs require a stable `runId`. The
+response continuation returns `nextPageCursor` and `complete`; pass the cursor
+into the next request. Work is capped at 500 pages per call, and retrying the
+same run ID and cursor is idempotent. Scheduled workflows can therefore resume
+after interruption without duplicating observations.
+
+Durable findings support `open`, `acknowledged`, `remediating`, and `resolved`
+statuses. Transition requests use `expectedDigest` plus an operation ID and can
+set an owner, acknowledgement reason, due date, and remediation task or proposal
+links. Acknowledgement requires a reason, remediation requires an owner, and
+only administrators resolve. `/integrity/health` exposes scoped counts, overdue
+work, last observation, and `healthy`, `degraded`, or `critical` status.
+
+Transition a material claim by supplying compare-and-set page and lifecycle
+evidence:
+
+```json
+{
+  "operationId": "dispute-dispatch-claim",
+  "expectedPageDigest": "sha256:...",
+  "expectedState": "active",
+  "to": "disputed",
+  "reason": "Two retained sources support conflicting interpretations.",
+  "evidenceSourceIds": ["knowledge_source_0123456789abcdef"]
+}
+```
+
+States are `active`, `needs-review`, `disputed`, `superseded`, and `retracted`.
+Agents may flag `needs-review` or `disputed`; administrators finalize other
+transitions. The response is the newly versioned page. Each transition is
+attributed, digest-bound, retained in page history, idempotent for an exact
+retry, and rejected when the page digest, expected state, operation identity,
+or evidence access is stale.
+
+Search one readable collection with a bounded query. `scope` can be `all`, `raw-sources`, or `derived-pages`. Results identify their kind, backend, effective classification, and source citations; derived results carry the citations from their material claims. Confidential and restricted snippets are withheld. `backend: "auto"` or `"qmd"` projects current eligible derived pages into an isolated, non-default QMD collection scoped by workspace, collection, and launch-manifest digest, and refreshes it only when page digests change. Raw source matches remain keyword-scored. If QMD is unavailable or the requested scope has no derived pages, the response uses `backend: "keyword"`, sets `degraded: true`, and includes a reason.
+
+```json
+{
+  "query": "reviewed dispatch",
+  "limit": 10,
+  "scope": "all",
+  "backend": "auto"
+}
+```
+
+Every search response includes `evidenceDigest`, computed over the exact query, bounded result set, and optional launch context. To retain selected results as durable knowledge, send the unchanged response, selected result IDs, and proposed pages to `/search/promotions`. Veritas rejects a changed digest, another run's launch binding, unknown selection, missing source revision, or a derived result whose current citations no longer match. A valid request creates the same dry-run ingestion proposal used by source ingestion; it does not mutate pages.
+
+Agent calls to source, page, proposal, activity, search, promotion, and export
+operations must send all three headers below. The server verifies them against
+the persisted attempt manifest and filters every read and mutation to the exact
+resources in `resources.shared`. Administrator and read-only calls do not
+require these headers.
+
+```http
+x-veritas-task-id: task_...
+x-veritas-attempt-id: attempt_...
+x-veritas-launch-manifest-digest: sha256:...
+```
+
+```json
+{
+  "operationId": "promote-dispatch-query",
+  "evidence": {
+    "query": "reviewed dispatch",
+    "backend": "keyword",
+    "degraded": false,
+    "results": [
+      {
+        "id": "knowledge_source_0123456789abcdef",
+        "kind": "raw-source",
+        "backend": "keyword",
+        "title": "Dispatch specification",
+        "snippet": "Reviewed dispatch is required.",
+        "score": 0.9,
+        "sourceId": "knowledge_source_0123456789abcdef",
+        "citations": [{ "sourceId": "knowledge_source_0123456789abcdef" }]
+      }
+    ],
+    "evidenceDigest": "sha256:..."
+  },
+  "selectedResultIds": ["knowledge_source_0123456789abcdef"],
+  "pages": [
+    {
+      "stableKey": "dispatch-overview",
+      "title": "Dispatch overview",
+      "pageKind": "overview",
+      "metadata": { "owner": "platform", "reviewState": "pending" },
+      "markdown": "# Dispatch overview\n\nReviewed dispatch is required.",
+      "claims": [
+        {
+          "claimKey": "reviewed-dispatch",
+          "text": "Reviewed dispatch is required.",
+          "citations": [{ "sourceId": "knowledge_source_0123456789abcdef" }],
+          "confidence": 0.9
+        }
+      ],
+      "reviewState": "review-required",
+      "confidence": 0.9
+    }
+  ]
+}
+```
+
+To create a durable work product instead, send `title`, the same unchanged `evidence`, `selectedResultIds`, and optional `redaction` (`none`, `standard`, or `strict`) to `/exports`. The Markdown body records each result's kind, backend, score, redacted snippet, source ID, locator, and excerpt hash. Work-product source links point back to the collection objects, while metadata retains the collection ID, query, evidence digest, selected-result count, citation count, and export policy.
+
+Collection `exportPolicy` is authoritative. `forbidden` rejects creation. `redacted-only` rejects `redaction: "none"`, sets redacted export as the product default, and prevents the general work-product export endpoint from honoring `?redacted=false`. `allowed` accepts the requested posture and defaults to standard redaction.
+
+---
+
+## Traces
+
+Distributed execution tracing — record and query traces for agent task attempts.
+
+Mounted at `/api/traces`.
+
+| Method | Path                       | Description                 |
+| ------ | -------------------------- | --------------------------- |
+| `GET`  | `/api/traces/status`       | Check if tracing is enabled |
+| `POST` | `/api/traces/enable`       | Enable tracing              |
+| `POST` | `/api/traces/disable`      | Disable tracing             |
+| `GET`  | `/api/traces/:attemptId`   | Get a trace by attempt ID   |
+| `GET`  | `/api/traces/task/:taskId` | List all traces for a task  |
+
+### Check Tracing Status
+
+```
+GET /api/traces/status
+```
+
+**Response** `200`:
+
+```json
+{
+  "enabled": true
+}
+```
+
+### Get Task Traces
+
+```
+GET /api/traces/task/TASK-001
+```
+
+Returns all execution traces associated with the given task.
+
+---
+
+## Audit
+
+Immutable, hash-chained audit log. **Admin only.**
+
+Mounted at `/api/audit`.
+
+| Method | Path                | Description                                              |
+| ------ | ------------------- | -------------------------------------------------------- |
+| `GET`  | `/api/audit`        | Recent audit entries (`?limit=N`, default 100, max 1000) |
+| `GET`  | `/api/audit/verify` | Verify hash chain integrity of current month's log       |
+
+**Auth**: Requires `admin` role.
+
+### Query Audit Log
+
+```
+GET /api/audit?limit=50
+```
+
+**Response** `200`:
+
+```json
+{
+  "entries": [
+    {
+      "timestamp": "2026-03-08T07:00:00Z",
+      "action": "task.archive",
+      "actor": "admin-key",
+      "resource": "TASK-001",
+      "details": { "title": "Fix auth bug" },
+      "hash": "sha256:..."
+    }
+  ],
+  "count": 50
+}
+```
+
+### Verify Integrity
+
+```
+GET /api/audit/verify
+```
+
+Verifies the hash chain of the current month's audit log file. Returns chain validity and any broken links.
+
+---
+
+## Common Workflows
+
+### Agent Task Lifecycle
+
+```bash
+# 1. Create task
+TASK=$(curl -s -X POST http://localhost:3001/api/tasks \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: YOUR_KEY' \
+  -d '{"title":"Fix bug","priority":"high"}' | jq -r '.id')
+
+# 2. Start time tracking
+curl -s -X POST http://localhost:3001/api/tasks/$TASK/time/start
+
+# 3. Emit telemetry
+curl -s -X POST http://localhost:3001/api/telemetry/events \
+  -H 'Content-Type: application/json' \
+  -d "{\"type\":\"run.started\",\"taskId\":\"$TASK\",\"agent\":\"veritas\"}"
+
+# 4. Update status to in-progress
+curl -s -X PATCH http://localhost:3001/api/tasks/$TASK \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"in-progress"}'
+
+# 5. Save checkpoint mid-work
+curl -s -X POST http://localhost:3001/api/tasks/$TASK/checkpoint \
+  -H 'Content-Type: application/json' \
+  -d '{"state":{"step":3,"context":"halfway done"}}'
+
+# 6. Add observation
+curl -s -X POST http://localhost:3001/api/tasks/$TASK/observations \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"Found root cause in auth middleware","type":"insight","agent":"veritas"}'
+
+# 7. Complete
+curl -s -X PATCH http://localhost:3001/api/tasks/$TASK \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"done"}'
+
+# 8. Stop timer + emit completion telemetry
+curl -s -X POST http://localhost:3001/api/tasks/$TASK/time/stop
+curl -s -X POST http://localhost:3001/api/telemetry/events \
+  -H 'Content-Type: application/json' \
+  -d "{\"type\":\"run.completed\",\"taskId\":\"$TASK\",\"agent\":\"veritas\",\"durationMs\":45000,\"success\":true}"
+```
+
+### Agent Loop (Poll for Work)
+
+```bash
+# Get next available task
+NEXT=$(curl -s http://localhost:3001/api/tasks?status=todo&limit=1 | jq -r '.tasks[0].id')
+if [ "$NEXT" != "null" ]; then
+  # Claim it
+  curl -s -X PATCH http://localhost:3001/api/tasks/$NEXT \
+    -H 'Content-Type: application/json' \
+    -d '{"status":"in-progress","assignee":"agent-1"}'
+fi
+```
+
+### Blocker Tracking
+
+```bash
+# Add a blocker observation
+curl -s -X POST http://localhost:3001/api/tasks/TASK-001/observations \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"Blocked: waiting on API key from vendor","type":"blocker","agent":"veritas"}'
+
+# Add a dependency
+curl -s -X POST http://localhost:3001/api/tasks/TASK-001/dependencies \
+  -H 'Content-Type: application/json' \
+  -d '{"targetId":"TASK-002","type":"blocked-by"}'
+```
+
+### Webhook Hook Setup
+
+```bash
+# Fire a webhook when any task moves to "done"
+curl -s -X POST http://localhost:3001/api/hooks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "done-notify",
+    "event": "task.status.changed",
+    "filter": {"newStatus":"done"},
+    "action": {"type":"webhook","url":"https://example.com/hook"}
+  }'
+```
+
+---
+
+## Versioning & Deprecation
+
+- **Current version**: v1 (mounted at `/api/v1`, aliased at `/api`)
+- **No breaking changes** within a major version
+- Deprecations will be announced via:
+  - `Deprecation` response header
+  - Changelog entry
+  - Minimum 2 minor releases before removal
+- When v2 ships, v1 will remain available for at least 6 months
+
+---
+
+## Rate Limits
+
+| Tier   | Limit       | Applies To                       |
+| ------ | ----------- | -------------------------------- |
+| Global | 300 req/min | All endpoints (localhost exempt) |
+| Read   | 300 req/min | GET endpoints                    |
+| Write  | 60 req/min  | POST/PUT/PATCH/DELETE            |
+| Upload | 20 req/min  | File upload endpoints            |
+
+Rate limit headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
+
+---
+
+## Additional Endpoint Groups
+
+These endpoints follow the same auth/error patterns documented above:
+
+| Mount                            | Purpose                                                                  |
+| -------------------------------- | ------------------------------------------------------------------------ |
+| `/api/projects`                  | Project CRUD                                                             |
+| `/api/sprints`                   | Sprint management                                                        |
+| `/api/backlog`                   | Backlog operations                                                       |
+| `/api/agents`                    | Agent CRUD, routing                                                      |
+| `/api/agents/register`           | Agent self-registration                                                  |
+| `/api/agents/permissions`        | Agent permission management                                              |
+| `/api/templates`                 | Task templates                                                           |
+| `/api/task-types`                | Custom task type definitions                                             |
+| `/api/activity`                  | Activity feed                                                            |
+| `/api/notifications`             | User notifications                                                       |
+| `/api/broadcasts`                | Broadcast messages                                                       |
+| `/api/changes`                   | Efficient agent polling (change feed)                                    |
+| `/api/diff`                      | Task diff comparisons                                                    |
+| `/api/automation`                | Automation rules                                                         |
+| `/api/summary`                   | Board summaries                                                          |
+| `/api/github`                    | GitHub integration                                                       |
+| `/api/integrations/trackers`     | External tracker schema introspection and mapping profiles               |
+| `/api/conflicts`                 | Merge conflict detection                                                 |
+| `/api/watcher-policies`          | Agent continuation guardrail decisions                                   |
+| `/api/metrics`                   | Prometheus-style metrics                                                 |
+| `/api/traces`                    | Distributed tracing                                                      |
+| `/api/cost-prediction`           | Token cost forecasting                                                   |
+| `/api/errors`                    | Error pattern learning                                                   |
+| `/api/reflections`               | Reviewed reflection-to-memory promotion                                  |
+| `/api/reports`                   | Generated reports                                                        |
+| `/api/deliverables`              | Scheduled deliverables                                                   |
+| `/api/doc-freshness`             | Documentation freshness tracking                                         |
+| `/api/docs`                      | Docs endpoint                                                            |
+| `/api/shared-resources`          | Shared resource management                                               |
+| `/api/status-history`            | Task status history                                                      |
+| `/api/digest`                    | Digest generation                                                        |
+| `/api/audit`                     | Audit log                                                                |
+| `/api/lessons`                   | Lessons learned                                                          |
+| `/api/delegation`                | Task delegation                                                          |
+| `/api/workflows`                 | Workflow engine ([details](API-WORKFLOWS.md))                            |
+| `/api/ceremonies`                | Design-review and failure-retrospective requirements                     |
+| `/api/tool-servers`              | Run-scoped MCP and tool-server definitions, catalogs, and calls          |
+| `/api/tool-policies`             | Tool access policies                                                     |
+| `/api/sandbox-policies`          | Agent sandbox policy presets                                             |
+| `/api/integrations`              | External integrations, outbound delivery audit, and human reply adapters |
+| `/api/settings/transition-hooks` | Status transition hooks                                                  |
+
+| `/api/feedback` | User feedback & sentiment analytics |
+| `/api/decisions` | Decision audit trail |
+| `/api/drift` | Behavioral drift detection |
+| `/api/policies` | Agent policy & guard engine |
+| `/api/scoring/profiles` | Output evaluation profiles |
+| `/api/scoring/evaluate` | Run an output evaluation |
+| `/api/scoring/history` | Evaluation history |
+| `/api/prompt-registry` | Prompt template registry |
+| `/api/v1/system/health` | Global system health |
+
+---
+
+### Clearing optional template fields
+
+`PATCH /api/templates/:id` preserves omitted fields. Send explicit JSON `null` to clear `description`, `category`, or individual `taskDefaults` fields (`type`, `priority`, `project`, `descriptionTemplate`, `agent`). Cleared fields are omitted from subsequent GET responses in both file and SQLite storage; unrelated defaults remain unchanged.
+
+```json
+{
+  "description": null,
+  "taskDefaults": { "project": null, "agent": null }
+}
+```
+
+The required name and the `taskDefaults` container cannot be null. Creation continues to use omitted optional fields rather than null. Existing clients that omit fields keep their current patch behavior.
+
+## v4.0 API Reference
+
+### User Feedback (`/api/feedback`)
+
+Collect feedback on agent outputs and query aggregate sentiment analytics.
+
+#### List Feedback
+
+```
+GET /api/feedback
+```
+
+Query params: `agent`, `taskId`, `sentiment` (`positive` | `neutral` | `negative`), `since` (ISO timestamp), `limit` (default 50), `offset`.
+
+**Response:** Array of feedback objects.
+
+```json
+[
+  {
+    "id": "fb_abc123",
+    "content": "The summary was concise and accurate.",
+    "sentiment": "positive",
+    "category": "output-quality",
+    "agent": "TARS",
+    "taskId": "task_20260321_abc",
+    "createdAt": "2026-03-21T14:00:00.000Z"
+  }
+]
+```
+
+#### Submit Feedback
+
+```
+POST /api/feedback
+```
+
+```json
+{
+  "content": "The response missed the key point.",
+  "sentiment": "negative",
+  "category": "accuracy",
+  "agent": "CASE",
+  "taskId": "task_20260321_xyz"
+}
+```
+
+**Response:** `201` with created feedback object.
+
+#### Get Feedback Item
+
+```
+GET /api/feedback/:id
+```
+
+**Response:** Single feedback object.
+
+#### Delete Feedback
+
+```
+DELETE /api/feedback/:id
+```
+
+**Response:** `204 No Content`.
+
+#### Feedback Analytics
+
+```
+GET /api/feedback/analytics
+```
+
+Query params: `agent`, `since`, `until`.
+
+**Response:**
+
+```json
+{
+  "total": 42,
+  "sentimentBreakdown": {
+    "positive": 30,
+    "neutral": 8,
+    "negative": 4
+  },
+  "topCategories": [
+    { "category": "output-quality", "count": 18 },
+    { "category": "accuracy", "count": 12 }
+  ],
+  "trend": [{ "date": "2026-03-21", "positive": 5, "neutral": 1, "negative": 0 }]
+}
+```
+
+---
+
+### Decision Audit Trail (`/api/decisions`)
+
+Log agent decisions with assumptions and record outcomes.
+
+#### List Decisions
+
+```
+GET /api/decisions
+```
+
+Query params: `agent`, `taskId`, `minConfidence` (0–100), `maxConfidence` (0–100), `minRisk` (0–100), `maxRisk` (0–100), `startTime`, `endTime`.
+
+**Response:** Array of decision objects.
+
+```json
+[
+  {
+    "id": "dec_abc123",
+    "decision": "Use Redis for session caching",
+    "confidence": 0.85,
+    "reasoning": "Redis has sub-ms latency and supports TTL natively.",
+    "evidence": ["benchmark results", "existing infra"],
+    "assumptions": ["Redis cluster is available", "TTL of 1h is sufficient"],
+    "agent": "VERITAS",
+    "taskId": "task_20260321_abc",
+    "createdAt": "2026-03-21T14:00:00.000Z",
+    "outcome": null
+  }
+]
+```
+
+#### Log a Decision
+
+```
+POST /api/decisions
+```
+
+```json
+{
+  "decision": "Refactor auth to use JWT instead of sessions",
+  "confidence": 0.9,
+  "reasoning": "Sessions require sticky routing; JWT is stateless.",
+  "evidence": ["architecture review notes"],
+  "assumptions": ["Clients will store tokens securely"],
+  "agent": "VERITAS",
+  "taskId": "task_20260321_abc"
+}
+```
+
+**Response:** `201` with created decision object.
+
+#### Get Decision
+
+```
+GET /api/decisions/:id
+```
+
+#### Update an Assumption
+
+```
+PATCH /api/decisions/:id/assumptions/:idx
+```
+
+Update a specific assumption by its zero-based index.
+
+```json
+{
+  "text": "Clients will store tokens securely (confirmed via security review)",
+  "held": true
+}
+```
+
+**Response:** Updated decision object with the assumption patched.
+
+#### Decision Review Sessions
+
+Task-launched review sessions capture independent participant responses, ordered critique rounds, and a final packet linked to a versioned work product plus a decision audit record.
+
+| Method | Path                                   | Description                                           |
+| ------ | -------------------------------------- | ----------------------------------------------------- |
+| `GET`  | `/api/decisions/reviews?taskId=<id>`   | List decision review sessions                         |
+| `POST` | `/api/decisions/reviews`               | Start a review session with at least two participants |
+| `GET`  | `/api/decisions/reviews/:id`           | Get a review session                                  |
+| `POST` | `/api/decisions/reviews/:id/responses` | Record an independent initial response                |
+| `POST` | `/api/decisions/reviews/:id/critiques` | Record a participant critique round                   |
+| `POST` | `/api/decisions/reviews/:id/finalize`  | Create the final packet, work product, and decision   |
+| `POST` | `/api/decisions/reviews/:id/cancel`    | Cancel a review session                               |
+| `GET`  | `/api/decisions/reviews/:id/export`    | Export the session packet as Markdown                 |
+
+```json
+{
+  "taskId": "task_20260618_abc",
+  "title": "Release readiness approach",
+  "prompt": "Should we cut v5.1 after the remaining PRs merge?",
+  "context": "Open issues require docs, packaging, and tap validation.",
+  "rounds": 1,
+  "participants": [
+    { "id": "architect", "label": "Architect", "model": "gpt-5" },
+    { "id": "qa-reviewer", "label": "QA Reviewer", "profileId": "qa-reviewer" }
+  ]
+}
+```
+
+---
+
+### Ceremony Requirements (`/api/ceremonies`)
+
+Ceremony requirements are durable review records created by enforcement gates or
+operators. They link back to tasks, runs, workflows, pull requests, or CI runs.
+
+| Method | Path                           | Description                             | Permissions      |
+| ------ | ------------------------------ | --------------------------------------- | ---------------- |
+| `GET`  | `/api/ceremonies`              | List ceremony requirements              | `workflow:read`  |
+| `POST` | `/api/ceremonies`              | Create a ceremony requirement           | `workflow:write` |
+| `POST` | `/api/ceremonies/:id/complete` | Complete a pending ceremony requirement | `workflow:write` |
+
+#### List Ceremony Requirements
+
+```
+GET /api/ceremonies?status=pending&kind=design_review&taskId=task_123&limit=20
+```
+
+Query params: `status`, `kind`, `taskId`, `limit`.
+
+#### Create Ceremony Requirement
+
+```json
+{
+  "kind": "design_review",
+  "enforcementMode": "block",
+  "reason": "Task coordinates multiple agents.",
+  "target": { "taskId": "task_20260626_review" },
+  "trigger": "manual",
+  "requiredArtifacts": ["decision-packet", "risk-list", "action-items"]
+}
+```
+
+#### Complete Ceremony Requirement
+
+```json
+{
+  "completedBy": "brad",
+  "artifacts": [
+    {
+      "kind": "decision-packet",
+      "title": "Design review notes",
+      "body": "Reviewed scope, risks, rollback, and follow-up actions."
+    }
+  ],
+  "actionItems": [
+    {
+      "title": "Track hardening follow-up",
+      "priority": "high",
+      "issueUrl": "https://github.com/BradGroux/veritas-kanban/issues/123"
+    }
+  ]
+}
+```
+
+`completedBy` defaults to the authenticated actor when omitted. Completion keeps
+the record for audit and satisfies future blocking evaluations for the same task
+and ceremony kind.
+
+---
+
+### Governance Decision Traces (`/api/governance/traces`)
+
+Inspect policy, tool-policy, sandbox-policy, budget-policy, agent-permission,
+routing, workflow-gate, and ceremony decisions with evaluated rules, matched
+rules, remediation, and redacted raw detail.
+
+#### List Governance Traces
+
+```
+GET /api/governance/traces
+```
+
+Query params: `kind`, `outcome`, `agent`, `taskId`, `actionType`, `startTime`, `endTime`, `limit`.
+
+`kind` values: `policy`, `tool-policy`, `sandbox-policy`, `budget-policy`, `agent-permission`, `routing`, `workflow-gate`, `ceremony`.
+
+`outcome` values: `allowed`, `warned`, `blocked`, `approval-required`, `routed`, `fallback`, `skipped`.
+
+**Response:** Array of trace records.
+
+```json
+[
+  {
+    "id": "govtrace_1760000000000_ab12cd",
+    "kind": "policy",
+    "outcome": "blocked",
+    "title": "Policy evaluation: git.push",
+    "summary": "Production deploy requires approval.",
+    "remediation": "Request approval from a lead agent.",
+    "subject": {
+      "agentId": "codex",
+      "taskId": "task_123",
+      "actionType": "git.push"
+    },
+    "evaluatedRules": [
+      {
+        "id": "policy:prod-risk",
+        "label": "Production risk gate",
+        "type": "policy",
+        "status": "matched",
+        "outcome": "blocked",
+        "message": "Risk score exceeded the blocking threshold."
+      }
+    ],
+    "matchedRules": [],
+    "steps": [],
+    "redacted": true,
+    "createdAt": "2026-06-01T12:00:00.000Z"
+  }
+]
+```
+
+#### Get Governance Trace
+
+```
+GET /api/governance/traces/:id
+```
+
+Returns one trace record including `raw` detail when present. All persisted trace values are redacted before write.
+
+---
+
+### Behavioral Drift Detection (`/api/drift`)
+
+Track agent metric baselines and detect behavioral deviations.
+
+#### List Drift Alerts
+
+```
+GET /api/drift/alerts
+```
+
+Query params: `agent`, `acknowledged` (boolean), `since`, `limit`.
+
+**Response:** Array of drift alert objects.
+
+```json
+[
+  {
+    "id": "drift_abc123",
+    "agent": "TARS",
+    "metric": "task_completion_rate",
+    "baseline": 0.92,
+    "current": 0.71,
+    "deviation": 0.21,
+    "threshold": 0.1,
+    "severity": "high",
+    "acknowledged": false,
+    "detectedAt": "2026-03-21T14:00:00.000Z"
+  }
+]
+```
+
+#### Acknowledge Drift Alert
+
+```
+POST /api/drift/alerts/:id/acknowledge
+```
+
+```json
+{
+  "notes": "Agent was rate-limited by upstream API — not a behavior change."
+}
+```
+
+**Response:** Updated alert with `acknowledged: true`.
+
+#### List Baselines
+
+```
+GET /api/drift/baselines
+```
+
+Query params: `agent`, `metric`.
+
+**Response:** Array of baseline records showing current metric norms per agent.
+
+#### Reset Baselines
+
+```
+POST /api/drift/baselines/reset
+```
+
+```json
+{
+  "agent": "TARS",
+  "metric": "task_completion_rate"
+}
+```
+
+**Response:** `200` with updated baseline record.
+
+#### Run Drift Analysis
+
+```
+POST /api/drift/analyze
+```
+
+```json
+{
+  "agent": "TARS"
+}
+```
+
+Compares current metrics against baselines and creates alerts for any out-of-threshold deviations.
+
+**Response:** `200` with analysis summary including number of alerts created.
+
+---
+
+### Agent Policy Engine (`/api/policies`)
+
+Define configurable guard rules for agent tool and action access.
+
+#### List Policies
+
+```
+GET /api/policies
+```
+
+Query params: `agent`, `project`, `enabled` (boolean).
+
+**Response:** Array of policy objects.
+
+```json
+[
+  {
+    "id": "pol_abc123",
+    "name": "No web access for Intern agents",
+    "description": "Intern-level agents cannot use browser or fetch tools.",
+    "enabled": true,
+    "scope": { "agentLevel": "intern" },
+    "rules": [
+      {
+        "tool": "browser",
+        "action": "*",
+        "effect": "deny"
+      }
+    ],
+    "precedence": "deny-first",
+    "createdAt": "2026-03-21T14:00:00.000Z"
+  }
+]
+```
+
+#### Create Policy
+
+```
+POST /api/policies
+```
+
+```json
+{
+  "name": "Require approval for file deletion",
+  "enabled": true,
+  "scope": { "global": true },
+  "rules": [
+    {
+      "tool": "exec",
+      "action": "rm",
+      "effect": "require-approval"
+    }
+  ],
+  "precedence": "deny-first"
+}
+```
+
+**Response:** `201` with created policy object.
+
+#### Get Policy
+
+```
+GET /api/policies/:id
+```
+
+#### Update Policy
+
+```
+PUT /api/policies/:id
+```
+
+#### Delete Policy
+
+```
+DELETE /api/policies/:id
+```
+
+**Response:** `204 No Content`.
+
+#### Evaluate Policy
+
+```
+POST /api/policies/evaluate
+```
+
+```json
+{
+  "agent": "TARS",
+  "project": "core",
+  "actionType": "tool.browser.navigate",
+  "riskScore": 72,
+  "metadata": { "url": "https://example.com" }
+}
+```
+
+**Response:**
+
+```json
+{
+  "decision": "require-approval",
+  "matches": [
+    {
+      "policyId": "pol_abc123",
+      "policyName": "Production risk gate",
+      "policyType": "risk-threshold",
+      "responseAction": "require-approval",
+      "message": "Risk score requires approval."
+    }
+  ],
+  "warnings": [],
+  "blockedBy": [],
+  "approvalRequiredBy": ["pol_abc123"],
+  "traceId": "govtrace_1760000000000_ab12cd"
+}
+```
+
+---
+
+### Output Evaluation & Scoring (`/api/scoring`)
+
+Create scoring profiles and evaluate agent outputs against weighted criteria.
+
+#### List Scoring Profiles
+
+```
+GET /api/scoring/profiles
+```
+
+Query params: `limit`, `offset`.
+
+**Response:** Array of scoring profile objects.
+
+#### Create Scoring Profile
+
+```
+POST /api/scoring/profiles
+```
+
+```json
+{
+  "name": "Code Quality Baseline",
+  "description": "Checks for common quality indicators in generated code.",
+  "compositeMethod": "weightedAvg",
+  "scorers": [
+    {
+      "id": "s1",
+      "name": "No hardcoded secrets",
+      "type": "RegexMatch",
+      "pattern": "(password|secret|api_key)\\s*=\\s*['\"][^'\"]+['\"]",
+      "flags": "i",
+      "invert": true,
+      "weight": 2,
+      "scoreOnMatch": 0,
+      "scoreOnMiss": 1
+    },
+    {
+      "id": "s2",
+      "name": "Has error handling",
+      "type": "KeywordContains",
+      "keywords": ["try", "catch", "error"],
+      "matchMode": "any",
+      "weight": 1
+    }
+  ]
+}
+```
+
+**Response:** `201` with created profile.
+
+Scoring profiles accept `KeywordContains`, `NumericRange`, bounded `RegexMatch`, and declarative
+`OccurrenceRatio` scorers. Regex patterns are limited to 256 characters and execute through a
+globally bounded four-worker pool and wait queue with a 100 ms limit. Valid JavaScript regex flags
+supported by the active Node runtime remain accepted. `OccurrenceRatio` counts literal `needles`
+and normalizes them with a fixed `denominator` or numeric `denominatorPath`; it does not execute
+expression strings. Persisted legacy custom-expression profiles must be migrated before evaluation.
+
+#### Get Scoring Profile
+
+```
+GET /api/scoring/profiles/:id
+```
+
+#### Update Scoring Profile
+
+```
+PUT /api/scoring/profiles/:id
+```
+
+#### Delete Scoring Profile
+
+```
+DELETE /api/scoring/profiles/:id
+```
+
+**Response:** `204 No Content`.
+
+#### Evaluate Output
+
+```
+POST /api/scoring/evaluate
+```
+
+```json
+{
+  "profileId": "prof_abc123",
+  "output": "function getUser(id) {\n  try {\n    return db.find(id);\n  } catch (e) {\n    throw e;\n  }\n}",
+  "action": "generate_function",
+  "agent": "TARS",
+  "taskId": "task_20260321_abc"
+}
+```
+
+**Response:**
+
+```json
+{
+  "id": "eval_xyz789",
+  "profileId": "prof_abc123",
+  "score": 0.88,
+  "compositeMethod": "weightedAvg",
+  "scorerResults": [
+    { "id": "s1", "name": "No hardcoded secrets", "score": 1.0, "weight": 2 },
+    { "id": "s2", "name": "Has error handling", "score": 1.0, "weight": 1 }
+  ],
+  "agent": "TARS",
+  "taskId": "task_20260321_abc",
+  "evaluatedAt": "2026-03-21T14:00:00.000Z"
+}
+```
+
+#### Evaluation History
+
+```
+GET /api/scoring/history
+```
+
+Query params: `profileId`, `agent`, `taskId`, `since`, `limit`, `offset`.
+
+**Response:** Array of past evaluation results.
+
+---
+
+### Prompt Template Registry (`/api/prompt-registry`)
+
+Manage version-controlled prompt templates with variable extraction and usage tracking.
+
+#### List Templates
+
+```
+GET /api/prompt-registry
+```
+
+Query params: `tag`, `search`, `limit`, `offset`.
+
+**Response:** Array of template summaries (without full content for performance).
+
+#### Create Template
+
+```
+POST /api/prompt-registry
+```
+
+```json
+{
+  "name": "Task Completion Summary",
+  "description": "Generates a completion summary for a finished task.",
+  "content": "You completed task {{task_title}}. Summarize what was done in 2-3 sentences, referencing the acceptance criteria: {{acceptance_criteria}}",
+  "tags": ["completion", "summary"],
+  "changelog": "Initial version"
+}
+```
+
+**Response:** `201` with created template including auto-extracted variables (`task_title`, `acceptance_criteria`).
+
+#### Get Template
+
+```
+GET /api/prompt-registry/:id
+```
+
+**Response:** Full template with current content, version number, variables list, and metadata.
+
+#### Update Template
+
+```
+PATCH /api/prompt-registry/:id
+```
+
+Body: Partial template fields. Triggers automatic version creation.
+
+```json
+{
+  "content": "You completed task {{task_title}} (ID: {{task_id}}). Summarize...",
+  "changelog": "Added task_id variable"
+}
+```
+
+#### Delete Template
+
+```
+DELETE /api/prompt-registry/:id
+```
+
+**Response:** `204 No Content`.
+
+#### List Versions
+
+```
+GET /api/prompt-registry/:id/versions
+```
+
+**Response:** Array of version objects (id, versionNumber, changelog, createdAt). Does not include full content for performance.
+
+#### Get Usage History
+
+```
+GET /api/prompt-registry/:id/usage
+```
+
+Query params: `limit`, `offset`.
+
+**Response:** Array of usage records with model, token counts, and timestamps.
+
+#### Template Stats
+
+```
+GET /api/prompt-registry/:id/stats
+```
+
+**Response:**
+
+```json
+{
+  "totalUses": 42,
+  "averageInputTokens": 312,
+  "averageOutputTokens": 128,
+  "lastUsedAt": "2026-03-21T14:00:00.000Z"
+}
+```
+
+#### Aggregate Stats (All Templates)
+
+```
+GET /api/prompt-registry/stats/all
+```
+
+**Response:** Aggregate usage stats across all templates.
+
+#### Preview Template
+
+```
+POST /api/prompt-registry/:id/render-preview
+```
+
+```json
+{
+  "variables": {
+    "task_title": "Add OAuth login",
+    "acceptance_criteria": "Users can log in with Google."
+  }
+}
+```
+
+**Response:** `{ "rendered": "You completed task Add OAuth login. Summarize..." }`
+
+#### Record Usage
+
+```
+POST /api/prompt-registry/:id/record-usage
+```
+
+```json
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "inputTokens": 320,
+  "outputTokens": 145,
+  "renderedOutput": "You completed task Add OAuth login...",
+  "variables": { "task_title": "Add OAuth login" }
+}
+```
+
+**Response:** `201` with logged usage record.
+
+---
+
+## SQLite Portability (`/api/v1/sqlite`)
+
+Admin-only endpoints for v5 file-to-SQLite migration and backup portability.
+
+#### Dry-Run File Migration
+
+```
+POST /api/v1/sqlite/migration/dry-run
+```
+
+```json
+{
+  "sourceRoot": "/path/to/project",
+  "sqlitePath": "/path/to/.veritas-kanban/veritas.db",
+  "journalPath": "/path/to/.veritas-kanban/sqlite-migration-journal.json"
+}
+```
+
+Returns entity counts and warnings without creating or mutating the database.
+
+#### Run File Migration
+
+```
+POST /api/v1/sqlite/migration/run
+```
+
+```json
+{
+  "sourceRoot": "/path/to/project",
+  "sqlitePath": "/path/to/.veritas-kanban/veritas.db",
+  "backupDir": "/path/to/pre-migration-backup",
+  "journalPath": "/path/to/.veritas-kanban/sqlite-migration-journal.json"
+}
+```
+
+Creates a timestamped source backup, imports supported file-backed data into
+SQLite, and returns a migration report.
+
+#### Migration Recovery State
+
+```
+GET /api/v1/sqlite/migration/recovery?sourceRoot=/path/to/project&sqlitePath=/path/to/.veritas-kanban/veritas.db
+```
+
+Returns the latest migration journal, safe-mode recommendation, backup
+restore availability, source-file availability, SQLite readability, next
+actions, and artifacts to preserve for support.
+
+#### Restore Pre-Migration Backup
+
+```
+POST /api/v1/sqlite/migration/restore-backup
+```
+
+```json
+{
+  "backupPath": "/path/to/pre-migration-backup",
+  "targetRoot": "/path/to/project",
+  "journalPath": "/path/to/.veritas-kanban/sqlite-migration-journal.json",
+  "replaceExisting": true,
+  "dryRun": false
+}
+```
+
+Restores the file-backed `tasks/` and `.veritas-kanban/` content from the
+pre-migration backup. Non-empty targets require `replaceExisting: true`; use
+`dryRun: true` to verify the paths and file count before overwriting.
+
+#### Export Backup Bundle
+
+```
+POST /api/v1/sqlite/export
+```
+
+```json
+{
+  "sqlitePath": "/path/to/.veritas-kanban/veritas.db",
+  "outputDir": "/path/to/backup-bundle",
+  "workspaceId": "local"
+}
+```
+
+Writes raw SQLite table snapshots plus human-readable Markdown/JSON/YAML files.
+Omit `workspaceId` for a full database export. When `workspaceId` is supplied,
+the export includes only rows scoped to that workspace plus member user records;
+global app configuration tables are exported as empty arrays. Derived task
+Markdown and workflow YAML files use the same workspace boundary, and unscoped
+derived files such as global settings JSON are omitted.
+
+The generated `manifest.json` includes table row counts, data lifecycle classes,
+retention/export/delete behavior, sensitivity flags, scope, and redaction state.
+
+#### Data Lifecycle Policy
+
+```
+GET /api/v1/sqlite/lifecycle-policy
+```
+
+Returns the machine-readable v5 lifecycle policy used by backup manifests and
+future Maintenance Center cleanup previews.
+
+#### Import Backup Bundle
+
+```
+POST /api/v1/sqlite/import
+```
+
+```json
+{
+  "sqlitePath": "/path/to/fresh.db",
+  "bundleDir": "/path/to/backup-bundle",
+  "replaceExisting": true
+}
+```
+
+Restores the bundle into SQLite and rebuilds derived search indexes.
+
+---
+
+## Maintenance Center (`/api/v1/maintenance`)
+
+Admin/backup endpoints that power Settings -> Maintenance. The full contract is
+documented in [v5.0 Maintenance Center](MAINTENANCE-CENTER.md).
+
+#### Summary
+
+```
+GET /api/v1/maintenance/summary
+```
+
+Returns health checks, storage categories, lifecycle policy metadata, work
+product maintenance preview data, safe cleanup preview items, and allowlisted
+log sources with redacted local paths. Cleanup is preview-only; the endpoint
+does not delete data. When SQLite is active, the response also includes the
+optional `sqlite` posture object documented under [Health](#health).
+
+#### Redacted Log Tail
+
+```
+GET /api/v1/maintenance/logs?source=server&tail=200
+```
+
+Returns redacted lines and redacted source metadata from an allowlisted source.
+`tail` is capped at 500.
+
+#### Debug Bundle
+
+```
+POST /api/v1/maintenance/debug-bundle
+```
+
+Creates a redacted debug bundle under the runtime debug-bundles directory and
+returns the output path plus a manifest of included categories, excluded
+sensitive categories, redaction rules, and redacted file metadata. The
+`phase-authority.json` member includes at most 200 phase-bound runs with phase
+identity, authority scope counts, source kinds, transition expansion counts,
+and completion bindings. Exact authority scopes, paths, credential
+references, and full digests are not exported. The `admission-queue.json`
+member includes at most 200 entries from the same bounded inspection projection
+used by the API, CLI, and Operations UI. It identifies launch source, queue
+state, readiness, retry posture, and redacted navigation keys without exporting
+the durable replay target, prompts, messages, override text, credentials, or
+raw idempotency keys.
+
+#### SQLite Export and Import
+
+```
+POST /api/v1/maintenance/sqlite/export
+POST /api/v1/maintenance/sqlite/import
+```
+
+Wrappers around the SQLite portability export/import handlers. They return the
+same portability report used by `/api/v1/sqlite`.
+
+---
+
+### File Work Products (`/api/v1/work-products`)
+
+File Work Products are governed, immutable deliverables copied from the exact artifact root granted to a run. Read, registration, and archive routes use normal Work Product permissions; physical purge requires `admin:manage`. Every route enforces the authenticated workspace.
+
+| Method   | Path                                                    | Behavior                                                                                                 |
+| -------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `POST`   | `/api/v1/work-products/artifacts/register`              | Validate and atomically register one relative run artifact; stable `requestId` retries are idempotent.   |
+| `GET`    | `/api/v1/work-products/artifacts`                       | List file products by optional `taskId`, `sourceRunId`, `includeArchived`, and `limit`.                  |
+| `GET`    | `/api/v1/work-products/:id/artifact`                    | Inspect current file Work Product metadata.                                                              |
+| `GET`    | `/api/v1/work-products/:id/artifact/versions`           | List immutable artifact metadata versions.                                                               |
+| `GET`    | `/api/v1/work-products/:id/artifact/preview?version=N`  | Return a bounded passive preview contract or an actionable fail-closed status.                           |
+| `GET`    | `/api/v1/work-products/:id/artifact/download?version=N` | Download authorized bytes after size and SHA-256 verification.                                           |
+| `DELETE` | `/api/v1/work-products/:id/artifact?confirm=:id`        | Physically purge an archived file product, all versions, and all stored bodies after exact confirmation. |
+
+Registration body:
+
+```json
+{
+  "taskId": "task_release",
+  "runId": "run_release",
+  "attemptId": "attempt_release",
+  "requestId": "release-pdf-v1",
+  "producingEventId": "runevt_output",
+  "relativePath": "release.pdf",
+  "title": "Release PDF",
+  "mediaType": "application/pdf",
+  "workProductId": "wp_optional_refinement_target"
+}
+```
+
+`relativePath` is resolved only beneath the manifest-bound `VERITAS_ARTIFACT_ROOT`; callers cannot supply or discover the host root. Quarantined artifacts remain inspectable but return `404` from download. Successful downloads include `Content-Disposition: attachment`, `Content-Digest`, `X-Artifact-SHA256`, ETag, and private immutable cache headers.
+
+Preview responses use `work-product-artifact-preview/v1`. Renderer selection is based on validated content and media type. Text and Markdown require strict UTF-8; passive HTML is reduced to bounded semantic markup and returned as a host-owned CSP document for an empty-sandbox `srcdoc` frame; PNG, JPEG, GIF, and WebP require matching magic bytes and bounded dimensions; PDFs require a bounded passive page tree with no active actions or external links; CSV and `.xlsx` return capped inert cells with formula-shaped values marked explicitly. The response includes the exact artifact version, digest, source run, redaction state, and causal event, but never a host path or storage key. Unsupported, quarantined, missing, malformed, oversized, and policy-blocked artifacts return `renderer: "none"` with allowed fallback actions. Preview responses are private and non-cacheable. `POST /api/work-products/:id/artifact/preview/audit` records an authenticated HTML preview `open`, `close`, `refresh`, or `navigate` action for an optional exact version; it requires `work_product:read` and stores no document content. See [Governed Artifact Previews v1](architecture/ARTIFACT-PREVIEWS-V1.md).
+
+Direct general Work Product creation rejects `kind: "file"`, and generic updates reject existing file products; governed registration is the only creation and refinement path. Archive preserves downloads. Physical purge is explicit, requires the authenticated workspace and `admin:manage`, rejects active products, and requires `confirm` to exactly match the Work Product ID. See [File-Backed Work Products v1](architecture/FILE-WORK-PRODUCTS-V1.md).
+
+### Run File Provenance (`/api/agents/:taskId/file-provenance`)
+
+Run file provenance projects the append-only run journal into digest-bound file history. Both routes require an authenticated workspace and an exact task attempt whose persisted task envelope belongs to that workspace. Legacy or mismatched attempts fail closed.
+
+| Method | Endpoint                                                                                         | Purpose                                                                                           |
+| ------ | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/agents/:taskId/file-provenance/resolve?attemptId=...&root=...&relativePath=...&sha256=...` | Resolve current bytes as `exact`, `stale`, `unknown`, or `gap`, with a bounded predecessor chain. |
+| `GET`  | `/api/agents/:taskId/file-provenance?attemptId=...&limit=25`                                     | List the latest bounded records and typed capture gaps for one attempt.                           |
+
+Paths are normalized root-relative identifiers; host paths and traversal are rejected. URLs, connector targets, and metadata are reduced to safe redacted fields. An exact response binds the latest path record to the requested SHA-256 digest. Approval workflows can bind the deterministic `run-file-provenance-approval-evidence/v1` projection rather than trusting a filename or mutable path. See [Run File Provenance v1](architecture/RUN-FILE-PROVENANCE-V1.md).
+
+---
+
+### System Health (`/api/v1/system/health`)
+
+Get a real-time snapshot of system health across resources, agents, and operations.
+
+```
+GET /api/v1/system/health
+```
+
+No query params required.
+
+**Response:**
+
+```json
+{
+  "status": "stable",
+  "level": 0,
+  "signals": {
+    "system": {
+      "status": "stable",
+      "storageUsedPercent": 42,
+      "diskFreeGb": 120,
+      "memoryUsedPercent": 58
+    },
+    "agents": {
+      "status": "stable",
+      "online": 3,
+      "offline": 0,
+      "total": 3
+    },
+    "operations": {
+      "status": "stable",
+      "successRate": 0.97,
+      "recentRuns": 50,
+      "recentFailures": 1
+    }
+  },
+  "timestamp": "2026-03-21T14:00:00.000Z"
+}
+```
+
+**Health levels:** `stable` (0) · `reviewing` (1) · `drifting` (2) · `elevated` (3) · `alert` (4)
+
+---
+
+_For workflow engine endpoints, see [API-WORKFLOWS.md](API-WORKFLOWS.md)._  
+_For MCP server tools, see [MCP Server Guide](mcp/README.md)._  
+_For agent workflow SOPs, see [SOP-agent-task-workflow.md](SOP-agent-task-workflow.md)._
+
+## Notification pagination and storage
+
+`GET /api/notifications` accepts `limit` (integer 1–1000) and `offset` (nonnegative integer), alongside the existing `agent`, `undelivered`, and `taskId` filters. Omit pagination to retain the existing all-results response. Invalid pagination returns HTTP 400. Responses remain arrays, ordered newest first with notification ID as the stable tie-breaker.
+
+SQLite applies filtering and pagination in the query, aggregates notification statistics in SQL, and updates delivery state by row ID. Subscription creation preserves an existing subscription's original reason and timestamp. The file backend keeps the same operation semantics with locked, atomic file updates; its read and write costs still depend on retained history. No database migration is required.
+
+Run the disposable SQLite delivery benchmark from the repository root:
+
+```bash
+pnpm --filter @veritas-kanban/server exec tsx scripts/benchmark-notifications.ts
+```
+
+It seeds 100, 1,000, and 10,000 public-safe notifications in temporary databases, reports cold delivery latency and 25 warm samples per size, and removes only its temporary fixtures. `changedRowsPerWrite` should remain `[1]`. Timings depend on hardware and current host load; compare matching environments and use the row-change count as the deterministic regression check.

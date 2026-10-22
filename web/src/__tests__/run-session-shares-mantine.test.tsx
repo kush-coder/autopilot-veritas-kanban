@@ -1,0 +1,398 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import type { RunApprovalRequest, RunSessionEvent, RunSessionShare } from '@veritas-kanban/shared';
+
+import {
+  RunSessionShareView,
+  RunSessionSharesSection,
+} from '@/components/task/RunSessionSharesSection';
+import { createMockTask, renderWithProviders } from './test-utils';
+
+const mocks = vi.hoisted(() => ({
+  useRunSessions: vi.fn(),
+  useRunSession: vi.fn(),
+  useRunSessionEvents: vi.fn(),
+  useRunSessionEventStream: vi.fn(),
+  createShareMutateAsync: vi.fn(),
+  updateShareMutate: vi.fn(),
+  revokeShareMutate: vi.fn(),
+  sendMessageMutateAsync: vi.fn(),
+  approvalMutateAsync: vi.fn(),
+  forkMutateAsync: vi.fn(),
+  useAgentStatus: vi.fn(),
+  useAgentStream: vi.fn(),
+  usePendingAgentApprovals: vi.fn(),
+  toast: vi.fn(),
+  identity: {
+    authContext: { clientMode: 'desktop' },
+  },
+}));
+
+vi.mock('@/hooks/useRunSessions', () => ({
+  useRunSessions: mocks.useRunSessions,
+  useRunSession: mocks.useRunSession,
+  useRunSessionEvents: mocks.useRunSessionEvents,
+  useRunSessionEventStream: mocks.useRunSessionEventStream,
+  useCreateRunSessionShare: () => ({
+    mutateAsync: mocks.createShareMutateAsync,
+    isPending: false,
+  }),
+  useUpdateRunSessionShare: () => ({
+    mutate: mocks.updateShareMutate,
+    isPending: false,
+  }),
+  useRevokeRunSessionShare: () => ({
+    mutate: mocks.revokeShareMutate,
+    isPending: false,
+  }),
+  useSendRunSessionMessage: () => ({
+    mutateAsync: mocks.sendMessageMutateAsync,
+    isPending: false,
+  }),
+  useRunSessionApprovalResponse: () => ({
+    mutateAsync: mocks.approvalMutateAsync,
+    isPending: false,
+  }),
+  useForkRunSession: () => ({
+    mutateAsync: mocks.forkMutateAsync,
+    isPending: false,
+  }),
+}));
+
+vi.mock('@/hooks/useAgent', () => ({
+  useAgentStatus: mocks.useAgentStatus,
+  useAgentStream: mocks.useAgentStream,
+  usePendingAgentApprovals: mocks.usePendingAgentApprovals,
+}));
+
+vi.mock('@/hooks/useToast', () => ({
+  useToast: () => ({ toast: mocks.toast }),
+}));
+
+vi.mock('@/hooks/useIdentity', () => ({
+  useIdentity: () => mocks.identity,
+}));
+
+const baseShare: RunSessionShare = {
+  id: 'run_share_721',
+  workspaceId: 'local',
+  taskId: 'task-721',
+  sourceType: 'task-agent',
+  sourceId: 'attempt-721',
+  permission: 'view',
+  status: 'active',
+  createdAt: '2026-06-18T10:00:00.000Z',
+  updatedAt: '2026-06-18T10:00:00.000Z',
+  createdBy: { id: 'user-1', label: 'Brad', workspaceId: 'local' },
+  actorLabel: 'Reviewer',
+  stablePath: '/runs/shared/run_share_721',
+  mobileSafeApprovalClasses: ['elicitation'],
+  snapshot: {
+    running: true,
+    taskTitle: 'Shared live sessions',
+    attemptId: 'attempt-721',
+    attemptStatus: 'running',
+    agent: 'codex',
+    model: 'gpt-5',
+    startedAt: '2026-06-18T10:00:00.000Z',
+  },
+  forkedTaskIds: [],
+};
+
+const pendingApproval: RunApprovalRequest = {
+  schemaVersion: 'run-approval/v1',
+  id: 'runapproval_mobile_safe1',
+  workspaceId: 'local',
+  taskId: baseShare.taskId,
+  attemptId: baseShare.sourceId,
+  provider: 'codex-app-server',
+  agentId: 'codex-app-server',
+  requestKind: 'elicitation',
+  actionClass: 'elicitation',
+  action: 'Choose the verification gate',
+  actionHash: 'a'.repeat(64),
+  details: 'Select the next bounded verification command.',
+  resourceScope: [],
+  riskClass: 'low',
+  evidenceRevision: 'provider-runtime-probe/v6',
+  providerRequestId: 'provider-mobile-safe-1',
+  mobileSafe: true,
+  status: 'pending',
+  revision: 1,
+  createdAt: '2026-06-18T10:01:30.000Z',
+  updatedAt: '2026-06-18T10:01:30.000Z',
+  expiresAt: '2026-06-18T10:06:30.000Z',
+};
+
+const event: RunSessionEvent = {
+  id: 'run_event_msg',
+  shareId: baseShare.id,
+  taskId: baseShare.taskId,
+  attemptId: baseShare.snapshot.attemptId,
+  type: 'message.sent',
+  actor: { id: 'editor-1', label: 'Pair Editor', workspaceId: 'local' },
+  createdAt: '2026-06-18T10:02:00.000Z',
+  message: 'Continue the run',
+};
+
+describe('run session share Mantine surfaces', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.useRunSessions.mockReturnValue({ data: [baseShare], isLoading: false });
+    mocks.useRunSession.mockReturnValue({ data: baseShare, isLoading: false, error: null });
+    mocks.useRunSessionEvents.mockReturnValue({ data: [event], isLoading: false });
+    mocks.usePendingAgentApprovals.mockReturnValue({
+      data: [pendingApproval],
+      isLoading: false,
+    });
+    mocks.useAgentStatus.mockReturnValue({
+      data: {
+        running: true,
+        attemptId: 'attempt-721',
+        controls: {
+          controls: [
+            {
+              action: 'message',
+              capabilityId: 'run.steer',
+              state: 'supported',
+              available: true,
+              advisory: false,
+              reason: 'Steering is supported.',
+            },
+            {
+              action: 'approvals',
+              capabilityId: 'run.approvals',
+              state: 'supported',
+              available: true,
+              advisory: false,
+              reason: 'Provider approvals are supported.',
+            },
+          ],
+        },
+      },
+      error: null,
+    });
+    mocks.useAgentStream.mockReturnValue({
+      outputs: [
+        {
+          type: 'stdout',
+          content: 'agent streamed output',
+          timestamp: '2026-06-18T10:01:00.000Z',
+        },
+      ],
+      isConnected: true,
+      isRunning: true,
+      clearOutputs: vi.fn(),
+    });
+    mocks.createShareMutateAsync.mockResolvedValue(baseShare);
+    mocks.sendMessageMutateAsync.mockResolvedValue(event);
+    mocks.approvalMutateAsync.mockResolvedValue({
+      ...event,
+      type: 'approval.responded',
+      actionClass: 'elicitation',
+      approvalResponse: 'approved',
+    });
+    mocks.forkMutateAsync.mockResolvedValue({
+      fork: { id: 'run_fork_721' },
+      task: { id: 'task-721-fork', title: 'Forked task' },
+    });
+    mocks.identity.authContext = { clientMode: 'desktop' };
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('creates links, upgrades view-only shares, and revokes active shares from task detail', async () => {
+    const user = userEvent.setup();
+    const task = createMockTask({ id: 'task-721', title: 'Shared live sessions' });
+
+    renderWithProviders(<RunSessionSharesSection task={task} isAgentRunning />);
+
+    expect(screen.getByText('Shared Live Sessions')).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: 'Create Link' }));
+    expect(mocks.createShareMutateAsync).toHaveBeenCalledWith({
+      taskId: 'task-721',
+      permission: 'view',
+      mobileSafeApprovalClasses: ['elicitation'],
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Co-drive' }));
+    expect(mocks.updateShareMutate).toHaveBeenCalledWith({
+      shareId: 'run_share_721',
+      input: { permission: 'edit' },
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Revoke' }));
+    expect(mocks.revokeShareMutate).toHaveBeenCalledWith({ shareId: 'run_share_721' });
+  });
+
+  it('renders a view-only shared session without edit or fork controls', () => {
+    renderWithProviders(<RunSessionShareView shareId="run_share_721" />);
+
+    expect(screen.getByText('Shared live sessions')).toBeTruthy();
+    expect(screen.getByText('agent streamed output')).toBeTruthy();
+    expect(screen.getByText('message.sent')).toBeTruthy();
+    expect(screen.queryByText('Co-drive Message')).toBeNull();
+    expect(screen.queryByText('Fork Session')).toBeNull();
+  });
+
+  it('sends attributed co-drive messages and mobile-safe approval responses', async () => {
+    const user = userEvent.setup();
+    mocks.identity.authContext = { clientMode: 'mobile-pwa' };
+    mocks.useRunSession.mockReturnValue({
+      data: { ...baseShare, permission: 'edit' },
+      isLoading: false,
+      error: null,
+    });
+
+    renderWithProviders(<RunSessionShareView shareId="run_share_721" />);
+
+    await user.type(
+      screen.getByPlaceholderText('Send an attributed message into the run...'),
+      'Run the narrow verification gate'
+    );
+    await user.click(screen.getByRole('button', { name: 'Send Message' }));
+    expect(mocks.sendMessageMutateAsync).toHaveBeenCalledWith({
+      shareId: 'run_share_721',
+      input: { message: 'Run the narrow verification gate' },
+    });
+
+    expect(
+      screen.getByText(
+        'Mobile decisions require both a mobile-safe provider request and an allowlisted action class for this share.'
+      )
+    ).toBeTruthy();
+    await user.type(screen.getByLabelText('Reviewer note'), 'Looks safe from mobile');
+    await user.click(screen.getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() =>
+      expect(mocks.approvalMutateAsync).toHaveBeenCalledWith({
+        shareId: 'run_share_721',
+        input: {
+          approvalId: pendingApproval.id,
+          actionClass: 'elicitation',
+          response: 'approved',
+          expectedRevision: pendingApproval.revision,
+          expectedActionHash: pendingApproval.actionHash,
+          note: 'Looks safe from mobile',
+        },
+      })
+    );
+  });
+
+  it('forks a fork-permission share without enabling co-drive controls', async () => {
+    const user = userEvent.setup();
+    mocks.useRunSession.mockReturnValue({
+      data: { ...baseShare, permission: 'fork' },
+      isLoading: false,
+      error: null,
+    });
+
+    renderWithProviders(<RunSessionShareView shareId="run_share_721" />);
+
+    expect(screen.queryByText('Co-drive Message')).toBeNull();
+    await user.type(screen.getByLabelText('Fork task title'), 'Continue in a clean fork');
+    await user.click(screen.getByRole('button', { name: 'Create Fork' }));
+
+    expect(mocks.forkMutateAsync).toHaveBeenCalledWith({
+      shareId: 'run_share_721',
+      input: {
+        title: 'Continue in a clean fork',
+        reason: 'Forked from shared live run session.',
+      },
+    });
+  });
+
+  it('disables co-drive messaging when the persisted runtime manifest cannot steer', () => {
+    mocks.useRunSession.mockReturnValue({
+      data: { ...baseShare, permission: 'edit' },
+      isLoading: false,
+      error: null,
+    });
+    mocks.useAgentStatus.mockReturnValue({
+      data: {
+        running: true,
+        attemptId: 'attempt-721',
+        controls: {
+          controls: [
+            {
+              action: 'message',
+              capabilityId: 'run.steer',
+              state: 'unsupported',
+              available: false,
+              advisory: false,
+              reason: 'This provider cannot steer the active run.',
+            },
+          ],
+        },
+      },
+      error: null,
+    });
+
+    renderWithProviders(<RunSessionShareView shareId="run_share_721" />);
+
+    expect(
+      screen.getByText('Message unavailable: This provider cannot steer the active run.')
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole('button', {
+          name: 'Send Message unavailable: This provider cannot steer the active run.',
+        })
+        .getAttribute('disabled')
+    ).not.toBeNull();
+    expect(
+      screen.getByText(
+        'Approval unavailable: Validated provider approval evidence is not available for this run.'
+      )
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Approve' }).getAttribute('disabled')).not.toBeNull();
+  });
+
+  it('fails shared controls closed for a replacement attempt', () => {
+    mocks.useRunSession.mockReturnValue({
+      data: { ...baseShare, permission: 'edit' },
+      isLoading: false,
+      error: null,
+    });
+    mocks.useAgentStatus.mockReturnValue({
+      data: {
+        running: true,
+        attemptId: 'attempt-replacement',
+        controls: {
+          controls: [
+            {
+              action: 'message',
+              capabilityId: 'run.steer',
+              state: 'supported',
+              available: true,
+              advisory: false,
+              reason: 'Steering is supported.',
+            },
+            {
+              action: 'approvals',
+              capabilityId: 'run.approvals',
+              state: 'supported',
+              available: true,
+              advisory: false,
+              reason: 'Provider approvals are supported.',
+            },
+          ],
+        },
+      },
+      error: null,
+    });
+
+    renderWithProviders(<RunSessionShareView shareId="run_share_721" />);
+
+    const replacementReason =
+      'This link is pinned to an earlier attempt and cannot control its replacement.';
+    expect(screen.getByText(`Message unavailable: ${replacementReason}`)).toBeTruthy();
+    expect(screen.getByText(`Approval unavailable: ${replacementReason}`)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Approve' }).getAttribute('disabled')).not.toBeNull();
+    expect(mocks.useAgentStream).toHaveBeenCalledWith(undefined);
+    expect(screen.queryByText('agent streamed output')).toBeNull();
+  });
+});

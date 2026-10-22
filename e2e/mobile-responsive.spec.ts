@@ -1,0 +1,249 @@
+import { test, expect, type Locator, type Page } from '@playwright/test';
+import { bypassAuth, cleanupRoutes, deleteTask, seedTestTask } from './helpers/auth';
+
+async function tapLocatorCenter(page: Page, locator: Locator) {
+  await expect(locator).toBeVisible();
+  const box = await locator.boundingBox();
+  expect(box).not.toBeNull();
+  await page.touchscreen.tap(box!.x + box!.width / 2, box!.y + box!.height / 2);
+}
+
+async function useMobileDeviceContext(page: Page) {
+  await page.route('**/api/auth/context', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        role: 'read-only',
+        isLocalhost: false,
+        actorType: 'device',
+        authMethod: 'device-session',
+        deviceSessionId: 'e2e-mobile-session',
+        deviceId: 'e2e-phone',
+        clientId: 'e2e-mobile-browser',
+        clientMode: 'mobile-pwa',
+        capabilities: [
+          'board:read',
+          'workspace:read',
+          'task:read',
+          'task:write',
+          'comment:write',
+          'workflow:read',
+          'notification:read',
+          'notification:receive',
+        ],
+        permissions: [
+          'workspace:read',
+          'task:read',
+          'task:write',
+          'comment:write',
+          'workflow:read',
+          'work_product:read',
+          'agent:read',
+          'settings:read',
+        ],
+      }),
+    })
+  );
+}
+
+test.describe('mobile responsive flows', () => {
+  let testTaskId: string | null = null;
+
+  test.beforeEach(async ({ page }) => {
+    await bypassAuth(page);
+    await useMobileDeviceContext(page);
+  });
+
+  test.afterEach(async ({ page }) => {
+    if (testTaskId) {
+      await deleteTask(page, testTaskId).catch(() => {});
+      testTaskId = null;
+    }
+    await cleanupRoutes(page);
+  });
+
+  test('supports board, task detail, comments, approval review, notifications, and pairing setup', async ({
+    page,
+  }) => {
+    // WebKit's first mobile context can consume much of the default budget in
+    // fixture setup; keep this deliberately broad end-to-end flow bounded.
+    test.setTimeout(45_000);
+    const taskTitle = `E2E Mobile Responsive Task ${Date.now()}`;
+    const task = await seedTestTask(page, {
+      title: taskTitle,
+      description: 'Verify phone-sized task review and coordination flows.',
+      status: 'todo',
+      priority: 'high',
+      type: 'code',
+      git: {
+        repo: 'BradGroux/veritas-kanban',
+        branch: 'mobile-responsive-e2e',
+        baseBranch: 'main',
+        worktreePath: '/tmp/mobile-responsive-e2e',
+      },
+      verificationSteps: [
+        { id: 'mobile-verify', description: 'Mobile responsive e2e passes', checked: false },
+      ],
+    });
+    testTaskId = (task as { id: string }).id;
+
+    await page.goto('/');
+
+    await expect(page.getByRole('navigation', { name: 'Mobile navigation' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Mobile notifications' })).toBeVisible();
+
+    const statusSelect = page.getByRole('combobox', {
+      name: `Change status for ${taskTitle}`,
+    });
+    await expect(statusSelect).toBeVisible();
+    const statusPersisted = page.waitForResponse((response) => {
+      const request = response.request();
+      return (
+        request.method() === 'POST' &&
+        new URL(response.url()).pathname === `/api/tasks/${testTaskId}/move` &&
+        response.ok()
+      );
+    });
+    await statusSelect.click();
+    await page.getByRole('option', { name: 'Blocked' }).click();
+    await statusPersisted;
+    await page.reload();
+    await expect(page.getByRole('navigation', { name: 'Mobile navigation' })).toBeVisible();
+    await expect(page.getByText(taskTitle).first()).toBeVisible();
+
+    await page.getByText(taskTitle).first().click();
+    const detail = page.getByTestId('task-detail-panel');
+    await expect(detail).toBeVisible();
+    await expect(detail.getByRole('textbox', { name: 'Task title' })).toHaveValue(taskTitle);
+    const detailBox = await detail.boundingBox();
+    expect(detailBox?.width ?? 0).toBeLessThanOrEqual(page.viewportSize()!.width);
+
+    await detail.getByRole('combobox', { name: 'Task workspace mode' }).click();
+    await page.getByRole('option', { name: 'Results' }).click();
+    await detail.getByRole('combobox', { name: 'Results section' }).click();
+    await page.getByRole('option', { name: 'Review' }).click();
+    await detail.getByRole('button', { name: 'Request Changes' }).click();
+    await detail.getByPlaceholder('Describe the changes needed...').fill('Mobile review works.');
+    await detail.getByRole('button', { name: 'Submit Changes Requested' }).click();
+    await expect(
+      detail.locator('p:visible', { hasText: 'Mobile review works.' }).first()
+    ).toBeVisible();
+
+    await detail.getByRole('combobox', { name: 'Task workspace mode' }).click();
+    await page.getByRole('option', { name: 'Plan' }).click();
+    await detail.getByRole('combobox', { name: 'Plan section' }).click();
+    await page.getByRole('option', { name: 'Details' }).click();
+    await detail.getByPlaceholder(/Add a comment/).fill('Mobile comment submitted.');
+    await detail.getByRole('button', { name: 'Add Comment' }).click();
+    await expect(
+      detail.locator('p:visible', { hasText: 'Mobile comment submitted.' }).first()
+    ).toBeVisible();
+
+    await detail.getByRole('button', { name: 'Close task workspace' }).click();
+    await expect(detail).not.toBeVisible();
+
+    const mobileNotificationsButton = page.getByRole('button', { name: 'Mobile notifications' });
+    await tapLocatorCenter(page, mobileNotificationsButton);
+    const notifications = page.getByLabel('Notifications', { exact: true });
+    await expect(notifications).toBeVisible();
+    await expect(notifications.getByRole('heading', { name: 'Needs Attention' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(notifications).not.toBeVisible();
+
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('veritas:open-diagnostics')));
+    await page.getByRole('button', { name: /Remote Server/ }).click();
+    await expect(page.getByLabel('Pairing link')).toBeVisible();
+  });
+
+  test('renders login controls at a phone viewport', async ({ page }) => {
+    await cleanupRoutes(page);
+    await page.route('**/api/auth/status', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          needsSetup: false,
+          authenticated: false,
+          sessionExpiry: null,
+          authEnabled: true,
+        }),
+      })
+    );
+
+    await page.goto('/');
+
+    await expect(page.getByPlaceholder('Enter your password')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Login' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Forgot password?' })).toBeVisible();
+  });
+
+  test('keeps mobile notifications operable above a conflict toast after task detail closes', async ({
+    page,
+  }) => {
+    const taskTitle = `E2E Mobile Notification Conflict ${Date.now()}`;
+    const task = await seedTestTask(page, {
+      title: taskTitle,
+      description: 'Verify notifications remain touchable while a conflict toast is visible.',
+      status: 'todo',
+      priority: 'high',
+      type: 'code',
+    });
+    testTaskId = (task as { id: string }).id;
+
+    let returnedConflict = false;
+    await page.route(`**/api/tasks/${testTaskId}/move`, async (route) => {
+      if (!returnedConflict && route.request().method() === 'POST') {
+        returnedConflict = true;
+        await route.fulfill({
+          status: 409,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            success: false,
+            error: {
+              code: 'CONFLICT',
+              message: 'Task revision conflict',
+              details: { current: task },
+            },
+            meta: { timestamp: new Date().toISOString() },
+          }),
+        });
+        return;
+      }
+
+      await route.fallback();
+    });
+
+    await page.goto('/');
+
+    const statusSelect = page.getByRole('combobox', {
+      name: `Change status for ${taskTitle}`,
+    });
+    await statusSelect.click();
+    await page.getByRole('option', { name: 'Blocked' }).click();
+    await expect(page.getByText('Move not saved')).toBeVisible();
+
+    await page.getByText(taskTitle).first().click();
+    const detail = page.getByTestId('task-detail-panel');
+    await expect(detail).toBeVisible();
+    await detail.getByRole('button', { name: 'Close task workspace' }).click();
+    await expect(detail).not.toBeVisible();
+
+    const mobileNavigation = page.getByRole('navigation', { name: 'Mobile navigation' });
+    const notificationViewport = page.locator(
+      ".veritas-notifications[data-position='bottom-right']"
+    );
+    const mobileNotificationsButton = page.getByRole('button', { name: 'Mobile notifications' });
+    const [navigationBox, notificationBox] = await Promise.all([
+      mobileNavigation.boundingBox(),
+      notificationViewport.boundingBox(),
+    ]);
+
+    expect(navigationBox).not.toBeNull();
+    expect(notificationBox).not.toBeNull();
+    expect(notificationBox!.y + notificationBox!.height).toBeLessThanOrEqual(navigationBox!.y);
+
+    await tapLocatorCenter(page, mobileNotificationsButton);
+    await expect(page.getByLabel('Notifications', { exact: true })).toBeVisible();
+  });
+});

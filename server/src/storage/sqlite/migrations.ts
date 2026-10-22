@@ -1,0 +1,1637 @@
+export interface SqliteMigration {
+  version: number;
+  name: string;
+  up: string;
+}
+
+export const SQLITE_BASE_MIGRATIONS: readonly SqliteMigration[] = [
+  {
+    version: 1,
+    name: '0001_initial_workspace_foundation',
+    up: `
+      CREATE TABLE IF NOT EXISTS workspaces (
+        id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        description TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        email TEXT UNIQUE,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS workspace_memberships (
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member', 'viewer')),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (workspace_id, user_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_workspace_memberships_user_id
+        ON workspace_memberships(user_id);
+    `,
+  },
+  {
+    version: 2,
+    name: '0002_seed_local_workspace',
+    up: `
+      INSERT OR IGNORE INTO workspaces (id, slug, name, description)
+      VALUES (
+        'local',
+        'local',
+        'Local Workspace',
+        'Default local workspace used for v5 migration and single-user mode.'
+      );
+
+      INSERT OR IGNORE INTO users (id, display_name, email)
+      VALUES ('local-user', 'Local User', NULL);
+
+      INSERT OR IGNORE INTO workspace_memberships (workspace_id, user_id, role)
+      VALUES ('local', 'local-user', 'owner');
+    `,
+  },
+  {
+    version: 3,
+    name: '0003_task_repository_foundation',
+    up: `
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        storage_state TEXT NOT NULL DEFAULT 'active'
+          CHECK (storage_state IN ('active', 'archived', 'backlog')),
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        project TEXT,
+        sprint TEXT,
+        position INTEGER,
+        task_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        archived_at TEXT,
+        deleted_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_workspace_state_updated
+        ON tasks(workspace_id, storage_state, updated_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_status_position
+        ON tasks(status, position);
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_project
+        ON tasks(project);
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_sprint
+        ON tasks(sprint);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS task_search USING fts5(
+        task_id UNINDEXED,
+        title,
+        description,
+        tokenize='porter unicode61'
+      );
+    `,
+  },
+  {
+    version: 4,
+    name: '0004_configuration_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS app_config_documents (
+        key TEXT PRIMARY KEY,
+        document_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS managed_list_items (
+        list_name TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        item_json TEXT NOT NULL,
+        order_index INTEGER NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        is_hidden INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (list_name, item_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_managed_list_items_order
+        ON managed_list_items(list_name, order_index);
+
+      CREATE TABLE IF NOT EXISTS task_templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        category TEXT,
+        template_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_templates_name
+        ON task_templates(name);
+
+      CREATE TABLE IF NOT EXISTS prompt_templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        current_version_id TEXT NOT NULL,
+        template_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_prompt_templates_category_name
+        ON prompt_templates(category, name);
+
+      CREATE TABLE IF NOT EXISTS prompt_versions (
+        id TEXT PRIMARY KEY,
+        template_id TEXT NOT NULL,
+        version_number INTEGER NOT NULL,
+        version_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (template_id, version_number)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_prompt_versions_template
+        ON prompt_versions(template_id, version_number DESC);
+
+      CREATE TABLE IF NOT EXISTS prompt_usage (
+        id TEXT PRIMARY KEY,
+        template_id TEXT NOT NULL,
+        used_at TEXT NOT NULL,
+        used_by TEXT,
+        model TEXT,
+        usage_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_prompt_usage_template_used
+        ON prompt_usage(template_id, used_at);
+    `,
+  },
+  {
+    version: 5,
+    name: '0005_operational_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS activity_events (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        type TEXT NOT NULL,
+        task_id TEXT,
+        task_title TEXT,
+        agent TEXT,
+        details_json TEXT,
+        activity_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_activity_workspace_created
+        ON activity_events(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_activity_task_created
+        ON activity_events(task_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_activity_type_created
+        ON activity_events(type, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS status_history (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        previous_status TEXT NOT NULL,
+        new_status TEXT NOT NULL,
+        task_id TEXT,
+        task_title TEXT,
+        sub_agent_count INTEGER,
+        duration_ms INTEGER,
+        entry_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_status_history_workspace_created
+        ON status_history(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_status_history_task_created
+        ON status_history(task_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS telemetry_events (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        type TEXT NOT NULL,
+        task_id TEXT,
+        project_id TEXT,
+        agent TEXT,
+        model TEXT,
+        attempt_id TEXT,
+        success INTEGER,
+        duration_ms INTEGER,
+        exit_code INTEGER,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_tokens INTEGER,
+        total_tokens INTEGER,
+        cost REAL,
+        error TEXT,
+        stack_trace TEXT,
+        session_key TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_telemetry_workspace_created
+        ON telemetry_events(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_telemetry_type_created
+        ON telemetry_events(workspace_id, type, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_telemetry_task_created
+        ON telemetry_events(task_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_telemetry_project_created
+        ON telemetry_events(project_id, created_at DESC);
+    `,
+  },
+  {
+    version: 6,
+    name: '0006_governance_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS decision_records (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        agent_id TEXT,
+        task_id TEXT,
+        parent_decision_id TEXT,
+        confidence_level REAL NOT NULL,
+        risk_score REAL NOT NULL,
+        decision_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_decision_records_workspace_created
+        ON decision_records(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_decision_records_agent_created
+        ON decision_records(agent_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_decision_records_task_created
+        ON decision_records(task_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS feedback_records (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        agent TEXT,
+        rating INTEGER NOT NULL,
+        sentiment TEXT NOT NULL,
+        resolved INTEGER NOT NULL DEFAULT 0,
+        categories_json TEXT NOT NULL,
+        feedback_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_feedback_records_workspace_created
+        ON feedback_records(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_feedback_records_task_created
+        ON feedback_records(task_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_feedback_records_agent_created
+        ON feedback_records(agent, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_feedback_records_sentiment_created
+        ON feedback_records(sentiment, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS scoring_profiles (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        built_in INTEGER NOT NULL DEFAULT 0,
+        profile_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_scoring_profiles_workspace_name
+        ON scoring_profiles(workspace_id, name);
+
+      CREATE TABLE IF NOT EXISTS scoring_evaluations (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        profile_id TEXT NOT NULL,
+        agent TEXT,
+        task_id TEXT,
+        composite_score REAL NOT NULL,
+        evaluation_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_scoring_evaluations_profile_created
+        ON scoring_evaluations(profile_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_scoring_evaluations_agent_created
+        ON scoring_evaluations(agent, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_scoring_evaluations_task_created
+        ON scoring_evaluations(task_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS drift_alerts (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        acknowledged INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_drift_alerts_workspace_created
+        ON drift_alerts(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_drift_alerts_agent_created
+        ON drift_alerts(agent_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_drift_alerts_metric_created
+        ON drift_alerts(metric, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS drift_baselines (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (workspace_id, agent_id, metric)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_drift_baselines_agent_metric
+        ON drift_baselines(agent_id, metric);
+    `,
+  },
+  {
+    version: 7,
+    name: '0007_audit_policy_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS audit_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        action TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        resource TEXT,
+        integrity TEXT NOT NULL,
+        entry_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_audit_entries_workspace_created
+        ON audit_entries(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_audit_entries_actor_created
+        ON audit_entries(actor, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_audit_entries_action_created
+        ON audit_entries(action, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS agent_policies (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL,
+        enabled INTEGER NOT NULL,
+        response_action TEXT NOT NULL,
+        preset TEXT,
+        policy_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_agent_policies_workspace_name
+        ON agent_policies(workspace_id, name);
+
+      CREATE INDEX IF NOT EXISTS idx_agent_policies_type_enabled
+        ON agent_policies(type, enabled);
+
+      CREATE TABLE IF NOT EXISTS tool_policies (
+        role TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        allowed_json TEXT NOT NULL,
+        denied_json TEXT NOT NULL,
+        policy_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tool_policies_workspace_role
+        ON tool_policies(workspace_id, role);
+    `,
+  },
+  {
+    version: 8,
+    name: '0008_workflow_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS workflow_definitions (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        description TEXT,
+        workflow_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_workflow_definitions_workspace_name
+        ON workflow_definitions(workspace_id, name);
+
+      CREATE TABLE IF NOT EXISTS workflow_acls (
+        workflow_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        acl_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workflow_audit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        workflow_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_workflow_audit_events_workflow_created
+        ON workflow_audit_events(workflow_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS workflow_runs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        workflow_id TEXT NOT NULL,
+        workflow_version INTEGER NOT NULL,
+        task_id TEXT,
+        status TEXT NOT NULL,
+        current_step TEXT,
+        run_json TEXT NOT NULL,
+        workflow_snapshot_json TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        last_checkpoint TEXT,
+        error TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_workflow_runs_workspace_started
+        ON workflow_runs(workspace_id, started_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow_started
+        ON workflow_runs(workflow_id, started_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_workflow_runs_task_started
+        ON workflow_runs(task_id, started_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_workflow_runs_status_started
+        ON workflow_runs(status, started_at DESC);
+    `,
+  },
+  {
+    version: 9,
+    name: '0009_chat_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT,
+        title TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        model TEXT,
+        mode TEXT NOT NULL,
+        session_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_sessions_task
+        ON chat_sessions(task_id)
+        WHERE task_id IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_chat_sessions_workspace_updated
+        ON chat_sessions(workspace_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+        task_id TEXT,
+        role TEXT NOT NULL,
+        agent TEXT,
+        model TEXT,
+        message_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
+        ON chat_messages(session_id, created_at ASC);
+
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_task_created
+        ON chat_messages(task_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS squad_messages (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        agent TEXT NOT NULL,
+        display_name TEXT,
+        message TEXT NOT NULL,
+        tags_json TEXT,
+        timestamp TEXT NOT NULL,
+        model TEXT,
+        is_system INTEGER NOT NULL DEFAULT 0,
+        event TEXT,
+        task_title TEXT,
+        duration TEXT,
+        card_json TEXT,
+        message_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_squad_messages_workspace_timestamp
+        ON squad_messages(workspace_id, timestamp DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_squad_messages_agent_timestamp
+        ON squad_messages(agent, timestamp DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_squad_messages_event_timestamp
+        ON squad_messages(event, timestamp DESC);
+    `,
+  },
+  {
+    version: 10,
+    name: '0010_notification_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        target_agent TEXT NOT NULL,
+        from_agent TEXT NOT NULL,
+        type TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0,
+        delivered_at TEXT,
+        content TEXT NOT NULL,
+        title TEXT,
+        task_title TEXT,
+        project TEXT,
+        target_url TEXT,
+        dedupe_key TEXT,
+        source_json TEXT,
+        notification_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_notifications_agent_delivered_created
+        ON notifications(target_agent, delivered, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_notifications_task_created
+        ON notifications(task_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_notifications_type_created
+        ON notifications(type, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_notifications_dedupe_key
+        ON notifications(dedupe_key)
+        WHERE dedupe_key IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_notifications_project_created
+        ON notifications(project, created_at DESC)
+        WHERE project IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS thread_subscriptions (
+        task_id TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        subscription_json TEXT NOT NULL,
+        subscribed_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, task_id, agent)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_thread_subscriptions_task
+        ON thread_subscriptions(task_id, agent);
+    `,
+  },
+  {
+    version: 11,
+    name: '0011_scheduled_deliverable_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS scheduled_deliverables (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        schedule TEXT NOT NULL,
+        cron_expr TEXT,
+        schedule_description TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        agent TEXT,
+        output_path TEXT,
+        tags_json TEXT NOT NULL,
+        deliverable_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_run_at TEXT,
+        next_run_at TEXT,
+        total_runs INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_deliverables_enabled_next_run
+        ON scheduled_deliverables(enabled, next_run_at);
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_deliverables_agent_enabled
+        ON scheduled_deliverables(agent, enabled);
+
+      CREATE TABLE IF NOT EXISTS scheduled_deliverable_runs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        deliverable_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        output_file TEXT,
+        summary TEXT,
+        duration_ms INTEGER,
+        error TEXT,
+        source_run_id TEXT,
+        workflow_id TEXT,
+        snapshot_json TEXT,
+        run_json TEXT NOT NULL,
+        run_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_deliverable_runs_deliverable_run
+        ON scheduled_deliverable_runs(deliverable_id, run_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_deliverable_runs_status_run
+        ON scheduled_deliverable_runs(status, run_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_deliverable_runs_source_run
+        ON scheduled_deliverable_runs(source_run_id)
+        WHERE source_run_id IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_deliverable_runs_workflow_run
+        ON scheduled_deliverable_runs(workflow_id, run_at DESC)
+        WHERE workflow_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 12,
+    name: '0012_task_artifact_metadata',
+    up: `
+      CREATE TABLE IF NOT EXISTS task_attachments (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        filename TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        sha256 TEXT,
+        storage_path TEXT NOT NULL,
+        uploaded_at TEXT NOT NULL,
+        uploaded_by TEXT,
+        session_id TEXT,
+        validation_status TEXT NOT NULL DEFAULT 'unknown',
+        validation_error TEXT,
+        retention_status TEXT NOT NULL DEFAULT 'active',
+        cleanup_eligible INTEGER NOT NULL DEFAULT 0,
+        attachment_json TEXT NOT NULL,
+        deleted_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_attachments_task_uploaded
+        ON task_attachments(task_id, uploaded_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_task_attachments_workspace_cleanup
+        ON task_attachments(workspace_id, cleanup_eligible, uploaded_at DESC)
+        WHERE deleted_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_task_attachments_mime_uploaded
+        ON task_attachments(workspace_id, mime_type, uploaded_at DESC)
+        WHERE deleted_at IS NULL;
+
+      CREATE TABLE IF NOT EXISTS task_deliverables (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        path TEXT,
+        agent TEXT,
+        model TEXT,
+        source_run_id TEXT,
+        description TEXT,
+        version_number INTEGER NOT NULL DEFAULT 1,
+        redaction_json TEXT,
+        deliverable_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT,
+        deleted_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_task_deliverables_task_created
+        ON task_deliverables(task_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_task_deliverables_workspace_type_status
+        ON task_deliverables(workspace_id, type, status, created_at DESC)
+        WHERE deleted_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_task_deliverables_agent_created
+        ON task_deliverables(agent, created_at DESC)
+        WHERE agent IS NOT NULL AND deleted_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_task_deliverables_source_run
+        ON task_deliverables(source_run_id)
+        WHERE source_run_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 13,
+    name: '0013_work_product_repositories',
+    up: `
+      CREATE TABLE IF NOT EXISTS work_products (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'archived')),
+        task_id TEXT,
+        source_run_id TEXT,
+        agent TEXT,
+        model TEXT,
+        version_number INTEGER NOT NULL DEFAULT 1,
+        redaction_json TEXT,
+        source_links_json TEXT,
+        metadata_json TEXT,
+        render_json TEXT NOT NULL,
+        product_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        archived_at TEXT,
+        deleted_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_work_products_workspace_updated
+        ON work_products(workspace_id, updated_at DESC)
+        WHERE deleted_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_work_products_task_updated
+        ON work_products(task_id, updated_at DESC)
+        WHERE task_id IS NOT NULL AND deleted_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_work_products_source_run
+        ON work_products(source_run_id, updated_at DESC)
+        WHERE source_run_id IS NOT NULL AND deleted_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_work_products_kind_status
+        ON work_products(workspace_id, kind, status, updated_at DESC)
+        WHERE deleted_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_work_products_agent_updated
+        ON work_products(agent, updated_at DESC)
+        WHERE agent IS NOT NULL AND deleted_at IS NULL;
+
+      CREATE TABLE IF NOT EXISTS work_product_versions (
+        id TEXT PRIMARY KEY,
+        product_id TEXT NOT NULL REFERENCES work_products(id) ON DELETE CASCADE,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        version_number INTEGER NOT NULL,
+        change_type TEXT NOT NULL,
+        change_summary TEXT,
+        title TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        agent TEXT,
+        model TEXT,
+        redaction_json TEXT,
+        render_json TEXT NOT NULL,
+        version_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (product_id, version_number)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_work_product_versions_product
+        ON work_product_versions(product_id, version_number DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_work_product_versions_workspace_created
+        ON work_product_versions(workspace_id, created_at DESC);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS work_product_search USING fts5(
+        product_id UNINDEXED,
+        title,
+        body,
+        tokenize='porter unicode61'
+      );
+    `,
+  },
+  {
+    version: 14,
+    name: '0014_multi_user_identity_foundation',
+    up: `
+      ALTER TABLE users ADD COLUMN handle TEXT;
+      ALTER TABLE users ADD COLUMN auth_subject TEXT;
+      ALTER TABLE users ADD COLUMN avatar_url TEXT;
+      ALTER TABLE users ADD COLUMN disabled_at TEXT;
+      ALTER TABLE users ADD COLUMN last_seen_at TEXT;
+
+      ALTER TABLE workspaces ADD COLUMN mode TEXT NOT NULL DEFAULT 'local';
+      ALTER TABLE workspaces ADD COLUMN created_by TEXT;
+      ALTER TABLE workspaces ADD COLUMN archived_at TEXT;
+
+      ALTER TABLE workspace_memberships RENAME TO workspace_memberships_legacy;
+
+      CREATE TABLE workspace_memberships (
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (
+          role IN ('owner', 'admin', 'member', 'reviewer', 'read-only', 'agent')
+        ),
+        status TEXT NOT NULL DEFAULT 'active',
+        invited_by TEXT,
+        joined_at TEXT,
+        disabled_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (workspace_id, user_id)
+      );
+
+      INSERT INTO workspace_memberships (
+        workspace_id,
+        user_id,
+        role,
+        status,
+        joined_at,
+        created_at,
+        updated_at
+      )
+      SELECT
+        workspace_id,
+        user_id,
+        CASE role
+          WHEN 'viewer' THEN 'read-only'
+          ELSE role
+        END,
+        'active',
+        created_at,
+        created_at,
+        created_at
+      FROM workspace_memberships_legacy;
+
+      DROP TABLE workspace_memberships_legacy;
+
+      CREATE INDEX IF NOT EXISTS idx_workspace_memberships_user_id
+        ON workspace_memberships(user_id);
+
+      CREATE INDEX IF NOT EXISTS idx_workspace_memberships_user_status
+        ON workspace_memberships(user_id, status);
+
+      CREATE TABLE workspace_invitations (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        email TEXT,
+        role TEXT NOT NULL CHECK (
+          role IN ('owner', 'admin', 'member', 'reviewer', 'read-only', 'agent')
+        ),
+        token_hash TEXT NOT NULL UNIQUE,
+        invited_by TEXT NOT NULL REFERENCES users(id),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        accepted_by TEXT REFERENCES users(id),
+        accepted_at TEXT,
+        revoked_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_workspace_invitations_workspace_email
+        ON workspace_invitations(workspace_id, email, revoked_at, accepted_at);
+
+      CREATE INDEX IF NOT EXISTS idx_workspace_invitations_token_hash
+        ON workspace_invitations(token_hash);
+    `,
+  },
+  {
+    version: 15,
+    name: '0015_scoped_api_tokens',
+    up: `
+      CREATE TABLE api_tokens (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        token_prefix TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        scopes_json TEXT NOT NULL,
+        created_by TEXT NOT NULL REFERENCES users(id),
+        created_at TEXT NOT NULL,
+        expires_at TEXT,
+        revoked_at TEXT,
+        revoked_by TEXT REFERENCES users(id),
+        last_used_at TEXT,
+        last_used_ip TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_api_tokens_workspace_created
+        ON api_tokens(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_api_tokens_hash
+        ON api_tokens(token_hash);
+
+      CREATE INDEX IF NOT EXISTS idx_api_tokens_active
+        ON api_tokens(workspace_id, revoked_at, expires_at);
+    `,
+  },
+  {
+    version: 16,
+    name: '0016_device_pairing_sessions',
+    up: `
+      CREATE TABLE device_pairing_codes (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        created_by TEXT NOT NULL REFERENCES users(id),
+        code_prefix TEXT NOT NULL,
+        code_hash TEXT NOT NULL UNIQUE,
+        device_name TEXT NOT NULL,
+        device_type TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        client_mode TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        scopes_json TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (
+          role IN ('owner', 'admin', 'member', 'reviewer', 'read-only', 'agent')
+        ),
+        nonce TEXT NOT NULL UNIQUE,
+        signed_at TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        session_expires_at TEXT NOT NULL,
+        used_at TEXT,
+        used_by TEXT REFERENCES users(id),
+        revoked_at TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_device_pairing_codes_workspace_created
+        ON device_pairing_codes(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_device_pairing_codes_hash
+        ON device_pairing_codes(code_hash);
+
+      CREATE INDEX IF NOT EXISTS idx_device_pairing_codes_active
+        ON device_pairing_codes(workspace_id, used_at, revoked_at, expires_at);
+
+      CREATE TABLE device_sessions (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        device_name TEXT NOT NULL,
+        device_type TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        client_mode TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        scopes_json TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (
+          role IN ('owner', 'admin', 'member', 'reviewer', 'read-only', 'agent')
+        ),
+        token_prefix TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        nonce TEXT NOT NULL UNIQUE,
+        signed_at TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT,
+        revoked_by TEXT REFERENCES users(id),
+        last_seen_at TEXT,
+        last_seen_ip TEXT,
+        connection_state TEXT NOT NULL DEFAULT 'pairing' CHECK (
+          connection_state IN (
+            'pairing',
+            'connected',
+            'reconnecting',
+            'auth_failed',
+            'unreachable',
+            'revoked',
+            'expired'
+          )
+        ),
+        state_reason TEXT,
+        last_auth_failure TEXT,
+        degraded_reason TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_device_sessions_workspace_created
+        ON device_sessions(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_device_sessions_hash
+        ON device_sessions(token_hash);
+
+      CREATE INDEX IF NOT EXISTS idx_device_sessions_client
+        ON device_sessions(workspace_id, client_id, revoked_at);
+
+      CREATE INDEX IF NOT EXISTS idx_device_sessions_device
+        ON device_sessions(workspace_id, device_id, revoked_at);
+
+      CREATE INDEX IF NOT EXISTS idx_device_sessions_active
+        ON device_sessions(workspace_id, revoked_at, expires_at);
+    `,
+  },
+  {
+    version: 17,
+    name: '0017_governance_decision_traces',
+    up: `
+      CREATE TABLE IF NOT EXISTS governance_decision_traces (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        agent_id TEXT,
+        task_id TEXT,
+        action_type TEXT,
+        trace_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_governance_traces_workspace_created
+        ON governance_decision_traces(workspace_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_governance_traces_kind_created
+        ON governance_decision_traces(kind, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_governance_traces_outcome_created
+        ON governance_decision_traces(outcome, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_governance_traces_agent_created
+        ON governance_decision_traces(agent_id, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_governance_traces_task_created
+        ON governance_decision_traces(task_id, created_at DESC);
+    `,
+  },
+  {
+    version: 18,
+    name: '0018_causal_run_event_journal',
+    up: `
+      CREATE TABLE run_events (
+        event_id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        provider_event_id TEXT,
+        dedupe_key TEXT,
+        received_at TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        UNIQUE (workspace_id, task_id, attempt_id, sequence),
+        UNIQUE (workspace_id, task_id, attempt_id, dedupe_key)
+      );
+
+      CREATE INDEX idx_run_events_task_attempt_sequence
+        ON run_events(workspace_id, task_id, attempt_id, sequence);
+
+      CREATE INDEX idx_run_events_received_at
+        ON run_events(workspace_id, received_at);
+    `,
+  },
+  {
+    version: 19,
+    name: '0019_run_approval_broker',
+    up: `
+      CREATE TABLE run_approvals (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        provider_request_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN ('pending', 'approved', 'rejected', 'expired', 'cancelled')
+        ),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        action_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        approval_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (workspace_id, task_id, attempt_id, provider, provider_request_id)
+      );
+
+      CREATE INDEX idx_run_approvals_workspace_status_created
+        ON run_approvals(workspace_id, status, created_at DESC);
+
+      CREATE INDEX idx_run_approvals_task_attempt_status
+        ON run_approvals(task_id, attempt_id, status, created_at DESC);
+
+      CREATE INDEX idx_run_approvals_agent_status
+        ON run_approvals(agent_id, status, created_at DESC);
+
+      CREATE INDEX idx_run_approvals_expiry
+        ON run_approvals(status, expires_at);
+    `,
+  },
+  {
+    version: 20,
+    name: '0020_durable_run_supervisor',
+    up: `
+      CREATE TABLE run_supervisors (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'launching',
+            'running',
+            'recovering',
+            'reattached',
+            'recovery-required',
+            'completed',
+            'failed',
+            'interrupted',
+            'cancelled'
+          )
+        ),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        lease_owner_id TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        supervisor_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (workspace_id, task_id, attempt_id)
+      );
+
+      CREATE INDEX idx_run_supervisors_workspace_state_updated
+        ON run_supervisors(workspace_id, state, updated_at DESC);
+
+      CREATE INDEX idx_run_supervisors_task_attempt
+        ON run_supervisors(task_id, attempt_id);
+
+      CREATE INDEX idx_run_supervisors_lease
+        ON run_supervisors(state, lease_expires_at);
+    `,
+  },
+  {
+    version: 21,
+    name: '0021_run_scoped_tool_control_plane',
+    up: `
+      CREATE TABLE tool_server_definitions (
+        id TEXT PRIMARY KEY,
+        version TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        document_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE tool_server_discoveries (
+        definition_digest TEXT PRIMARY KEY,
+        server_id TEXT NOT NULL,
+        server_version TEXT NOT NULL,
+        discovery_digest TEXT NOT NULL,
+        document_json TEXT NOT NULL,
+        discovered_at TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_tool_server_discoveries_server
+        ON tool_server_discoveries(server_id, server_version);
+
+      CREATE TABLE run_tool_catalogs (
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        digest TEXT NOT NULL,
+        document_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, attempt_id)
+      );
+
+      CREATE INDEX idx_run_tool_catalogs_provider_created
+        ON run_tool_catalogs(provider, created_at DESC);
+    `,
+  },
+  {
+    version: 22,
+    name: '0022_phase_transition_journal',
+    up: `
+      CREATE TABLE phase_transitions (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local'
+          REFERENCES workspaces(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        operation_id TEXT NOT NULL,
+        from_evidence_digest TEXT NOT NULL,
+        to_evidence_digest TEXT NOT NULL,
+        manifest_digest TEXT NOT NULL,
+        transition_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (workspace_id, task_id, attempt_id, sequence),
+        UNIQUE (workspace_id, task_id, attempt_id, operation_id)
+      );
+
+      CREATE INDEX idx_phase_transitions_run_sequence
+        ON phase_transitions(workspace_id, task_id, attempt_id, sequence DESC);
+
+      CREATE INDEX idx_phase_transitions_created
+        ON phase_transitions(workspace_id, created_at DESC);
+    `,
+  },
+  {
+    version: 23,
+    name: '0023_durable_admission_reservations',
+    up: `
+      CREATE TABLE admission_reservations (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL DEFAULT 'local',
+        task_id TEXT NOT NULL,
+        root_task_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        host_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'released', 'expired')),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        idempotency_key TEXT NOT NULL UNIQUE,
+        lease_expires_at TEXT NOT NULL,
+        reservation_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_admission_reservations_scope_state
+        ON admission_reservations(
+          workspace_id, root_task_id, provider, host_id, state, updated_at DESC
+        );
+
+      CREATE INDEX idx_admission_reservations_task
+        ON admission_reservations(task_id, updated_at DESC);
+
+      CREATE INDEX idx_admission_reservations_lease
+        ON admission_reservations(state, lease_expires_at);
+    `,
+  },
+  {
+    version: 24,
+    name: '0024_workflow_admission_reservations',
+    up: `
+      ALTER TABLE admission_reservations ADD COLUMN workflow_run_id TEXT;
+      ALTER TABLE admission_reservations ADD COLUMN workflow_step_id TEXT;
+      ALTER TABLE admission_reservations ADD COLUMN root_reservation_id TEXT;
+
+      CREATE INDEX idx_admission_reservations_workflow
+        ON admission_reservations(workflow_run_id, workflow_step_id, updated_at DESC);
+
+      CREATE INDEX idx_admission_reservations_root_reservation
+        ON admission_reservations(root_reservation_id, updated_at DESC);
+    `,
+  },
+  {
+    version: 25,
+    name: '0025_execution_tree_budget_reservations',
+    up: `
+      ALTER TABLE admission_reservations ADD COLUMN root_objective_id TEXT;
+      ALTER TABLE admission_reservations ADD COLUMN node_id TEXT;
+      ALTER TABLE admission_reservations ADD COLUMN parent_node_id TEXT;
+
+      CREATE INDEX idx_admission_reservations_execution_tree
+        ON admission_reservations(root_objective_id, updated_at DESC);
+
+      CREATE INDEX idx_admission_reservations_execution_parent
+        ON admission_reservations(parent_node_id, updated_at DESC);
+    `,
+  },
+  {
+    version: 26,
+    name: '0026_durable_admission_queue',
+    up: `
+      CREATE TABLE admission_queue (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        state TEXT NOT NULL
+          CHECK (state IN ('queued', 'leased', 'requeued', 'dispatched', 'terminal')),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        enqueue_sequence INTEGER NOT NULL CHECK (enqueue_sequence > 0),
+        available_at TEXT NOT NULL,
+        lease_expires_at TEXT,
+        queue_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX idx_admission_queue_active_task
+        ON admission_queue(task_id)
+        WHERE state IN ('queued', 'leased', 'requeued');
+
+      CREATE INDEX idx_admission_queue_fifo
+        ON admission_queue(state, available_at, enqueue_sequence, id);
+
+      CREATE INDEX idx_admission_queue_workspace
+        ON admission_queue(workspace_id, state, enqueue_sequence);
+
+      CREATE INDEX idx_admission_queue_lease
+        ON admission_queue(state, lease_expires_at);
+    `,
+  },
+  {
+    version: 27,
+    name: '0027_durable_goals',
+    up: `
+      CREATE TABLE durable_goals (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        root_task_id TEXT,
+        root_workflow_id TEXT,
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'active',
+            'paused',
+            'blocked',
+            'awaiting-approval',
+            'usage-limited',
+            'budget-limited',
+            'complete',
+            'cancelled',
+            'failed'
+          )
+        ),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        goal_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_durable_goals_workspace_state_updated
+        ON durable_goals(workspace_id, state, updated_at DESC);
+
+      CREATE INDEX idx_durable_goals_root_task
+        ON durable_goals(root_task_id, updated_at DESC);
+
+      CREATE INDEX idx_durable_goals_root_workflow
+        ON durable_goals(root_workflow_id, updated_at DESC);
+    `,
+  },
+  {
+    version: 28,
+    name: '0028_reflection_extraction_jobs',
+    up: `
+      CREATE TABLE reflection_extraction_jobs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (
+          state IN ('queued', 'leased', 'completed', 'dead-letter')
+        ),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        idempotency_key TEXT NOT NULL UNIQUE,
+        available_at TEXT NOT NULL,
+        lease_owner_id TEXT,
+        lease_expires_at TEXT,
+        job_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_reflection_extraction_jobs_available
+        ON reflection_extraction_jobs(state, available_at, created_at, id);
+
+      CREATE INDEX idx_reflection_extraction_jobs_workspace
+        ON reflection_extraction_jobs(workspace_id, state, available_at);
+
+      CREATE INDEX idx_reflection_extraction_jobs_lease
+        ON reflection_extraction_jobs(state, lease_expires_at);
+    `,
+  },
+  {
+    version: 29,
+    name: '0029_run_output_artifacts',
+    up: `
+      CREATE TABLE run_output_artifacts (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        turn_id TEXT,
+        state TEXT NOT NULL
+          CHECK (state IN ('available', 'quarantined', 'expired', 'deleted')),
+        expires_at TEXT NOT NULL,
+        active_lease_until TEXT,
+        stored_bytes INTEGER NOT NULL CHECK (stored_bytes >= 0),
+        metadata_json TEXT NOT NULL,
+        content BLOB,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_run_output_artifacts_scope
+        ON run_output_artifacts(workspace_id, task_id, run_id, attempt_id, created_at DESC);
+
+      CREATE INDEX idx_run_output_artifacts_expiry
+        ON run_output_artifacts(state, expires_at, active_lease_until);
+    `,
+  },
+  {
+    version: 30,
+    name: '0030_knowledge_collection_sources',
+    up: `
+      CREATE TABLE knowledge_collections (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        slug TEXT NOT NULL,
+        operation_id_digest TEXT NOT NULL,
+        collection_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (workspace_id, slug),
+        UNIQUE (workspace_id, operation_id_digest)
+      );
+
+      CREATE INDEX idx_knowledge_collections_workspace_updated
+        ON knowledge_collections(workspace_id, updated_at DESC, id);
+
+      CREATE TABLE knowledge_sources (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        collection_id TEXT NOT NULL
+          REFERENCES knowledge_collections(id) ON DELETE CASCADE,
+        source_key TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        operation_id_digest TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        content BLOB,
+        captured_at TEXT NOT NULL,
+        UNIQUE (collection_id, source_key, revision),
+        UNIQUE (collection_id, operation_id_digest)
+      );
+
+      CREATE INDEX idx_knowledge_sources_collection_key_revision
+        ON knowledge_sources(collection_id, source_key, revision DESC);
+
+      CREATE INDEX idx_knowledge_sources_workspace_captured
+        ON knowledge_sources(workspace_id, captured_at DESC, id);
+    `,
+  },
+  {
+    version: 31,
+    name: '0031_knowledge_pages',
+    up: `
+      CREATE TABLE knowledge_pages (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        collection_id TEXT NOT NULL
+          REFERENCES knowledge_collections(id) ON DELETE CASCADE,
+        stable_key TEXT NOT NULL,
+        page_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (collection_id, stable_key)
+      );
+
+      CREATE INDEX idx_knowledge_pages_collection_key
+        ON knowledge_pages(collection_id, stable_key, id);
+
+      CREATE INDEX idx_knowledge_pages_workspace_updated
+        ON knowledge_pages(workspace_id, updated_at DESC, id);
+    `,
+  },
+  {
+    version: 32,
+    name: '0032_knowledge_ingestion_proposals',
+    up: `
+      CREATE TABLE knowledge_ingestion_proposals (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        collection_id TEXT NOT NULL
+          REFERENCES knowledge_collections(id) ON DELETE CASCADE,
+        operation_id_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('dry-run', 'applied', 'reversed')),
+        proposal_json TEXT NOT NULL,
+        proposed_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (collection_id, operation_id_digest)
+      );
+
+      CREATE INDEX idx_knowledge_ingestion_proposals_collection_state
+        ON knowledge_ingestion_proposals(collection_id, state, proposed_at DESC, id);
+
+      CREATE TABLE knowledge_activity_entries (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        collection_id TEXT NOT NULL
+          REFERENCES knowledge_collections(id) ON DELETE CASCADE,
+        proposal_id TEXT NOT NULL
+          REFERENCES knowledge_ingestion_proposals(id) ON DELETE CASCADE,
+        type TEXT NOT NULL CHECK (
+          type IN ('knowledge.ingestion.applied', 'knowledge.ingestion.reversed')
+        ),
+        entry_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_knowledge_activity_collection_created
+        ON knowledge_activity_entries(collection_id, created_at DESC, id);
+    `,
+  },
+  {
+    version: 33,
+    name: '0033_knowledge_integrity_findings',
+    up: `
+      CREATE TABLE knowledge_integrity_findings (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        collection_id TEXT NOT NULL
+          REFERENCES knowledge_collections(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (
+          status IN ('open', 'acknowledged', 'remediating', 'resolved')
+        ),
+        severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error')),
+        finding_json TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+
+      CREATE INDEX idx_knowledge_integrity_findings_collection_status
+        ON knowledge_integrity_findings(
+          collection_id, status, severity, last_seen_at DESC, id
+        );
+    `,
+  },
+  {
+    version: 34,
+    name: '0034_work_product_artifacts',
+    up: `
+      CREATE TABLE work_product_artifacts (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL,
+        product_id TEXT NOT NULL,
+        version_number INTEGER NOT NULL CHECK (version_number > 0),
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        request_id_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('available', 'quarantined', 'deleted')),
+        byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+        sha256 TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        content BLOB,
+        created_at TEXT NOT NULL,
+        UNIQUE (workspace_id, product_id, version_number),
+        UNIQUE (workspace_id, product_id, request_id_digest)
+      );
+
+      CREATE INDEX idx_work_product_artifacts_product_version
+        ON work_product_artifacts(workspace_id, product_id, version_number DESC);
+
+      CREATE INDEX idx_work_product_artifacts_state_created
+        ON work_product_artifacts(workspace_id, state, created_at DESC);
+    `,
+  },
+];
+
+export function sortedMigrations(migrations: readonly SqliteMigration[]): SqliteMigration[] {
+  return [...migrations].sort((a, b) => a.version - b.version);
+}

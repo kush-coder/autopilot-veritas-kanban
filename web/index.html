@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <script>
+      // Apply theme immediately to prevent flash. Default dark.
+      (function () {
+        var currentScript = document.currentScript;
+        var cspNonce = currentScript && currentScript.nonce ? currentScript.nonce : '';
+        if (cspNonce) {
+          window.__VERITAS_CSP_NONCE__ = cspNonce;
+        }
+
+        var value = null;
+        try {
+          value = localStorage.getItem('veritas-kanban-theme');
+        } catch (error) {
+          value = null;
+        }
+        var theme =
+          value === 'light' ||
+          (value === 'auto' && window.matchMedia('(prefers-color-scheme: light)').matches)
+            ? 'light'
+            : 'dark';
+        document.documentElement.dataset.mantineColorScheme = theme;
+        if (theme === 'dark') {
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="%BASE_URL%favicon.png" />
+    <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="application-name" content="Veritas Kanban" />
+    <meta name="apple-mobile-web-app-title" content="Veritas" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#15171f" />
+    <title>Veritas Kanban</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

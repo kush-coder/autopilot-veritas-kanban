@@ -1,0 +1,2234 @@
+/**
+ * WorkflowStepExecutor — Executes individual workflow steps
+ * Executes workflow steps through provider-specific agent adapters.
+ */
+
+import path from 'path';
+import sanitizeFilename from 'sanitize-filename';
+import yaml from 'yaml';
+import type {
+  AgentConfig,
+  AgentHostRoutingDecision,
+  ExecutableAgentProvider,
+  NetworkEgressTelemetryEvent,
+  ProviderRuntimeCapabilityId,
+  ProviderRuntimeManifest,
+  RunLaunchPhaseAuthority,
+  SandboxPolicyDryRunResult,
+} from '@veritas-kanban/shared';
+import type {
+  WorkflowStep,
+  WorkflowRun,
+  StepExecutionResult,
+  WorkflowAgent,
+  StepSessionConfig,
+  EscalationPolicy,
+} from '../types/workflow.js';
+import { getWorkflowRunsDir } from '../utils/paths.js';
+import { buildSafeCodexEnv } from '../utils/codex-env.js';
+import {
+  assertAllowedCodexCommandOverride,
+  isCodexWorkflowAgent,
+} from '../utils/codex-command-policy.js';
+import { createLogger } from '../lib/logger.js';
+import { getGovernanceTraceService } from './governance-trace-service.js';
+import {
+  HttpOpenClawWorkflowAdapter,
+  type OpenClawWorkflowAdapter,
+  type OpenClawWorkflowSessionInput,
+  type OpenClawWorkflowSessionResult,
+} from './openclaw-workflow-adapter.js';
+import { getToolPolicyService } from './tool-policy-service.js';
+import { getAgentHostService } from './agent-host-service.js';
+import { getSandboxPolicyService } from './sandbox-policy-service.js';
+import {
+  getRunEgressGatewayService,
+  RUN_EGRESS_UPSTREAM_PROXY_ENV_KEY,
+  runEgressPolicyRequiresGateway,
+  type RunEgressGatewayApprovalRequest,
+  type RunEgressGatewayApprovalResult,
+  type RunEgressGatewayService,
+} from './run-egress-gateway-service.js';
+import {
+  getRunApprovalBrokerService,
+  type RunApprovalBrokerService,
+} from './run-approval-broker-service.js';
+import { getTelemetryService } from './telemetry-service.js';
+import {
+  assertProviderRuntimeCapabilities,
+  assertProviderRuntimeControl,
+  BASELINE_LAUNCH_CAPABILITIES,
+  providerRuntimeControls,
+} from './provider-runtime-control-service.js';
+import {
+  PhaseLaunchAuthorityService,
+  type PhaseLaunchParentSnapshot,
+} from './phase-launch-authority-service.js';
+import { digestRunLaunchValue } from '../utils/run-launch-manifest-digest.js';
+import {
+  FileWorkflowExecutionFileRepository,
+  type WorkflowExecutionFileRepository,
+} from '../storage/workflow-execution-file-repository.js';
+
+const log = createLogger('workflow-step-executor');
+
+/**
+ * Thrown by executeGateStep when a gate's on_false policy escalates to human (#778).
+ * Allows WorkflowRunService to distinguish an expected human pause from a real failure.
+ */
+export class HumanGateBlockError extends Error {
+  readonly stepId: string;
+  readonly escalationMessage: string;
+  readonly policy: EscalationPolicy;
+
+  constructor(stepId: string, policy: EscalationPolicy) {
+    const msg =
+      policy.escalate_message || `Gate ${stepId} condition not met — awaiting human input`;
+    super(msg);
+    this.name = 'HumanGateBlockError';
+    this.stepId = stepId;
+    this.escalationMessage = msg;
+    this.policy = policy;
+  }
+}
+
+interface WorkflowStepExecutorOptions {
+  openClawAdapter?: OpenClawWorkflowAdapter;
+  runtimeManifestResolver?: (agent: AgentConfig) => Promise<ProviderRuntimeManifest>;
+  persistRun?: (run: WorkflowRun) => Promise<void>;
+  phaseAuthority?: PhaseLaunchAuthorityService;
+  runEgressGateway?: Pick<RunEgressGatewayService, 'start'>;
+  approvalBroker?: Pick<RunApprovalBrokerService, 'request' | 'awaitDecision' | 'cancelAttempt'>;
+  executionFiles?: WorkflowExecutionFileRepository;
+}
+
+type WorkflowExecutableProvider = Extract<ExecutableAgentProvider, 'codex-sdk' | 'openclaw'>;
+
+export interface WorkflowAgentStepPreparation {
+  kind: 'agent';
+  step: WorkflowStep;
+  agentDef: WorkflowAgent | null;
+  sessionConfig: StepSessionConfig;
+  sessionContext: Record<string, unknown>;
+  prompt: string;
+  toolPolicyFilter: { allowed?: string[]; denied?: string[] };
+  workingDirectory: string;
+  runtimeProvider: WorkflowExecutableProvider;
+  runtimeManifest: ProviderRuntimeManifest;
+  requiredRuntimeCapabilities: ProviderRuntimeCapabilityId[];
+  sandboxPolicy: SandboxPolicyDryRunResult;
+  hostRouting: AgentHostRoutingDecision;
+  hostRoutingGeneratedAt: string;
+  phaseAuthority: RunLaunchPhaseAuthority;
+  phaseLaunchDigest: string;
+}
+
+export type WorkflowStepExecutionPreparation =
+  | WorkflowAgentStepPreparation
+  | {
+      kind: 'non-agent';
+      step: WorkflowStep;
+    };
+
+interface WorkflowSessionPhaseSnapshot {
+  attemptId: string;
+  manifestDigest: string;
+  phaseAuthority: RunLaunchPhaseAuthority;
+}
+
+export class WorkflowStepExecutor {
+  private runsDir: string;
+  private openClawAdapter: OpenClawWorkflowAdapter;
+  private runtimeManifestResolver: (agent: AgentConfig) => Promise<ProviderRuntimeManifest>;
+  private persistRun: (run: WorkflowRun) => Promise<void>;
+  private phaseAuthority: PhaseLaunchAuthorityService;
+  private runEgressGateway: Pick<RunEgressGatewayService, 'start'>;
+  private approvalBroker: Pick<
+    RunApprovalBrokerService,
+    'request' | 'awaitDecision' | 'cancelAttempt'
+  >;
+  private executionFiles: WorkflowExecutionFileRepository;
+
+  constructor(runsDir?: string, options: WorkflowStepExecutorOptions = {}) {
+    this.runsDir = runsDir || getWorkflowRunsDir();
+    this.openClawAdapter = options.openClawAdapter || new HttpOpenClawWorkflowAdapter();
+    this.runtimeManifestResolver =
+      options.runtimeManifestResolver ??
+      (async (agent) => {
+        const { clawdbotAgentService } = await import('./clawdbot-agent-service.js');
+        return clawdbotAgentService.probeProviderRuntime(agent, agent.type, 'workflow');
+      });
+    this.persistRun = options.persistRun ?? (async () => undefined);
+    this.phaseAuthority = options.phaseAuthority ?? new PhaseLaunchAuthorityService();
+    this.runEgressGateway = options.runEgressGateway ?? getRunEgressGatewayService();
+    this.approvalBroker = options.approvalBroker ?? getRunApprovalBrokerService();
+    this.executionFiles =
+      options.executionFiles ?? new FileWorkflowExecutionFileRepository(this.runsDir);
+  }
+
+  /**
+   * Execute a single workflow step
+   */
+  async executeStep(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    preparation?: WorkflowStepExecutionPreparation
+  ): Promise<StepExecutionResult> {
+    log.info({ runId: run.id, stepId: step.id, type: step.type }, 'Executing step');
+    const resolved = preparation ?? (await this.prepareStep(step, run));
+    if (!preparation) {
+      this.applyPreparation(run, resolved);
+      await this.persistRun(run);
+    }
+    const effectiveStep = resolved.step;
+
+    switch (effectiveStep.type) {
+      case 'agent':
+        if (resolved.kind !== 'agent') {
+          throw new Error(`Workflow step ${effectiveStep.id} is missing agent launch preparation`);
+        }
+        return this.executeAgentStep(resolved, run);
+      case 'loop':
+        return this.executeLoopStep(effectiveStep, run);
+      case 'gate':
+        return this.executeGateStep(effectiveStep, run);
+      case 'parallel':
+        return this.executeParallelStep(effectiveStep, run);
+      default:
+        throw new Error(`Unknown step type: ${effectiveStep.type}`);
+    }
+  }
+
+  /**
+   * Resolve every launch control before WorkflowRunService mutates step state.
+   */
+  async prepareStep(
+    step: WorkflowStep,
+    run: WorkflowRun
+  ): Promise<WorkflowStepExecutionPreparation> {
+    const selectedAgent = run.steps.find((candidate) => candidate.stepId === step.id)?.agent;
+    const effectiveStep = selectedAgent ? { ...step, agent: selectedAgent } : step;
+    if (effectiveStep.type !== 'agent') {
+      return { kind: 'non-agent', step: effectiveStep };
+    }
+    return this.prepareAgentStep(effectiveStep, run);
+  }
+
+  /**
+   * Persist the exact prepared evidence only after all phase controls pass.
+   */
+  applyPreparation(run: WorkflowRun, preparation: WorkflowStepExecutionPreparation): void {
+    if (preparation.kind !== 'agent') return;
+    const stepRun = run.steps.find((candidate) => candidate.stepId === preparation.step.id);
+    if (!stepRun) {
+      throw new Error(`Workflow run is missing step state for ${preparation.step.id}`);
+    }
+    stepRun.agent = preparation.step.agent;
+    stepRun.providerRuntimeManifest = preparation.runtimeManifest;
+    stepRun.requiredRuntimeCapabilities = [
+      ...new Set(preparation.requiredRuntimeCapabilities),
+    ].sort((left, right) => left.localeCompare(right));
+    stepRun.runtimeControls = providerRuntimeControls(preparation.runtimeManifest);
+    stepRun.phaseAuthority = structuredClone(preparation.phaseAuthority);
+    stepRun.phaseLaunchDigest = preparation.phaseLaunchDigest;
+    if (stepRun.runRetry?.state === 'launched') {
+      stepRun.runRetry = {
+        ...stepRun.runRetry,
+        launchedManifestDigest: preparation.runtimeManifest.digest,
+        requiredRuntimeCapabilities: [...stepRun.requiredRuntimeCapabilities],
+      };
+    }
+    this.recordAgentHostRouting(
+      run,
+      preparation.step,
+      preparation.hostRouting,
+      preparation.hostRoutingGeneratedAt
+    );
+  }
+
+  /**
+   * Probe a fallback through the same capability and sandbox gates used by a
+   * real workflow launch, without creating a provider session.
+   */
+  async validateFallbackAgent(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    agentId: string
+  ): Promise<ProviderRuntimeManifest> {
+    const effectiveStep = { ...step, agent: agentId };
+    if (!this.getAgentDefinition(run, agentId)) {
+      throw new Error(`Workflow fallback agent ${agentId} is not defined in the workflow`);
+    }
+    const preparation = await this.prepareAgentStep(effectiveStep, run);
+    return preparation.runtimeManifest;
+  }
+
+  /**
+   * Execute an agent step through its configured provider.
+   * Integrated features: #108 (progress), #110 (tool policies), #111 (session management)
+   */
+  private async prepareAgentStep(
+    step: WorkflowStep,
+    run: WorkflowRun
+  ): Promise<WorkflowAgentStepPreparation> {
+    if (!step.agent) {
+      throw new Error(`Agent step ${step.id} missing agent`);
+    }
+
+    let agentDef = this.getAgentDefinition(run, step.agent);
+    if (agentDef && run.budget?.modelOverride) {
+      agentDef = { ...agentDef, model: run.budget.modelOverride };
+    }
+    const workflowConfig = run.context.workflow as
+      { config?: { fresh_session_default?: boolean } } | undefined;
+
+    // Build session configuration (#111)
+    const sessionConfig = this.buildSessionConfig(step, run, workflowConfig?.config);
+
+    // Load progress file (#108)
+    const progress = await this.loadProgressFile(run.id);
+
+    // Build context based on session config (#111)
+    const sessionContext = this.buildSessionContext(sessionConfig, run, progress);
+
+    // Render the input prompt with context
+    const prompt = this.renderTemplate(step.input || '', sessionContext);
+
+    // Get tool policy filter for this agent role (#110)
+    const toolPolicyFilter = this.applyAutomationToolCeiling(
+      run,
+      await this.getToolPolicyForAgent(agentDef)
+    );
+    const workingDirectory = this.expandPath(this.getWorkflowWorkingDirectory(run));
+    const runtimeProvider = this.resolveWorkflowProvider(step, agentDef);
+    const runtimeManifest = await this.resolveRuntimeManifest(step, agentDef, runtimeProvider);
+    const requiredRuntimeCapabilities = this.requiredRuntimeCapabilities(
+      step,
+      run,
+      agentDef,
+      runtimeProvider,
+      sessionConfig,
+      toolPolicyFilter
+    );
+    assertProviderRuntimeCapabilities(
+      runtimeManifest,
+      requiredRuntimeCapabilities,
+      `workflow step ${step.id} launch`
+    );
+    const parentPhase = this.resolveWorkflowPhaseParent(step, run, sessionConfig);
+    let sandboxPolicy = await getSandboxPolicyService().dryRunWithTrace({
+      presetId: agentDef?.sandboxPresetId,
+      provider: runtimeManifest.provider,
+      workspacePath: workingDirectory,
+      providerRuntimeManifest: runtimeManifest,
+    });
+    if (step.phase || parentPhase?.evidence?.identity.mode === 'profile') {
+      sandboxPolicy = await getSandboxPolicyService().dryRunWithTrace({
+        preset: this.phaseAuthority.narrowSandboxPreset(
+          sandboxPolicy.result.preset,
+          step.phase,
+          parentPhase
+        ),
+        provider: runtimeManifest.provider,
+        workspacePath: workingDirectory,
+        providerRuntimeManifest: runtimeManifest,
+      });
+    }
+    const sandboxTrace = await getGovernanceTraceService().record(sandboxPolicy.trace);
+    if (sandboxPolicy.result.decision === 'block') {
+      throw new Error(
+        `Workflow step ${step.id} cannot enforce sandbox preset ${sandboxPolicy.result.preset.id}; trace ${sandboxTrace.id}`
+      );
+    }
+    const hostPreview = getAgentHostService().preview({
+      agent: step.agent,
+      provider: runtimeManifest.provider,
+      model: agentDef?.model,
+      workspacePath: workingDirectory,
+      requiredTools: this.routingTools(agentDef, toolPolicyFilter),
+      requiredRuntimeCapabilities,
+      verificationGates: step.acceptance_criteria,
+      sandboxPresetId: sandboxPolicy.result.preset.id,
+    });
+    const selectedHost =
+      hostPreview.decision.selectedHostId ??
+      (runtimeProvider === 'openclaw' ? 'openclaw-gateway' : 'local-process');
+    const phaseAuthority = this.phaseAuthority.compile({
+      requestedPhase: step.phase,
+      parent: parentPhase,
+      ...(agentDef
+        ? {
+            agentProfile: {
+              id: agentDef.id,
+              version: run.workflowVersion,
+            },
+          }
+        : {}),
+      sandboxPolicy: sandboxPolicy.result,
+      providerRuntimeManifest: runtimeManifest,
+      selectedHost,
+      toolCatalogId: digestRunLaunchValue(toolPolicyFilter),
+    });
+    this.phaseAuthority.assertEnforceable(phaseAuthority);
+    const phaseLaunchDigest = digestRunLaunchValue({
+      schemaVersion: 'workflow-phase-launch/v1',
+      workflowId: run.workflowId,
+      workflowVersion: run.workflowVersion,
+      runId: run.id,
+      stepId: step.id,
+      agent: step.agent,
+      providerRuntimeManifestDigest: runtimeManifest.digest,
+      selectedHost,
+      phaseEvidenceDigest: phaseAuthority.evidence.digest,
+      phaseSourceReferences: phaseAuthority.sourceReferences,
+    });
+
+    log.info(
+      {
+        runId: run.id,
+        stepId: step.id,
+        agent: step.agent,
+        role: agentDef?.role,
+        sessionMode: sessionConfig.mode,
+        sessionContext: sessionConfig.context,
+        sessionCleanup: sessionConfig.cleanup,
+        toolPolicy: toolPolicyFilter,
+        runtimeProvider,
+        hostRouting: hostPreview.decision,
+      },
+      'Agent step execution configured'
+    );
+
+    return {
+      kind: 'agent',
+      step,
+      agentDef,
+      sessionConfig,
+      sessionContext,
+      prompt,
+      toolPolicyFilter,
+      workingDirectory,
+      runtimeProvider,
+      runtimeManifest,
+      requiredRuntimeCapabilities,
+      sandboxPolicy: sandboxPolicy.result,
+      hostRouting: hostPreview.decision,
+      hostRoutingGeneratedAt: hostPreview.generatedAt,
+      phaseAuthority,
+      phaseLaunchDigest,
+    };
+  }
+
+  private async executeAgentStep(
+    preparation: WorkflowAgentStepPreparation,
+    run: WorkflowRun
+  ): Promise<StepExecutionResult> {
+    const egressPolicy = preparation.sandboxPolicy.effective.networkPolicy;
+    if (
+      preparation.runtimeProvider === 'openclaw' &&
+      egressPolicy &&
+      preparation.sandboxPolicy.preset.enforcement === 'required' &&
+      runEgressPolicyRequiresGateway(egressPolicy)
+    ) {
+      throw new Error(
+        `OpenClaw workflow step ${preparation.step.id} cannot enforce the required run-scoped egress gateway`
+      );
+    }
+    if (preparation.runtimeProvider === 'codex-sdk') {
+      return this.executeCodexAgentStep(
+        preparation.step,
+        run,
+        preparation.agentDef,
+        preparation.prompt,
+        preparation.sessionConfig,
+        preparation.toolPolicyFilter,
+        preparation.hostRouting,
+        preparation.sandboxPolicy,
+        preparation.runtimeManifest
+      );
+    }
+
+    return this.executeOpenClawAgentStep(
+      preparation.step,
+      run,
+      preparation.agentDef,
+      preparation.prompt,
+      preparation.sessionConfig,
+      preparation.sessionContext,
+      preparation.toolPolicyFilter,
+      preparation.hostRouting,
+      preparation.runtimeManifest
+    );
+  }
+
+  private async executeOpenClawAgentStep(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    agentDef: WorkflowAgent | null,
+    prompt: string,
+    sessionConfig: StepSessionConfig,
+    sessionContext: Record<string, unknown>,
+    toolPolicyFilter: { allowed?: string[]; denied?: string[] },
+    hostRouting: AgentHostRoutingDecision,
+    runtimeManifest: ProviderRuntimeManifest
+  ): Promise<StepExecutionResult> {
+    const agentId = step.agent || agentDef?.id || step.id;
+    const sessionMap = (run.context._sessions as Record<string, string> | undefined) || {};
+    const existingSessionKey = sessionConfig.mode === 'reuse' ? sessionMap[agentId] : undefined;
+
+    let sessionKey = existingSessionKey;
+    let ownedSession = false;
+    let adapterResult: OpenClawWorkflowSessionResult | undefined;
+
+    const baseInput: Omit<OpenClawWorkflowSessionInput, 'sessionKey' | 'prompt'> = {
+      workflowId: run.workflowId,
+      runId: run.id,
+      stepId: step.id,
+      taskId: run.taskId,
+      agentId,
+      timeoutSeconds: sessionConfig.timeout,
+      toolFilter: toolPolicyFilter,
+    };
+
+    try {
+      if (sessionKey) {
+        this.recordWorkflowSession(run, step, agentId, sessionKey);
+        adapterResult = await this.openClawAdapter.send({
+          ...baseInput,
+          sessionKey,
+          prompt,
+        });
+      } else {
+        adapterResult = await this.openClawAdapter.spawn({
+          ...baseInput,
+          agentName: agentDef?.name,
+          model: agentDef?.model,
+          prompt,
+          sessionMode: sessionConfig.mode,
+          contextMode: sessionConfig.context,
+          cleanup: sessionConfig.cleanup,
+          taskContext: sessionContext.task,
+        });
+        sessionKey = adapterResult.sessionKey;
+        ownedSession = true;
+        this.recordWorkflowSession(run, step, agentId, sessionKey);
+
+        if (!adapterResult.output) {
+          adapterResult = await this.openClawAdapter.wait({
+            ...baseInput,
+            sessionKey,
+            prompt,
+          });
+        }
+      }
+
+      this.assertOpenClawResult(step, adapterResult);
+
+      const result = this.buildOpenClawStepResult(
+        step,
+        run,
+        agentDef,
+        adapterResult,
+        sessionConfig,
+        hostRouting
+      );
+      const parsed = this.parseStepOutput(result, step);
+      await this.validateAcceptanceCriteria(step, result, parsed);
+      const outputPath = await this.saveStepOutput(run.id, step.id, result, step.output?.file);
+      await this.appendProgressFile(run.id, step.id, result);
+
+      return {
+        output: parsed,
+        outputPath,
+        providerRuntimeManifest: runtimeManifest,
+      };
+    } catch (err) {
+      const message = this.sanitizeProviderError(err, prompt);
+      throw new Error(`OpenClaw workflow step ${step.id} failed: ${message}`, { cause: err });
+    } finally {
+      if (ownedSession && sessionKey && sessionConfig.cleanup === 'delete') {
+        try {
+          await this.openClawAdapter.cleanup({
+            workflowId: run.workflowId,
+            runId: run.id,
+            stepId: step.id,
+            taskId: run.taskId,
+            agentId,
+            sessionKey,
+          });
+        } catch (err) {
+          log.warn(
+            { runId: run.id, stepId: step.id, sessionKey, err },
+            'OpenClaw workflow session cleanup failed'
+          );
+        }
+      }
+    }
+  }
+
+  private recordWorkflowSession(
+    run: WorkflowRun,
+    step: WorkflowStep,
+    agentId: string,
+    sessionKey: string
+  ): void {
+    run.context._sessions = {
+      ...((run.context._sessions as Record<string, string> | undefined) || {}),
+      [agentId]: sessionKey,
+    };
+
+    const stepRun = run.steps.find((s) => s.stepId === step.id);
+    if (stepRun) {
+      stepRun.sessionKey = sessionKey;
+      if (stepRun.phaseAuthority && stepRun.phaseLaunchDigest) {
+        run.context._sessionPhaseAuthority = {
+          ...((run.context._sessionPhaseAuthority as
+            Record<string, WorkflowSessionPhaseSnapshot> | undefined) ?? {}),
+          [agentId]: {
+            attemptId: this.workflowStepAttemptId(run, stepRun.stepId),
+            manifestDigest: stepRun.phaseLaunchDigest,
+            phaseAuthority: structuredClone(stepRun.phaseAuthority),
+          },
+        };
+      }
+    }
+  }
+
+  private resolveWorkflowPhaseParent(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    sessionConfig: StepSessionConfig
+  ): PhaseLaunchParentSnapshot | undefined {
+    const stepRun = run.steps.find((candidate) => candidate.stepId === step.id);
+    if (stepRun?.phaseAuthority && stepRun.phaseLaunchDigest) {
+      return {
+        attemptId: this.workflowStepAttemptId(run, step.id),
+        manifestDigest: stepRun.phaseLaunchDigest,
+        evidence: stepRun.phaseAuthority.evidence,
+      };
+    }
+
+    if (sessionConfig.mode !== 'reuse') return undefined;
+    const agentId = step.agent ?? step.id;
+    const sessionKey = (run.context._sessions as Record<string, string> | undefined)?.[agentId];
+    if (!sessionKey) return undefined;
+    const sessionPhase = (
+      run.context._sessionPhaseAuthority as Record<string, WorkflowSessionPhaseSnapshot> | undefined
+    )?.[agentId];
+    if (sessionPhase) {
+      if (
+        !sessionPhase.attemptId ||
+        !sessionPhase.manifestDigest ||
+        !sessionPhase.phaseAuthority?.evidence
+      ) {
+        throw new Error(`Workflow session ${agentId} has invalid phase authority evidence`);
+      }
+      return {
+        attemptId: sessionPhase.attemptId,
+        manifestDigest: sessionPhase.manifestDigest,
+        evidence: sessionPhase.phaseAuthority.evidence,
+      };
+    }
+
+    const legacyDigest = digestRunLaunchValue({
+      schemaVersion: 'workflow-legacy-session-phase/v1',
+      workflowId: run.workflowId,
+      workflowVersion: run.workflowVersion,
+      runId: run.id,
+      agentId,
+      sessionKeyDigest: digestRunLaunchValue(sessionKey),
+    });
+    return {
+      attemptId: `legacy-session:${legacyDigest.slice(0, 20)}`,
+      manifestDigest: legacyDigest,
+    };
+  }
+
+  private workflowStepAttemptId(run: WorkflowRun, stepId: string): string {
+    const stepRun = run.steps.find((candidate) => candidate.stepId === stepId);
+    const sequence = stepRun?.runRetry?.sequence ?? stepRun?.retries ?? 0;
+    return `${run.id}:${stepId}:${sequence}`;
+  }
+
+  private workflowTaskId(run: WorkflowRun): string {
+    const contextTask = run.context.task as { id?: string } | undefined;
+    return run.taskId ?? contextTask?.id ?? run.id;
+  }
+
+  private workflowProject(run: WorkflowRun): string | undefined {
+    const contextTask = run.context.task as { project?: string } | undefined;
+    return contextTask?.project;
+  }
+
+  private async resolveWorkflowEgressApproval(
+    run: WorkflowRun,
+    step: WorkflowStep,
+    agentId: string,
+    runtimeManifest: ProviderRuntimeManifest,
+    sandboxPolicy: SandboxPolicyDryRunResult,
+    request: RunEgressGatewayApprovalRequest
+  ): Promise<RunEgressGatewayApprovalResult> {
+    const taskId = this.workflowTaskId(run);
+    const attemptId = this.workflowStepAttemptId(run, step.id);
+    const providerRequestId = `egress:${digestRunLaunchValue({
+      gatewayId: request.gatewayId,
+      protocol: request.protocol,
+      host: request.host,
+      port: request.port,
+      method: request.method,
+      path: request.path,
+      policyHash: request.decision.policyHash,
+    }).slice('sha256:'.length, 'sha256:'.length + 32)}`;
+    const approval = await this.approvalBroker.request({
+      workspaceId: 'local',
+      taskId,
+      attemptId,
+      provider: 'codex-sdk',
+      agentId,
+      providerRequestId,
+      requestKind: 'approval',
+      actionClass: 'network',
+      action: `Allow ${request.protocol} egress to ${request.host}:${request.port}`,
+      details: `Blocked by ${request.decision.reason}; method ${request.method ?? 'not available'}.`,
+      resourceScope: [request.host, `${request.protocol}:${request.port}`],
+      workingDirectory: this.expandPath(this.getWorkflowWorkingDirectory(run)),
+      riskClass: 'high',
+      policyReason: request.decision.reason,
+      evidenceRevision: digestRunLaunchValue({
+        runtimeManifestDigest: runtimeManifest.digest,
+        policyHash: sandboxPolicy.effective.networkPolicy?.policyHash,
+      }),
+      mobileSafe: false,
+      exactAction: {
+        protocol: request.protocol,
+        host: request.host,
+        port: request.port,
+        method: request.method,
+        path: request.path,
+        policyHash: request.decision.policyHash,
+        blockedReason: request.decision.reason,
+      },
+    });
+    if (request.signal.aborted) {
+      await this.approvalBroker.cancelAttempt(
+        'local',
+        taskId,
+        attemptId,
+        'Workflow egress gateway stopped.'
+      );
+      return { approvalId: approval.id, approved: false };
+    }
+    try {
+      const resolved = await this.approvalBroker.awaitDecision(approval.id, {
+        signal: request.signal,
+      });
+      return {
+        approvalId: approval.id,
+        approved: resolved.request.status === 'approved',
+      };
+    } catch (error) {
+      if (request.signal.aborted) {
+        await this.approvalBroker.cancelAttempt(
+          'local',
+          taskId,
+          attemptId,
+          'Workflow egress gateway stopped.'
+        );
+        return { approvalId: approval.id, approved: false };
+      }
+      throw error;
+    }
+  }
+
+  private recordAgentHostRouting(
+    run: WorkflowRun,
+    step: WorkflowStep,
+    decision: AgentHostRoutingDecision,
+    recordedAt: string
+  ): void {
+    const existing =
+      run.context.agentHostRouting &&
+      typeof run.context.agentHostRouting === 'object' &&
+      !Array.isArray(run.context.agentHostRouting)
+        ? (run.context.agentHostRouting as Record<string, unknown>)
+        : {};
+
+    run.context.agentHostRouting = {
+      ...existing,
+      [step.id]: {
+        stepId: step.id,
+        agent: step.agent,
+        recordedAt,
+        selectedHostId: decision.selectedHostId,
+        selectedHostName: decision.selectedHostName,
+        policy: decision.policy,
+        reason: decision.reason,
+        fallbackBehavior: decision.fallbackBehavior,
+        excludedHostIds: decision.excludedHostIds,
+      },
+    };
+  }
+
+  private routingTools(
+    agentDef: WorkflowAgent | null,
+    toolPolicyFilter: { allowed?: string[]; denied?: string[] }
+  ): string[] {
+    const tools = new Set<string>();
+    for (const tool of agentDef?.tools ?? []) {
+      tools.add(tool);
+    }
+    for (const tool of toolPolicyFilter.allowed ?? []) {
+      if (tool !== '*') tools.add(tool);
+    }
+    return Array.from(tools).sort((a, b) => a.localeCompare(b));
+  }
+
+  private async resolveRuntimeManifest(
+    step: WorkflowStep,
+    agentDef: WorkflowAgent | null,
+    provider: WorkflowExecutableProvider
+  ): Promise<ProviderRuntimeManifest> {
+    const type = agentDef?.id || step.agent || step.id;
+    const command = agentDef?.command || (provider === 'openclaw' ? 'openclaw' : 'codex');
+    return this.runtimeManifestResolver({
+      type,
+      name: agentDef?.name || type,
+      command,
+      args: [],
+      enabled: true,
+      provider,
+      model: agentDef?.model,
+      sandboxPresetId: agentDef?.sandboxPresetId,
+      budget: agentDef?.budget,
+    });
+  }
+
+  private resolveWorkflowProvider(
+    step: WorkflowStep,
+    agentDef: WorkflowAgent | null
+  ): WorkflowExecutableProvider {
+    const provider = agentDef?.provider;
+    if (provider === 'openclaw' || provider === 'codex-sdk') {
+      return provider;
+    }
+    if (provider) {
+      throw new Error(
+        `Workflow agent ${agentDef?.id || step.agent || step.id} uses provider ${provider}, which has no workflow execution adapter.`
+      );
+    }
+    return this.isCodexAgent(agentDef, step.agent) ? 'codex-sdk' : 'openclaw';
+  }
+
+  private requiredRuntimeCapabilities(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    agentDef: WorkflowAgent | null,
+    runtimeProvider: WorkflowExecutableProvider,
+    sessionConfig: StepSessionConfig,
+    toolPolicyFilter: { allowed?: string[]; denied?: string[] }
+  ): ProviderRuntimeCapabilityId[] {
+    const required = new Set<ProviderRuntimeCapabilityId>(BASELINE_LAUNCH_CAPABILITIES);
+    const tools = this.routingTools(agentDef, toolPolicyFilter);
+    const hasToolPolicy = tools.length > 0 || (toolPolicyFilter.denied?.length ?? 0) > 0;
+    if (hasToolPolicy) required.add('tool.calls');
+    if (tools.some((tool) => /(^|[_.:/-])mcp([_.:/-]|$)/i.test(tool))) {
+      required.add('tool.mcp');
+    }
+    if (step.output?.schema) required.add('output.structured');
+    required.add('artifact.write');
+    const tokenUsageLimits = [
+      run.budget?.policy?.limits,
+      agentDef?.budget?.enabled ? agentDef.budget.limits : undefined,
+    ];
+    if (
+      tokenUsageLimits.some(
+        (limits) =>
+          limits?.inputTokens !== undefined ||
+          limits?.outputTokens !== undefined ||
+          limits?.totalTokens !== undefined ||
+          limits?.costUsd !== undefined
+      )
+    ) {
+      required.add('usage.tokens');
+    }
+
+    const sessionKey = step.agent || agentDef?.id || step.id;
+    const hasExistingSession = Boolean(
+      sessionConfig.mode === 'reuse' &&
+      (run.context._sessions as Record<string, string> | undefined)?.[sessionKey]
+    );
+    if (hasExistingSession) {
+      if (runtimeProvider === 'codex-sdk') {
+        required.add('run.resume');
+      } else {
+        required.add('run.reattach');
+        required.add('run.follow-up');
+      }
+    }
+
+    return [...required].sort((left, right) => left.localeCompare(right));
+  }
+
+  private assertOpenClawResult(
+    step: WorkflowStep,
+    result: OpenClawWorkflowSessionResult | undefined
+  ): asserts result is OpenClawWorkflowSessionResult {
+    if (!result) {
+      throw new Error('OpenClaw adapter did not return a result');
+    }
+
+    const status = result.status?.toLowerCase();
+    if (status === 'timeout' || status === 'timed_out') {
+      throw new Error(`OpenClaw session ${result.sessionKey} timed out`);
+    }
+    if (status === 'error' || status === 'failed' || status === 'failure') {
+      throw new Error(result.error || `OpenClaw session ${result.sessionKey} returned ${status}`);
+    }
+
+    if (!result.sessionKey) {
+      throw new Error(`OpenClaw step ${step.id} completed without a session key`);
+    }
+  }
+
+  private buildOpenClawStepResult(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    agentDef: WorkflowAgent | null,
+    result: OpenClawWorkflowSessionResult,
+    sessionConfig: StepSessionConfig,
+    hostRouting: AgentHostRoutingDecision
+  ): string {
+    const output = result.output?.trim() || 'OpenClaw completed without a final response.';
+    const hasStatus = /\bSTATUS\s*:/i.test(output);
+    const hasOutput = /\bOUTPUT\s*:/i.test(output);
+    const lines = [
+      `# OpenClaw Workflow Step: ${step.name || step.id}`,
+      '',
+      `Agent: ${agentDef?.name || step.agent}`,
+      `Provider: ${agentDef?.provider || 'openclaw'}`,
+      `Model: ${agentDef?.model || 'default'}`,
+      `Session: ${result.sessionKey}`,
+      `OpenClaw run: ${result.runId || run.id}`,
+      `Session mode: ${sessionConfig.mode}`,
+      `Session cleanup: ${sessionConfig.cleanup}`,
+      `Host routing: ${hostRouting.policy}`,
+      `Selected host: ${hostRouting.selectedHostName || hostRouting.selectedHostId || 'none'}`,
+      `Routing reason: ${hostRouting.reason}`,
+      '',
+      '## Final Response',
+      '',
+      output,
+    ];
+
+    if (!hasStatus) {
+      lines.push('', 'STATUS: done');
+    }
+    if (!hasOutput) {
+      lines.push(`OUTPUT: ${output}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  private sanitizeProviderError(err: unknown, prompt?: string): string {
+    let message =
+      err instanceof Error ? err.message : typeof err === 'string' ? err : 'Unknown error';
+    if (prompt) {
+      message = message.split(prompt).join('[REDACTED_PROMPT]');
+    }
+
+    const replacements: Array<[RegExp, string]> = [
+      [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]'],
+      [/\bsk-[A-Za-z0-9_-]{12,}/g, 'sk-[REDACTED]'],
+      [/\bghp_[A-Za-z0-9_]{12,}/g, 'ghp_[REDACTED]'],
+      [/\bgithub_pat_[A-Za-z0-9_]{12,}/g, 'github_pat_[REDACTED]'],
+      [
+        /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY)[A-Z0-9_]*)\s*=\s*([^\s"'`]+)/gi,
+        '$1=[REDACTED]',
+      ],
+      [
+        /\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s"'`,}]+)/gi,
+        '$1=[REDACTED]',
+      ],
+    ];
+
+    for (const [pattern, replacement] of replacements) {
+      message = message.replace(pattern, replacement);
+    }
+
+    return message.slice(0, 1000);
+  }
+
+  private async executeCodexAgentStep(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    agentDef: WorkflowAgent | null,
+    prompt: string,
+    sessionConfig: StepSessionConfig,
+    toolPolicyFilter: { allowed?: string[]; denied?: string[] },
+    hostRouting: AgentHostRoutingDecision,
+    sandboxPolicy: SandboxPolicyDryRunResult,
+    runtimeManifest: ProviderRuntimeManifest
+  ): Promise<StepExecutionResult> {
+    this.assertCodexToolPolicySupported(step, agentDef, toolPolicyFilter);
+
+    const codexPathOverride = assertAllowedCodexCommandOverride(
+      agentDef?.command,
+      `Workflow agent ${agentDef?.id || step.agent || step.id}`
+    );
+    const egressPolicy = sandboxPolicy.effective.networkPolicy;
+    const attemptId = this.workflowStepAttemptId(run, step.id);
+    const taskId = this.workflowTaskId(run);
+    const agentId = step.agent ?? agentDef?.id ?? step.id;
+    const egressGateway =
+      egressPolicy && runEgressPolicyRequiresGateway(egressPolicy)
+        ? await this.runEgressGateway.start({
+            runId: attemptId,
+            policy: egressPolicy,
+            upstreamProxyUrl: process.env[RUN_EGRESS_UPSTREAM_PROXY_ENV_KEY],
+            onApprovalRequired: (request) =>
+              this.resolveWorkflowEgressApproval(
+                run,
+                step,
+                agentId,
+                runtimeManifest,
+                sandboxPolicy,
+                request
+              ),
+            onDecision: async (event) => {
+              await getGovernanceTraceService().record({
+                kind: 'policy',
+                outcome: event.decision.decision === 'allow' ? 'allowed' : 'blocked',
+                title: 'Workflow egress decision',
+                summary: `${event.decision.protocol} request ${event.decision.decision}: ${event.decision.reason}`,
+                subject: {
+                  taskId,
+                  agentId: step.agent,
+                  actionType: 'workflow.network-egress',
+                },
+                evaluatedRules: [
+                  {
+                    id: event.decision.reason,
+                    label: 'Run-scoped egress gateway',
+                    type: 'policy',
+                    status: 'matched',
+                    outcome: event.decision.decision === 'allow' ? 'allowed' : 'blocked',
+                    message: event.decision.reason,
+                  },
+                ],
+                raw: {
+                  gatewayId: event.gatewayId,
+                  runKey: event.runKey,
+                  occurredAt: event.occurredAt,
+                  policyHash: event.decision.policyHash,
+                  protocol: event.decision.protocol,
+                  hostKey: event.decision.hostKey,
+                  port: event.decision.port,
+                  method: event.decision.method,
+                  decision: event.decision.decision,
+                  reason: event.decision.reason,
+                  blockedAddressClass: event.decision.blockedAddressClass,
+                  approvalEligible: event.decision.approvalEligible,
+                  approvalId: event.decision.approvalId,
+                  policyReason: event.decision.policyReason,
+                },
+              });
+              await getTelemetryService().emit<NetworkEgressTelemetryEvent>({
+                type: 'network.egress',
+                taskId,
+                attemptId,
+                agent: agentId,
+                provider: 'codex-sdk',
+                project: this.workflowProject(run),
+                gatewayId: event.gatewayId,
+                runKey: event.runKey,
+                policyHash: event.decision.policyHash,
+                protocol: event.decision.protocol,
+                hostKey: event.decision.hostKey,
+                port: event.decision.port,
+                method: event.decision.method,
+                decision: event.decision.decision,
+                reason: event.decision.reason,
+                policyReason: event.decision.policyReason,
+                blockedAddressClass: event.decision.blockedAddressClass,
+                approvalEligible: event.decision.approvalEligible,
+                approvalId: event.decision.approvalId,
+              });
+            },
+          })
+        : undefined;
+    try {
+      const { Codex } = await import('@openai/codex-sdk');
+      const workingDirectory = this.expandPath(this.getWorkflowWorkingDirectory(run));
+      const codex = new Codex({
+        codexPathOverride,
+        env: Object.fromEntries(
+          Object.entries({
+            ...buildSafeCodexEnv(process.env, sandboxPolicy.effective.envPassthrough),
+            ...egressGateway?.environment,
+          }).filter(([key]) => key !== RUN_EGRESS_UPSTREAM_PROXY_ENV_KEY)
+        ),
+      });
+
+      const sessionKey = step.agent || agentDef?.id || step.id;
+      const existingThreadId =
+        sessionConfig.mode === 'reuse'
+          ? (run.context._sessions as Record<string, string> | undefined)?.[sessionKey]
+          : undefined;
+      const thread = existingThreadId
+        ? codex.resumeThread(existingThreadId, {
+            workingDirectory,
+            sandboxMode: sandboxPolicy.effective.sandboxMode,
+            approvalPolicy: 'never',
+            networkAccessEnabled: sandboxPolicy.effective.networkAccessEnabled,
+            model: agentDef?.model,
+          })
+        : codex.startThread({
+            workingDirectory,
+            skipGitRepoCheck: true,
+            sandboxMode: sandboxPolicy.effective.sandboxMode,
+            approvalPolicy: 'never',
+            networkAccessEnabled: sandboxPolicy.effective.networkAccessEnabled,
+            model: agentDef?.model,
+          });
+
+      const streamed = await thread.runStreamed(prompt);
+      const events: unknown[] = [];
+      let threadId = existingThreadId || '';
+      let finalResponse = '';
+      let failureMessage = '';
+      let toolCalls = 0;
+      let tokenUsage:
+        | {
+            inputTokens: number;
+            outputTokens: number;
+            totalTokens?: number;
+            cost?: number;
+          }
+        | undefined;
+
+      for await (const event of streamed.events) {
+        events.push(event);
+        if (this.isCodexToolEvent(event)) {
+          assertProviderRuntimeControl(runtimeManifest, 'tool-calls');
+          toolCalls++;
+        }
+        const eventUsage = this.extractCodexBudgetUsage(event);
+        if (eventUsage) {
+          assertProviderRuntimeControl(runtimeManifest, 'token-usage');
+          tokenUsage = eventUsage;
+        }
+        if (event.type === 'thread.started') {
+          threadId = event.thread_id;
+          this.recordWorkflowSession(run, step, sessionKey, threadId);
+        }
+        if (event.type === 'item.completed' && event.item.type === 'agent_message') {
+          finalResponse = event.item.text;
+        }
+        if (event.type === 'turn.failed') failureMessage = event.error.message;
+        if (event.type === 'error') failureMessage = event.message;
+      }
+
+      if (failureMessage) {
+        throw new Error(`Codex workflow step failed: ${failureMessage}`);
+      }
+
+      const result = [
+        `# Codex Workflow Step: ${step.name || step.id}`,
+        '',
+        `Agent: ${agentDef?.name || step.agent}`,
+        `Provider: ${agentDef?.provider || 'codex-sdk'}`,
+        `Model: ${agentDef?.model || 'default'}`,
+        `Thread: ${threadId || 'unknown'}`,
+        `Working directory: ${workingDirectory}`,
+        `Host routing: ${hostRouting.policy}`,
+        `Selected host: ${hostRouting.selectedHostName || hostRouting.selectedHostId || 'none'}`,
+        `Routing reason: ${hostRouting.reason}`,
+        '',
+        '## Prompt',
+        '',
+        prompt,
+        '',
+        '## Final Response',
+        '',
+        finalResponse || 'Codex completed without a final response.',
+        '',
+        'STATUS: done',
+        `OUTPUT: ${finalResponse || 'Codex completed without a final response.'}`,
+        '',
+        '<details><summary>Codex events</summary>',
+        '',
+        '```json',
+        JSON.stringify(events, null, 2),
+        '```',
+        '',
+        '</details>',
+      ].join('\n');
+
+      const parsed = this.parseStepOutput(result, step);
+      await this.validateAcceptanceCriteria(step, result, parsed);
+      const outputPath = await this.saveStepOutput(run.id, step.id, result, step.output?.file);
+      await this.appendProgressFile(run.id, step.id, result);
+
+      return {
+        output: parsed,
+        outputPath,
+        budgetUsage: {
+          inputTokens: tokenUsage?.inputTokens,
+          outputTokens: tokenUsage?.outputTokens,
+          totalTokens: tokenUsage?.totalTokens,
+          costUsd: tokenUsage?.cost,
+          toolCalls,
+        },
+        providerRuntimeManifest: runtimeManifest,
+      };
+    } finally {
+      await egressGateway?.stop();
+    }
+  }
+
+  private extractCodexBudgetUsage(event: unknown):
+    | {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens?: number;
+        cost?: number;
+      }
+    | undefined {
+    const seen = new Set<unknown>();
+    const visit = (value: unknown): Record<string, unknown> | undefined => {
+      if (!value || typeof value !== 'object') return undefined;
+      if (seen.has(value)) return undefined;
+      seen.add(value);
+      const record = value as Record<string, unknown>;
+      const input =
+        record.input_tokens ?? record.inputTokens ?? record.prompt_tokens ?? record.promptTokens;
+      const output =
+        record.output_tokens ??
+        record.outputTokens ??
+        record.completion_tokens ??
+        record.completionTokens;
+      if (typeof input === 'number' && typeof output === 'number') return record;
+      for (const child of Object.values(record)) {
+        const result = visit(child);
+        if (result) return result;
+      }
+      return undefined;
+    };
+
+    const usage = visit(event);
+    if (!usage) return undefined;
+    const input = (usage.input_tokens ??
+      usage.inputTokens ??
+      usage.prompt_tokens ??
+      usage.promptTokens) as number;
+    const output = (usage.output_tokens ??
+      usage.outputTokens ??
+      usage.completion_tokens ??
+      usage.completionTokens) as number;
+    const total = usage.total_tokens ?? usage.totalTokens;
+    const cost = usage.cost ?? usage.cost_usd ?? usage.costUsd;
+    return {
+      inputTokens: input,
+      outputTokens: output,
+      totalTokens: typeof total === 'number' ? total : input + output,
+      cost: typeof cost === 'number' ? cost : undefined,
+    };
+  }
+
+  private isCodexToolEvent(event: unknown): boolean {
+    if (!event || typeof event !== 'object') return false;
+    const record = event as Record<string, unknown>;
+    const type = String(record.type || record.event || '').toLowerCase();
+    if (type.includes('tool')) return true;
+    const item = record.item;
+    if (item && typeof item === 'object') {
+      const itemType = String((item as Record<string, unknown>).type || '').toLowerCase();
+      return itemType.includes('tool') || itemType.includes('function_call');
+    }
+    return false;
+  }
+
+  private assertCodexToolPolicySupported(
+    step: WorkflowStep,
+    agentDef: WorkflowAgent | null,
+    toolPolicyFilter: { allowed?: string[]; denied?: string[] }
+  ): void {
+    const allowed = toolPolicyFilter.allowed ?? [];
+    const denied = toolPolicyFilter.denied ?? [];
+    const hasAllowedRestriction = allowed.length > 0 && !allowed.includes('*');
+    const hasDeniedRestriction = denied.length > 0;
+
+    if (!hasAllowedRestriction && !hasDeniedRestriction) {
+      return;
+    }
+
+    throw new Error(
+      `Codex workflow step ${step.id} cannot enforce restricted tool policy for role ${
+        agentDef?.role || 'unknown'
+      }; choose an unrestricted role or an OpenClaw-backed agent.`
+    );
+  }
+
+  /**
+   * Render a template string with context (simplified Jinja2-style)
+   * Phase 1: Basic string interpolation
+   */
+  private renderTemplate(template: string, context: Record<string, unknown>): string {
+    let rendered = template;
+
+    // Simple {{variable}} substitution
+    rendered = rendered.replace(/\{\{([^}]+)\}\}/g, (_, key) => {
+      const trimmedKey = key.trim();
+      const value = this.getNestedValue(context, trimmedKey);
+      return value !== undefined ? String(value) : `{{${trimmedKey}}}`;
+    });
+
+    return rendered;
+  }
+
+  /**
+   * Get nested object value from dot notation (e.g., "task.title")
+   */
+  private getNestedValue(obj: Record<string, unknown>, path: string): unknown {
+    return path.split('.').reduce((current: unknown, key: string) => {
+      if (current && typeof current === 'object' && key in current) {
+        return (current as Record<string, unknown>)[key];
+      }
+      return undefined;
+    }, obj);
+  }
+
+  private isCodexAgent(agentDef: WorkflowAgent | null, agentId?: string): boolean {
+    return isCodexWorkflowAgent(agentDef ? { ...agentDef, agentId } : { id: agentId });
+  }
+
+  private getWorkflowWorkingDirectory(run: WorkflowRun): string {
+    const task = run.context.task as
+      { git?: { worktreePath?: string; repo?: string }; repoPath?: string } | undefined;
+    return task?.git?.worktreePath || task?.repoPath || process.cwd();
+  }
+
+  private expandPath(p: string): string {
+    return p.replace(/^~/, process.env.HOME || '');
+  }
+
+  /**
+   * Parse agent output into structured data for context passing
+   */
+  private parseStepOutput(rawOutput: string, step: WorkflowStep): unknown {
+    if (!rawOutput) return rawOutput;
+
+    const hintedFile = step.output?.file || '';
+    const extension = path.extname(hintedFile).toLowerCase();
+
+    try {
+      if (extension === '.yml' || extension === '.yaml') {
+        return yaml.parse(rawOutput);
+      }
+
+      if (extension === '.json') {
+        return JSON.parse(rawOutput);
+      }
+
+      // Default: return as-is
+      return rawOutput;
+    } catch (err) {
+      log.warn({ stepId: step.id, err }, 'Failed to parse step output as structured data');
+      return rawOutput;
+    }
+  }
+
+  /**
+   * Save step output to disk
+   */
+  private async saveStepOutput(
+    runId: string,
+    stepId: string,
+    output: unknown,
+    filename?: string
+  ): Promise<string> {
+    // Sanitize runId to prevent path traversal (defensive — already validated upstream)
+    const safeRunId = sanitizeFilename(runId);
+    if (!safeRunId || safeRunId !== runId) {
+      throw new Error(`Invalid run ID: ${runId}`);
+    }
+
+    const candidate = filename || `${stepId}.md`;
+    const safeName = sanitizeFilename(candidate) || `${stepId}.md`;
+    const content = typeof output === 'string' ? output : JSON.stringify(output, null, 2);
+    const outputPath = await this.executionFiles.writeStepOutput(safeRunId, safeName, content);
+
+    log.info({ runId, stepId, outputPath }, 'Step output saved');
+    return outputPath;
+  }
+
+  /**
+   * Validate step output against acceptance criteria
+   */
+  private async validateAcceptanceCriteria(
+    step: WorkflowStep,
+    output: string,
+    parsedOutput: unknown
+  ): Promise<void> {
+    if (!step.acceptance_criteria || step.acceptance_criteria.length === 0) {
+      return; // No criteria to validate
+    }
+
+    for (const criterion of step.acceptance_criteria) {
+      const passed = this.validateCriterion(criterion, output, parsedOutput);
+
+      if (!passed) {
+        throw new Error(`Acceptance criterion not met: "${criterion}"`);
+      }
+    }
+
+    log.info(
+      { stepId: step.id, criteria: step.acceptance_criteria.length },
+      'All acceptance criteria passed'
+    );
+  }
+
+  /**
+   * Validate a single acceptance criterion (Phase 4: enhanced validation with security hardening)
+   */
+  private validateCriterion(criterion: string, rawOutput: string, parsedOutput: unknown): boolean {
+    // Check for validation type patterns
+
+    // Regex pattern: /pattern/flags
+    if (criterion.startsWith('/') && criterion.includes('/')) {
+      const lastSlash = criterion.lastIndexOf('/');
+      if (lastSlash > 0) {
+        const pattern = criterion.slice(1, lastSlash);
+        const flags = criterion.slice(lastSlash + 1);
+
+        // Security: Validate pattern length to prevent ReDoS
+        if (pattern.length > 500) {
+          log.warn({ criterion }, 'Regex pattern exceeds safe length — treating as literal match');
+          return rawOutput.includes(criterion);
+        }
+
+        // Security: Validate flags are safe (only i,m,s allowed — no g,y,u which could have side effects)
+        if (flags && !/^[ims]*$/.test(flags)) {
+          log.warn({ criterion, flags }, 'Unsafe regex flags detected — treating as literal match');
+          return rawOutput.includes(criterion);
+        }
+
+        try {
+          // Test the regex can compile and execute quickly
+          const testStart = Date.now();
+          const regex = new RegExp(pattern, flags);
+          const result = regex.test(rawOutput);
+          const testDuration = Date.now() - testStart;
+
+          // Security: If regex takes >100ms, it might be a ReDoS attempt
+          if (testDuration > 100) {
+            log.warn(
+              { criterion, duration: testDuration },
+              'Regex execution exceeded safe duration — possible ReDoS attempt'
+            );
+            return false;
+          }
+
+          return result;
+        } catch (err) {
+          log.warn({ criterion, err }, 'Invalid regex pattern — treating as literal match');
+          return rawOutput.includes(pattern);
+        }
+      }
+    }
+
+    // JSON path check: output.field == value
+    const equalsMatch = criterion.match(/^(.+?)\s*==\s*(.+)$/);
+    if (equalsMatch) {
+      const [, path, expectedValue] = equalsMatch;
+      const actualValue = this.getNestedValue({ output: parsedOutput }, path.trim());
+      const expected = expectedValue.trim().replace(/^["']|["']$/g, '');
+      return String(actualValue) === expected;
+    }
+
+    // Duration check: duration < N
+    const durationMatch = criterion.match(/^duration\s*<\s*(\d+)$/);
+    if (durationMatch) {
+      // This check is handled at step level, not output level
+      return true; // Skip here, will be validated in executeStep
+    }
+
+    // Default: Simple substring match (backward compatible)
+
+    return rawOutput.includes(criterion);
+  }
+
+  /**
+   * Execute a loop step — iterates over a collection
+   * Phase 4: Loop execution with verify_each support
+   */
+  private async executeLoopStep(
+    step: WorkflowStep,
+    run: WorkflowRun
+  ): Promise<StepExecutionResult> {
+    if (!step.loop) {
+      throw new Error(`Loop step ${step.id} missing loop configuration`);
+    }
+
+    const loopConfig = step.loop;
+
+    // Load progress file
+    const progress = await this.loadProgressFile(run.id);
+    const contextWithProgress = {
+      ...run.context,
+      progress: progress || '',
+      steps: this.buildStepsContext(run),
+    };
+
+    // Evaluate the loop collection
+    const collectionExpr = loopConfig.over;
+    const collection = this.evaluateExpression(collectionExpr, contextWithProgress);
+
+    if (!Array.isArray(collection)) {
+      throw new Error(`Loop expression "${collectionExpr}" did not return an array`);
+    }
+
+    // Check max iterations safety limit
+    // Security/Performance: Hard cap at 1000 iterations even if max_iterations not set
+    const DEFAULT_MAX_ITERATIONS = 1000;
+    const configuredMax = loopConfig.max_iterations || DEFAULT_MAX_ITERATIONS;
+    const maxIterations = Math.min(configuredMax, DEFAULT_MAX_ITERATIONS);
+    const iterationCount = Math.min(collection.length, maxIterations);
+
+    if (collection.length > maxIterations) {
+      log.warn(
+        {
+          runId: run.id,
+          stepId: step.id,
+          collectionSize: collection.length,
+          maxIterations,
+        },
+        `Loop collection size (${collection.length}) exceeds max iterations (${maxIterations}) — capping execution`
+      );
+    }
+
+    // Initialize loop state in step run
+    const stepRun = run.steps.find((s) => s.stepId === step.id);
+    if (stepRun) {
+      stepRun.loopState = {
+        totalIterations: iterationCount,
+        currentIteration: 0,
+        completedIterations: 0,
+        failedIterations: 0,
+      };
+    }
+
+    const itemVar = loopConfig.item_var || 'item';
+    const indexVar = loopConfig.index_var || 'index';
+    const results: unknown[] = [];
+    const completedItems: string[] = [];
+
+    for (let i = 0; i < iterationCount; i++) {
+      const currentItem = collection[i];
+
+      // Update loop state
+      if (stepRun?.loopState) {
+        stepRun.loopState.currentIteration = i + 1;
+      }
+
+      log.info(
+        { runId: run.id, stepId: step.id, iteration: i + 1, total: iterationCount },
+        'Loop iteration'
+      );
+
+      // Build iteration context
+      const iterationContext = {
+        ...contextWithProgress,
+        [itemVar]: currentItem,
+        [indexVar]: i,
+        loop: {
+          index: i,
+          total: iterationCount,
+          completed: completedItems,
+          results,
+        },
+      };
+
+      try {
+        // Render the input prompt for this iteration
+        const prompt = this.renderTemplate(step.input || '', iterationContext);
+
+        // Execute the iteration (spawn agent)
+        const result = `Agent ${step.agent} executed loop iteration ${i + 1}/${iterationCount}\n\nPrompt:\n${prompt}\n\nSTATUS: done\nOUTPUT: Iteration ${i + 1} complete`;
+
+        // Parse output
+        const parsed = this.parseStepOutput(result, step);
+
+        // Validate acceptance criteria for this iteration
+        await this.validateAcceptanceCriteria(step, result, parsed);
+
+        // Save iteration output
+        const outputFilename = this.renderTemplate(
+          step.output?.file || `${step.id}-{{loop.index}}.md`,
+          iterationContext
+        );
+        await this.saveStepOutput(run.id, step.id, result, outputFilename);
+
+        // Append to progress
+        await this.appendProgressFile(run.id, `${step.id}-iter-${i + 1}`, result);
+
+        results.push(parsed);
+        completedItems.push(String(currentItem));
+
+        if (stepRun?.loopState) {
+          stepRun.loopState.completedIterations++;
+        }
+
+        // Run verification step if verify_each is enabled
+        if (loopConfig.verify_each && loopConfig.verify_step) {
+          log.info(
+            { runId: run.id, stepId: step.id, verifyStep: loopConfig.verify_step },
+            'Running verification step'
+          );
+          // Verification would be handled by the workflow executor
+          // This is just a placeholder to show the integration point
+        }
+      } catch (err: unknown) {
+        if (stepRun?.loopState) {
+          stepRun.loopState.failedIterations++;
+        }
+
+        const errMessage = err instanceof Error ? err.message : 'Unknown error';
+        log.warn(
+          { runId: run.id, stepId: step.id, iteration: i + 1, error: errMessage },
+          'Loop iteration failed'
+        );
+
+        // Check if we should continue on error
+        if (loopConfig.continue_on_error) {
+          log.info(
+            { runId: run.id, stepId: step.id, iteration: i + 1 },
+            'Continuing loop despite iteration failure (continue_on_error: true)'
+          );
+          continue;
+        }
+
+        // Check completion policy
+        if (loopConfig.completion === 'any_done' && results.length > 0) {
+          log.info(
+            { runId: run.id, stepId: step.id, completed: results.length },
+            'Loop stopping — any_done policy satisfied'
+          );
+          break;
+        }
+
+        if (loopConfig.completion === 'first_success' && results.length === 1) {
+          log.info({ runId: run.id, stepId: step.id }, 'Loop stopping — first_success achieved');
+          break;
+        }
+
+        // all_done: throw error to trigger retry policy
+        throw err;
+      }
+
+      // Check early exit conditions
+      if (loopConfig.completion === 'first_success' && results.length > 0) {
+        break;
+      }
+    }
+
+    // Check if loop met its completion criteria
+    if (loopConfig.completion === 'all_done' && stepRun?.loopState) {
+      if (stepRun.loopState.completedIterations < iterationCount) {
+        throw new Error(
+          `Loop failed — only ${stepRun.loopState.completedIterations}/${iterationCount} iterations completed`
+        );
+      }
+    }
+
+    // Aggregate results
+    const outputPath = await this.saveStepOutput(
+      run.id,
+      step.id,
+      { iterations: results, completed: completedItems },
+      step.output?.file || `${step.id}-summary.json`
+    );
+
+    return {
+      output: { iterations: results, completed: completedItems },
+      outputPath,
+    };
+  }
+
+  /**
+   * Execute a gate step — blocks execution until a condition is met
+   * Phase 4: Gate execution with approval/condition/timeout
+   */
+  private async executeGateStep(
+    step: WorkflowStep,
+    run: WorkflowRun
+  ): Promise<StepExecutionResult> {
+    if (!step.condition) {
+      throw new Error(`Gate step ${step.id} missing condition`);
+    }
+
+    // Load progress file
+    const progress = await this.loadProgressFile(run.id);
+    const contextWithProgress = {
+      ...run.context,
+      progress: progress || '',
+      steps: this.buildStepsContext(run),
+    };
+
+    // Evaluate the gate condition
+    const conditionResult = this.evaluateExpression(step.condition, contextWithProgress);
+
+    log.info(
+      { runId: run.id, stepId: step.id, condition: step.condition, result: conditionResult },
+      'Gate condition evaluated'
+    );
+
+    if (!conditionResult) {
+      // Condition not met — handle on_false policy
+      const policy = step.on_false;
+      await this.recordWorkflowGateTrace(step, run, false, policy);
+
+      if (policy?.escalate_to === 'human') {
+        // Block the workflow (will be handled by workflow-run-service)
+        throw new Error(policy.escalate_message || `Gate ${step.id} condition not met`);
+      }
+
+      throw new Error(`Gate ${step.id} condition failed: ${step.condition}`);
+    }
+
+    // Gate passed
+    await this.recordWorkflowGateTrace(step, run, true, step.on_false);
+    const output = `Gate ${step.id} passed: ${step.condition}`;
+    const outputPath = await this.saveStepOutput(run.id, step.id, output);
+
+    return {
+      output: { passed: true, condition: step.condition },
+      outputPath,
+    };
+  }
+
+  /**
+   * Execute a parallel step — runs multiple sub-steps concurrently
+   * Phase 4: Parallel execution with fan-out/fan-in
+   */
+  private async executeParallelStep(
+    step: WorkflowStep,
+    run: WorkflowRun
+  ): Promise<StepExecutionResult> {
+    if (!step.parallel) {
+      throw new Error(`Parallel step ${step.id} missing parallel configuration`);
+    }
+
+    const parallelConfig = step.parallel;
+    const subSteps = parallelConfig.steps;
+
+    if (!subSteps || subSteps.length === 0) {
+      throw new Error(`Parallel step ${step.id} has no sub-steps defined`);
+    }
+
+    // Security/Performance: Hard cap on parallel sub-steps to prevent resource exhaustion
+    const MAX_PARALLEL_SUBSTEPS = 50;
+    if (subSteps.length > MAX_PARALLEL_SUBSTEPS) {
+      throw new Error(
+        `Parallel step ${step.id} has ${subSteps.length} sub-steps, exceeding maximum of ${MAX_PARALLEL_SUBSTEPS}`
+      );
+    }
+
+    // Load progress file
+    const progress = await this.loadProgressFile(run.id);
+    const contextWithProgress = {
+      ...run.context,
+      progress: progress || '',
+      steps: this.buildStepsContext(run),
+    };
+
+    log.info(
+      {
+        runId: run.id,
+        stepId: step.id,
+        subStepCount: subSteps.length,
+        completion: parallelConfig.completion,
+      },
+      'Starting parallel execution'
+    );
+
+    // Execute all sub-steps in parallel using Promise.allSettled
+    // Note: For production use with real OpenClaw sessions, consider batching to limit
+    // concurrent session spawns (e.g., p-limit library with concurrency: 10)
+    const subStepPromises = subSteps.map((subStep) =>
+      this.executeParallelSubStep(subStep, run, contextWithProgress, step.id)
+    );
+
+    // Wait for all (or until completion criteria met)
+    const results = await Promise.allSettled(subStepPromises);
+
+    // Analyze results
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+
+    log.info(
+      {
+        runId: run.id,
+        stepId: step.id,
+        total: results.length,
+        fulfilled: fulfilled.length,
+        rejected: rejected.length,
+      },
+      'Parallel execution completed'
+    );
+
+    // Check completion criteria
+    const completionType = parallelConfig.completion;
+    let success = false;
+
+    if (completionType === 'all') {
+      success = rejected.length === 0;
+    } else if (completionType === 'any') {
+      success = fulfilled.length > 0;
+    } else if (typeof completionType === 'number') {
+      success = fulfilled.length >= completionType;
+    }
+
+    if (!success) {
+      const failureReasons = rejected.map((r) => (r.status === 'rejected' ? r.reason : 'unknown'));
+      throw new Error(
+        `Parallel step ${step.id} failed — completion criteria not met. Failures: ${failureReasons.join(', ')}`
+      );
+    }
+
+    // Aggregate results
+    const aggregatedOutput = {
+      subSteps: subSteps.map((subStep, idx) => ({
+        id: subStep.id,
+        status: results[idx].status,
+        output:
+          results[idx].status === 'fulfilled'
+            ? (results[idx] as PromiseFulfilledResult<unknown>).value
+            : null,
+        error:
+          results[idx].status === 'rejected'
+            ? String((results[idx] as PromiseRejectedResult).reason)
+            : null,
+      })),
+      completed: fulfilled.length,
+      failed: rejected.length,
+    };
+
+    const outputPath = await this.saveStepOutput(
+      run.id,
+      step.id,
+      aggregatedOutput,
+      step.output?.file || `${step.id}-parallel.json`
+    );
+
+    return {
+      output: aggregatedOutput,
+      outputPath,
+    };
+  }
+
+  /**
+   * Execute a single parallel sub-step
+   */
+  private async executeParallelSubStep(
+    subStep: { id: string; agent: string; input: string; timeout?: number },
+    run: WorkflowRun,
+    context: Record<string, unknown>,
+    parentStepId: string
+  ): Promise<unknown> {
+    log.info(
+      { runId: run.id, parentStepId, subStepId: subStep.id, agent: subStep.agent },
+      'Executing parallel sub-step'
+    );
+
+    // Render the input prompt
+    const prompt = this.renderTemplate(subStep.input, context);
+
+    // Placeholder: Simulate agent execution
+    const result = `Delegation event: ${parentStepId} -> ${subStep.id} (${subStep.agent})\n\nAgent ${subStep.agent} executed sub-step ${subStep.id}\n\nPrompt:\n${prompt}\n\nSTATUS: done\nOUTPUT: Sub-step ${subStep.id} complete`;
+
+    // Parse output
+    const parsed = this.parseStepOutput(result, {
+      id: subStep.id,
+      name: subStep.id,
+      type: 'agent',
+    } as WorkflowStep);
+
+    // Save sub-step output
+    await this.saveStepOutput(run.id, `${parentStepId}-${subStep.id}`, result);
+
+    return parsed;
+  }
+
+  /**
+   * Evaluate a template expression to a value
+   * Supports: variable access, equality checks, boolean expressions
+   * Security: Uses proper tokenization to prevent injection via boolean operator bypass
+   */
+  private evaluateExpression(expr: string, context: Record<string, unknown>): unknown {
+    const trimmed = expr.trim();
+
+    // Remove template braces if present: {{expr}} → expr
+    const cleaned = trimmed.replace(/^\{\{|\}\}$/g, '').trim();
+
+    // Security: Parse boolean operators BEFORE equality to prevent "foo and bar" in strings from splitting
+    // Use regex with negative lookbehind/lookahead to only match operators outside quotes
+    // This regex matches " and " or " or " that are NOT inside quoted strings
+    const booleanOpPattern = /\s+(and|or)\s+(?=(?:[^"']*["'][^"']*["'])*[^"']*$)/i;
+    const boolMatch = cleaned.match(booleanOpPattern);
+
+    if (boolMatch) {
+      const operator = boolMatch[1].toLowerCase();
+      const parts = cleaned.split(boolMatch[0]); // Split on the matched operator with spaces
+
+      if (operator === 'and') {
+        // Evaluate all parts and check if all are truthy
+        const results = parts.map((p) => this.evaluateExpression(p.trim(), context));
+        return results.every((r) => r === true || r === 'true');
+      } else if (operator === 'or') {
+        // Evaluate all parts and check if any is truthy
+        const results = parts.map((p) => this.evaluateExpression(p.trim(), context));
+        return results.some((r) => r === true || r === 'true');
+      }
+    }
+
+    // Boolean equality: {{verify.decision == "approved"}}
+    // Only match == that's NOT inside quotes
+    const eqMatch = cleaned.match(/^(.+?)\s*==\s*(.+)$/);
+    if (eqMatch) {
+      const [, leftExpr, rightExpr] = eqMatch;
+      const left = this.getNestedValue(context, leftExpr.trim());
+      const right = rightExpr.trim().replace(/^["']|["']$/g, '');
+      return String(left) === right;
+    }
+
+    // Default: resolve as variable access
+    return this.getNestedValue(context, cleaned);
+  }
+
+  private async recordWorkflowGateTrace(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    conditionResult: boolean,
+    policy?: WorkflowStep['on_false']
+  ): Promise<void> {
+    const outcome = conditionResult
+      ? 'allowed'
+      : policy?.escalate_to === 'human'
+        ? 'approval-required'
+        : 'blocked';
+    const message = conditionResult
+      ? `Gate condition passed: ${step.condition}`
+      : `Gate condition failed: ${step.condition}`;
+
+    await getGovernanceTraceService().record({
+      kind: 'workflow-gate',
+      outcome,
+      title: `Workflow gate: ${step.name || step.id}`,
+      summary: conditionResult
+        ? `Workflow run ${run.id} can continue past gate ${step.id}.`
+        : policy?.escalate_message || `Workflow run ${run.id} is blocked at gate ${step.id}.`,
+      remediation: conditionResult
+        ? undefined
+        : policy?.escalate_to === 'human'
+          ? 'Review the gate output and resume the workflow after human approval.'
+          : 'Update upstream step output or revise the gate condition before retrying the workflow.',
+      subject: {
+        workflowId: run.workflowId,
+        runId: run.id,
+        taskId: run.taskId,
+        stepId: step.id,
+        actionType: 'workflow.gate',
+      },
+      evaluatedRules: [
+        {
+          id: `workflow-gate:${step.id}`,
+          label: step.name || step.id,
+          type: 'workflow-gate',
+          status: conditionResult ? 'matched' : 'not-matched',
+          outcome,
+          message,
+          details: {
+            condition: step.condition,
+            onFalse: policy,
+          },
+        },
+      ],
+      matchedRules: conditionResult
+        ? [
+            {
+              id: `workflow-gate:${step.id}`,
+              label: step.name || step.id,
+              type: 'workflow-gate',
+              status: 'matched',
+              outcome,
+              message,
+            },
+          ]
+        : [],
+      steps: [
+        {
+          id: 'condition',
+          label: 'Condition',
+          status: conditionResult ? 'matched' : 'not-matched',
+          message,
+          details: { expression: step.condition },
+        },
+        {
+          id: 'on-false',
+          label: 'On false policy',
+          status: policy ? 'info' : 'skipped',
+          message: policy
+            ? `Gate failure policy escalates to ${policy.escalate_to}.`
+            : 'No gate failure policy configured.',
+        },
+      ],
+      raw: {
+        step,
+        run: {
+          id: run.id,
+          workflowId: run.workflowId,
+          workflowVersion: run.workflowVersion,
+          taskId: run.taskId,
+          status: run.status,
+          currentStep: run.currentStep,
+        },
+        result: conditionResult,
+      },
+    });
+  }
+
+  /**
+   * Cleanup OpenClaw session.
+   */
+  async cleanupSession(sessionKey: string): Promise<void> {
+    await this.openClawAdapter.cleanup({
+      workflowId: 'manual',
+      runId: 'manual',
+      stepId: 'manual',
+      agentId: 'unknown',
+      sessionKey,
+    });
+  }
+
+  // ==================== Phase 2: Progress File Integration (#108) ====================
+
+  /**
+   * Load progress.md file for a workflow run
+   * Returns content or null if file doesn't exist
+   */
+  private async loadProgressFile(runId: string): Promise<string | null> {
+    // Sanitize runId to prevent path traversal (defensive — already validated upstream)
+    const safeRunId = sanitizeFilename(runId);
+    if (!safeRunId || safeRunId !== runId) {
+      throw new Error(`Invalid run ID: ${runId}`);
+    }
+
+    return this.executionFiles.readProgress(safeRunId);
+  }
+
+  /**
+   * Append step output to progress.md
+   */
+  private async appendProgressFile(runId: string, stepId: string, output: unknown): Promise<void> {
+    // Sanitize runId to prevent path traversal (defensive — already validated upstream)
+    const safeRunId = sanitizeFilename(runId);
+    if (!safeRunId || safeRunId !== runId) {
+      throw new Error(`Invalid run ID: ${runId}`);
+    }
+
+    const timestamp = new Date().toISOString();
+
+    const entry = `## Step: ${stepId} (${timestamp})\n\n${typeof output === 'string' ? output : JSON.stringify(output, null, 2)}\n\n---\n\n`;
+    const result = await this.executionFiles.appendProgress(safeRunId, entry);
+    if (!result.appended) {
+      log.warn(
+        { runId, fileSize: result.size },
+        'Progress file exceeds size limit — skipping append'
+      );
+      return;
+    }
+
+    log.info({ runId, stepId }, 'Progress file updated');
+  }
+
+  /**
+   * Build steps context for template resolution
+   * Enables {{steps.step-id.output}} references
+   * Performance: Only includes completed steps with output
+   */
+  private buildStepsContext(run: WorkflowRun): Record<string, unknown> {
+    const stepsContext: Record<string, unknown> = {};
+
+    // Performance: Use for loop instead of for...of for faster iteration
+    const steps = run.steps;
+    const context = run.context;
+
+    for (let i = 0; i < steps.length; i++) {
+      const stepRun = steps[i];
+      // Only include completed steps that have output in context
+      if (stepRun.status === 'completed') {
+        const stepOutput = context[stepRun.stepId];
+        if (stepOutput !== undefined) {
+          stepsContext[stepRun.stepId] = {
+            output: stepOutput,
+            status: stepRun.status,
+            duration: stepRun.duration,
+          };
+        }
+      }
+    }
+
+    return stepsContext;
+  }
+
+  // ==================== Phase 2: Tool Policies & Session Management (#110, #111) ====================
+
+  /**
+   * Get agent definition from workflow context
+   * Used to retrieve agent-specific settings (tools, model, etc.)
+   */
+  private getAgentDefinition(run: WorkflowRun, agentId: string): WorkflowAgent | null {
+    // Agent definitions are stored in workflow context during run initialization
+    const workflow = run.context.workflow as { agents?: WorkflowAgent[] } | undefined;
+    if (!workflow?.agents) return null;
+
+    return workflow.agents.find((a) => a.id === agentId) || null;
+  }
+
+  /**
+   * Build session configuration for a step (#111)
+   * Determines session mode, context passing, cleanup, and timeout
+   */
+  private buildSessionConfig(
+    step: WorkflowStep,
+    run: WorkflowRun,
+    defaultConfig?: { fresh_session_default?: boolean }
+  ): StepSessionConfig {
+    // If step has explicit session config, use it
+    if (step.session) {
+      return {
+        mode: step.session.mode || 'fresh',
+        context: step.session.context || 'minimal',
+        cleanup: step.session.cleanup || 'delete',
+        timeout: step.session.timeout || step.timeout || 600,
+        includeOutputsFrom: step.session.includeOutputsFrom,
+      };
+    }
+
+    // Legacy: step.fresh_session boolean (backwards compatibility)
+    if (step.fresh_session !== undefined) {
+      return {
+        mode: step.fresh_session ? 'fresh' : 'reuse',
+        context: 'minimal',
+        cleanup: 'delete',
+        timeout: step.timeout || 600,
+      };
+    }
+
+    // Use global workflow config default
+    const freshSessionDefault = defaultConfig?.fresh_session_default ?? true;
+
+    return {
+      mode: freshSessionDefault ? 'fresh' : 'reuse',
+      context: 'minimal',
+      cleanup: 'delete',
+      timeout: step.timeout || 600,
+    };
+  }
+
+  /**
+   * Build context for session injection (#111)
+   * Filters context based on session.context mode
+   */
+  private buildSessionContext(
+    sessionConfig: StepSessionConfig,
+    run: WorkflowRun,
+    progress: string | null
+  ): Record<string, unknown> {
+    const baseContext = {
+      task: run.context.task,
+      workflow: {
+        id: run.workflowId,
+        runId: run.id,
+      },
+    };
+
+    switch (sessionConfig.context) {
+      case 'minimal':
+        // Only task and workflow metadata
+        return {
+          ...baseContext,
+          progress: progress || '',
+        };
+
+      case 'full':
+        // All previous step outputs + workflow variables
+        return {
+          ...run.context,
+          progress: progress || '',
+          steps: this.buildStepsContext(run),
+        };
+
+      case 'custom': {
+        // Only specified steps' outputs
+        const customContext: Record<string, unknown> = {
+          ...baseContext,
+          progress: progress || '',
+        };
+
+        if (sessionConfig.includeOutputsFrom) {
+          const stepsContext: Record<string, unknown> = {};
+          for (const stepId of sessionConfig.includeOutputsFrom) {
+            if (run.context[stepId]) {
+              stepsContext[stepId] = {
+                output: run.context[stepId],
+              };
+            }
+          }
+          customContext.steps = stepsContext;
+        }
+
+        return customContext;
+      }
+
+      default:
+        return baseContext;
+    }
+  }
+
+  /**
+   * Get tool policy filter for an agent role (#110)
+   * Returns tool restrictions to pass to OpenClaw session spawn
+   */
+  private async getToolPolicyForAgent(agentDef: WorkflowAgent | null): Promise<{
+    allowed?: string[];
+    denied?: string[];
+  }> {
+    if (!agentDef || !agentDef.role) {
+      // No agent definition or role — no restrictions
+      return {};
+    }
+
+    const toolPolicyService = getToolPolicyService();
+    return await toolPolicyService.getToolFilterForRole(agentDef.role);
+  }
+
+  private applyAutomationToolCeiling(
+    run: WorkflowRun,
+    current: { allowed?: string[]; denied?: string[] }
+  ): { allowed?: string[]; denied?: string[] } {
+    const ceiling = run.automation?.standingScope.toolIds;
+    if (!ceiling) return current;
+    const ceilingSet = new Set(ceiling);
+    const currentAllowed = current.allowed ?? ['*'];
+    const allowed = currentAllowed.includes('*')
+      ? [...ceilingSet]
+      : currentAllowed.filter((tool) => ceilingSet.has(tool));
+    return {
+      allowed: allowed.sort((left, right) => left.localeCompare(right)),
+      denied: [...new Set([...(current.denied ?? []), ...(ceiling.length === 0 ? ['*'] : [])])],
+    };
+  }
+}

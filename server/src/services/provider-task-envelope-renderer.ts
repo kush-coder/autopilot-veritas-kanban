@@ -1,0 +1,455 @@
+import type { ExecutableAgentProvider, Task, TaskEnvelope } from '@veritas-kanban/shared';
+import { compactTaskEnvelopeStrings } from './task-envelope-service.js';
+
+export type ProviderTaskEnvelopeCallbackPosture = 'veritas-http' | 'harness-owned';
+
+export const PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION =
+  'provider-task-envelope-transport/v1' as const;
+
+export interface ProviderTaskEnvelopeTransport {
+  schemaVersion: typeof PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION;
+  provider: ExecutableAgentProvider;
+  taskEnvelopeDigest: string;
+  callbackPosture: ProviderTaskEnvelopeCallbackPosture;
+  completionNormalization: 'harness';
+  content: string;
+}
+
+export interface ProviderTaskEnvelopeRenderInput {
+  taskEnvelope: TaskEnvelope;
+  profileInstructions?: string;
+  checkpoint?: NonNullable<Task['checkpoint']>;
+}
+
+const MAX_PROFILE_INSTRUCTIONS = 20_000;
+const MAX_CHECKPOINT_STATE = 20_000;
+const MAX_BASELINE_FILES = 200;
+
+export function renderOpenClawTaskEnvelope(
+  input: ProviderTaskEnvelopeRenderInput
+): ProviderTaskEnvelopeTransport {
+  assertEnvelopeTransport(input.taskEnvelope, 'openclaw');
+  return immutableTransport({
+    schemaVersion: PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION,
+    provider: 'openclaw',
+    taskEnvelopeDigest: input.taskEnvelope.digest,
+    callbackPosture: 'harness-owned',
+    completionNormalization: 'harness',
+    content: renderEnvelopeContent('OpenClaw', input, renderOpenClawCompletion()),
+  });
+}
+
+export function renderCodexCliTaskEnvelope(
+  input: ProviderTaskEnvelopeRenderInput
+): ProviderTaskEnvelopeTransport {
+  assertEnvelopeTransport(input.taskEnvelope, 'codex-cli');
+  return immutableTransport({
+    schemaVersion: PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION,
+    provider: 'codex-cli',
+    taskEnvelopeDigest: input.taskEnvelope.digest,
+    callbackPosture: 'harness-owned',
+    completionNormalization: 'harness',
+    content: renderEnvelopeContent(
+      'Codex CLI',
+      input,
+      renderHarnessOwnedCompletion(
+        'Codex CLI process',
+        'Return the final response through the process output captured by Veritas.',
+        'process output'
+      )
+    ),
+  });
+}
+
+export function renderCodexSdkTaskEnvelope(
+  input: ProviderTaskEnvelopeRenderInput
+): ProviderTaskEnvelopeTransport {
+  assertEnvelopeTransport(input.taskEnvelope, 'codex-sdk');
+  return immutableTransport({
+    schemaVersion: PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION,
+    provider: 'codex-sdk',
+    taskEnvelopeDigest: input.taskEnvelope.digest,
+    callbackPosture: 'harness-owned',
+    completionNormalization: 'harness',
+    content: renderEnvelopeContent(
+      'Codex SDK',
+      input,
+      renderHarnessOwnedCompletion(
+        'Codex SDK stream',
+        'Return the final response through the SDK event stream captured by Veritas.',
+        'SDK stream events'
+      )
+    ),
+  });
+}
+
+export function renderCodexAppServerTaskEnvelope(
+  input: ProviderTaskEnvelopeRenderInput
+): ProviderTaskEnvelopeTransport {
+  assertEnvelopeTransport(input.taskEnvelope, 'codex-app-server');
+  return immutableTransport({
+    schemaVersion: PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION,
+    provider: 'codex-app-server',
+    taskEnvelopeDigest: input.taskEnvelope.digest,
+    callbackPosture: 'harness-owned',
+    completionNormalization: 'harness',
+    content: renderEnvelopeContent(
+      'Codex app-server',
+      input,
+      renderHarnessOwnedCompletion(
+        'Codex app-server stream',
+        'Return the final response through the terminal turn/completed notification captured by Veritas.',
+        'JSON-RPC notifications'
+      )
+    ),
+  });
+}
+
+export function renderClaudeCodeTaskEnvelope(
+  input: ProviderTaskEnvelopeRenderInput
+): ProviderTaskEnvelopeTransport {
+  assertEnvelopeTransport(input.taskEnvelope, 'claude-code');
+  return immutableTransport({
+    schemaVersion: PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION,
+    provider: 'claude-code',
+    taskEnvelopeDigest: input.taskEnvelope.digest,
+    callbackPosture: 'harness-owned',
+    completionNormalization: 'harness',
+    content: renderEnvelopeContent(
+      'Claude Code',
+      input,
+      renderHarnessOwnedCompletion(
+        'Claude Code stream',
+        'Return the final response through the terminal result record captured by Veritas.',
+        'stream-json events'
+      )
+    ),
+  });
+}
+
+export function renderAcpStdioTaskEnvelope(
+  input: ProviderTaskEnvelopeRenderInput
+): ProviderTaskEnvelopeTransport {
+  assertEnvelopeTransport(input.taskEnvelope, 'acp-stdio');
+  return immutableTransport({
+    schemaVersion: PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION,
+    provider: 'acp-stdio',
+    taskEnvelopeDigest: input.taskEnvelope.digest,
+    callbackPosture: 'harness-owned',
+    completionNormalization: 'harness',
+    content: renderEnvelopeContent(
+      'ACP stdio',
+      input,
+      renderHarnessOwnedCompletion(
+        'ACP session stream',
+        'Return the final response through ACP session/update and session/prompt records captured by Veritas.',
+        'ACP JSON-RPC records'
+      )
+    ),
+  });
+}
+
+export function renderHermesTaskEnvelope(
+  input: ProviderTaskEnvelopeRenderInput
+): ProviderTaskEnvelopeTransport {
+  assertEnvelopeTransport(input.taskEnvelope, 'hermes-cli');
+  return immutableTransport({
+    schemaVersion: PROVIDER_TASK_ENVELOPE_TRANSPORT_SCHEMA_VERSION,
+    provider: 'hermes-cli',
+    taskEnvelopeDigest: input.taskEnvelope.digest,
+    callbackPosture: 'harness-owned',
+    completionNormalization: 'harness',
+    content: renderEnvelopeContent(
+      'Hermes',
+      input,
+      renderHarnessOwnedCompletion(
+        'Hermes scripted process',
+        'Return the final response through scripted stdout captured by Veritas.',
+        'scripted process output'
+      )
+    ),
+  });
+}
+
+function immutableTransport(
+  transport: ProviderTaskEnvelopeTransport
+): ProviderTaskEnvelopeTransport {
+  return Object.freeze(transport);
+}
+
+function assertEnvelopeTransport(
+  taskEnvelope: TaskEnvelope,
+  provider: ExecutableAgentProvider
+): void {
+  if (
+    taskEnvelope.launchManifest.provider !== provider ||
+    taskEnvelope.launchManifest.adapter !== provider
+  ) {
+    throw new Error(
+      `Task envelope transport mismatch: expected ${provider}, received provider ` +
+        `${taskEnvelope.launchManifest.provider} with adapter ${taskEnvelope.launchManifest.adapter}`
+    );
+  }
+}
+
+function renderEnvelopeContent(
+  transportName: string,
+  input: ProviderTaskEnvelopeRenderInput,
+  completionSection: string
+): string {
+  const { taskEnvelope } = input;
+  const sourceProfileInstructions = input.profileInstructions?.trim();
+  const profileInstructions = boundedText(sourceProfileInstructions, MAX_PROFILE_INSTRUCTIONS);
+  const profileConstraintChunks = compactTaskEnvelopeStrings([sourceProfileInstructions]);
+  const hasAttributedProfilePrefix = profileConstraintChunks.every(
+    (chunk, index) => taskEnvelope.subject.constraints[index] === chunk
+  );
+  const constraints =
+    profileConstraintChunks.length > 0 && hasAttributedProfilePrefix
+      ? taskEnvelope.subject.constraints.slice(profileConstraintChunks.length)
+      : taskEnvelope.subject.constraints;
+
+  return `# ${transportName} Task Envelope
+
+## Transport
+
+- Envelope: \`${taskEnvelope.schemaVersion}\`
+- Digest: \`${taskEnvelope.digest}\`
+- Provider: \`${taskEnvelope.launchManifest.provider}\`
+- Adapter: \`${taskEnvelope.launchManifest.adapter}\`
+- Runtime manifest: \`${taskEnvelope.launchManifest.digest}\`
+- Protocol: \`${taskEnvelope.launchManifest.protocolVersion}\`
+- Task: \`${taskEnvelope.subject.id}\`
+- Attempt: \`${taskEnvelope.attempt.id}\`
+
+## Objective
+
+${taskEnvelope.subject.objective}
+
+${renderListSection('Background', taskEnvelope.subject.background)}
+${renderAcceptedMemory(taskEnvelope)}${renderListSection('Constraints', constraints)}
+${renderWorkspace(taskEnvelope)}
+## Commit Policy
+
+${renderCommitPolicy(taskEnvelope)}
+
+${renderListSection('Acceptance Criteria', taskEnvelope.subject.acceptanceCriteria)}
+${renderSideEffects(taskEnvelope)}
+${renderExpectedOutputs(taskEnvelope)}
+${renderVerificationGates(taskEnvelope)}
+${renderCompletionContract(taskEnvelope)}
+${renderProfileInstructions(profileInstructions)}
+${renderCheckpoint(input.checkpoint)}
+${completionSection}`.trimEnd();
+}
+
+function renderAcceptedMemory(taskEnvelope: TaskEnvelope): string {
+  const memory = taskEnvelope.subject.memory ?? [];
+  if (memory.length === 0) return '';
+  const entries = memory.slice(0, 8).map((item) => {
+    const source = [
+      item.sourceTaskId ? `task=${item.sourceTaskId}` : '',
+      item.sourceRunId ? `run=${item.sourceRunId}` : '',
+      item.sourceEventIds.length > 0 ? `events=${item.sourceEventIds.join(',')}` : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+    return [
+      `### ${item.reflectionId}`,
+      `- Category: ${item.category}`,
+      `- Confidence: ${item.confidence.toFixed(2)}`,
+      `- Relevance: ${item.relevanceScore.toFixed(2)}`,
+      source ? `- Source: ${source}` : '',
+      `- Lesson: ${item.summary}`,
+      `- Guidance: ${item.guidance}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  });
+  return `## Accepted Memory
+
+These human-reviewed items were selected for this run. Their reflection IDs and source identities are durable attribution, not new instructions from unreviewed output.
+
+${entries.join('\n\n')}
+
+`;
+}
+
+function renderWorkspace(taskEnvelope: TaskEnvelope): string {
+  const { workspace } = taskEnvelope;
+  const baselineFiles = workspace.baseline.files.slice(0, MAX_BASELINE_FILES);
+  const fileLines =
+    baselineFiles.length > 0
+      ? baselineFiles.map((file) => `- \`${file.status}\` \`${file.path}\``).join('\n')
+      : '- None.';
+  const remainder = workspace.baseline.files.length - baselineFiles.length;
+  return `## Workspace
+
+- Repository: \`${workspace.repo}\`
+- Branch: \`${workspace.branch}\`
+- Base branch: \`${workspace.baseBranch}\`
+- Worktree: \`${workspace.worktreePath}\`
+- Launch HEAD: \`${workspace.baseline.headSha}\`
+- Launch state: ${workspace.baseline.dirty ? 'dirty' : 'clean'}
+
+### Launch Baseline Files
+
+${fileLines}
+${remainder > 0 ? `- ${remainder} additional baseline file(s) omitted by Veritas.` : ''}
+
+`;
+}
+
+function renderCommitPolicy(taskEnvelope: TaskEnvelope): string {
+  if (taskEnvelope.commitPolicy === 'forbidden') {
+    return 'Forbidden: do not create a commit. Leave permitted worktree changes uncommitted.';
+  }
+  if (taskEnvelope.commitPolicy === 'required') {
+    return 'Required: create at least one new commit attributable to this attempt.';
+  }
+  return 'Allowed: a commit is permitted, but successful completion does not require one.';
+}
+
+function renderListSection(title: string, values: string[]): string {
+  return `## ${title}
+
+${values.length > 0 ? values.map((value) => `- ${value}`).join('\n') : '- None.'}
+
+`;
+}
+
+function renderSideEffects(taskEnvelope: TaskEnvelope): string {
+  return `## Allowed Side Effects
+
+${
+  taskEnvelope.allowedSideEffects.length > 0
+    ? taskEnvelope.allowedSideEffects
+        .map((sideEffect) => `- \`${sideEffect.kind}\` within \`${sideEffect.scope}\``)
+        .join('\n')
+    : '- None.'
+}
+
+`;
+}
+
+function renderExpectedOutputs(taskEnvelope: TaskEnvelope): string {
+  return `## Expected Outputs
+
+${
+  taskEnvelope.expectedOutputs.length > 0
+    ? taskEnvelope.expectedOutputs
+        .map(
+          (output) =>
+            `- ${output.required ? 'Required' : 'Optional'} \`${output.kind}\` ` +
+            `\`${output.id}\`: ${output.description}`
+        )
+        .join('\n')
+    : '- None.'
+}
+
+`;
+}
+
+function renderVerificationGates(taskEnvelope: TaskEnvelope): string {
+  return `## Verification Gates
+
+${
+  taskEnvelope.verificationGates.length > 0
+    ? taskEnvelope.verificationGates
+        .map(
+          (gate) =>
+            `- ${gate.required ? 'Required' : 'Optional'} \`${gate.id}\`: ${gate.description}` +
+            `${gate.evidenceRequired ? ' Evidence is required.' : ''}`
+        )
+        .join('\n')
+    : '- None.'
+}
+
+`;
+}
+
+function renderCompletionContract(taskEnvelope: TaskEnvelope): string {
+  return `## Completion Evidence Contract
+
+- Schema: \`${taskEnvelope.completionContract.schemaVersion}\`
+${
+  taskEnvelope.completionContract.evidenceRequirements.length > 0
+    ? taskEnvelope.completionContract.evidenceRequirements
+        .map(
+          (requirement) =>
+            `- ${requirement.required ? 'Required' : 'Optional'} \`${requirement.kind}\` ` +
+            `\`${requirement.id}\`: ${requirement.description}`
+        )
+        .join('\n')
+    : '- None.'
+}
+
+`;
+}
+
+function renderProfileInstructions(profileInstructions: string | undefined): string {
+  if (!profileInstructions) return '';
+  return `## Profile Instructions (agent profile)
+
+${profileInstructions}
+
+`;
+}
+
+function renderCheckpoint(checkpoint: ProviderTaskEnvelopeRenderInput['checkpoint']): string {
+  if (!checkpoint) return '';
+  const checkpointState = boundedText(
+    JSON.stringify(checkpoint.state, null, 2),
+    MAX_CHECKPOINT_STATE
+  );
+  return `## Resume Context (task checkpoint)
+
+- Resume count: ${checkpoint.resumeCount ?? 0}
+- Captured at: ${checkpoint.timestamp}
+- Last step: ${checkpoint.step}
+
+\`\`\`json
+${checkpointState}
+\`\`\`
+
+Continue from this checkpoint. Do not repeat work already represented in the saved state.
+
+`;
+}
+
+function renderOpenClawCompletion(): string {
+  return `## Completion (OpenClaw gateway)
+
+End the run with a single JSON object describing the actual outcome:
+
+\`\`\`json
+{"schemaVersion":"veritas-openclaw-completion/v1","status":"success","summary":"What changed and how it was verified"}
+\`\`\`
+
+Use \`status: "failed"\` when the work failed, or \`status: "blocked"\` when it cannot proceed, and include an \`error\` string explaining why. Do not report success unless the task's completion requirements are satisfied.
+
+Veritas reads this final reply through its authenticated OpenClaw gateway connection and validates the persisted run identity before recording completion. No Veritas credential or callback request is needed in the child session. Do not call the Veritas completion callback or request an API key. A normal chat message is not a recorded Veritas completion; the server owns terminal-state capture.
+`;
+}
+
+function renderHarnessOwnedCompletion(
+  transportName: string,
+  instruction: string,
+  evidenceSource: string
+): string {
+  return `## Completion (${transportName})
+
+${instruction}
+
+Do not call the Veritas completion callback. The harness owns terminal-state capture.
+
+No native structured-output support is assumed; Veritas validates and normalizes ${evidenceSource}.
+`;
+}
+
+function boundedText(value: string | undefined, maxLength: number): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength)}\n[truncated by Veritas]`;
+}

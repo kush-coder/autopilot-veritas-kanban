@@ -1,0 +1,1250 @@
+# CLI Guide
+
+Comprehensive guide to the `vk` command-line tool for Veritas Kanban.
+
+> 📋 Back to [README](../README.md) · [Features](FEATURES.md) · [Changelog](../CHANGELOG.md)
+
+---
+
+## Table of Contents
+
+- [Introduction](#introduction)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Command Reference](#command-reference)
+  - [Workflow Commands](#workflow-commands)
+  - [Task Commands](#task-commands)
+  - [Time Tracking](#time-tracking)
+  - [Comments](#comments)
+  - [Agent Status](#agent-status)
+  - [Project Management](#project-management)
+  - [Agent Commands](#agent-commands)
+  - [Admission Commands](#admission-commands)
+  - [Durable Goal Commands](#durable-goal-commands)
+  - [Automation Commands](#automation-commands)
+  - [Scheduler Commands](#scheduler-commands)
+  - [Queue Monitor Commands](#queue-monitor-commands)
+  - [GitHub Sync](#github-sync)
+  - [Utilities](#utilities)
+- [Workflow Commands Deep Dive](#workflow-commands-deep-dive)
+- [Scripting & Automation](#scripting--automation)
+- [Configuration](#configuration)
+- [Tips & Tricks](#tips--tricks)
+
+---
+
+## Introduction
+
+`vk` is the command-line interface for [Veritas Kanban](../README.md) — a local-first task management and AI agent orchestration platform. It lets you manage tasks, track time, coordinate agents, and run your entire project workflow without leaving the terminal.
+
+> 💡 **Philosophy:** _"Automate everything you do twice."_
+>
+> This principle — championed by Boris Cherny, creator of Claude Code — is at the heart of the v1.4 CLI additions. If you're doing the same multi-step workflow every time you start or finish a task, that workflow should be a single command. That's exactly what `vk begin` and `vk done` deliver.
+
+The CLI talks to the Veritas Kanban server over its REST API, so any command you run in the terminal has the same effect as clicking through the web UI or calling the API directly with curl.
+
+---
+
+## Installation
+
+```bash
+# Clone the repository (if you haven't already)
+git clone https://github.com/BradGroux/veritas-kanban.git
+cd veritas-kanban
+
+# Install dependencies
+pnpm install
+
+# Build shared code and the CLI before linking
+pnpm --filter @veritas-kanban/shared build
+pnpm --filter @veritas-kanban/cli build
+
+# Link the CLI globally from the CLI package
+cd cli
+npm link
+```
+
+After linking, the `vk` command is available globally in your terminal.
+
+```bash
+vk --help
+vk setup
+```
+
+> **Prerequisite:** The Veritas Kanban server must be running for CLI commands to work.
+> Start it with `pnpm dev` from the repository root.
+
+---
+
+## Quick Start
+
+The complete task lifecycle in three commands:
+
+```bash
+# 1. Create a task
+vk create "Implement OAuth login" --type code --project my-app
+
+# 2. Start working — one command handles everything
+vk begin task_20260201_abc123
+
+# 3. Finish up — one command wraps it all
+vk done task_20260201_abc123 "Added OAuth2 with Google and GitHub providers"
+```
+
+That's it. `vk begin` sets the task to in-progress, starts the time tracker, and marks the agent as working. `vk done` stops the timer, marks the task done, adds a closing comment, and sets the agent to idle. What used to require 6+ API calls now takes 2 commands.
+
+---
+
+## Command Reference
+
+### Workflow Commands
+
+Composite commands that orchestrate multiple API calls into a single action.
+
+#### `vk begin <id>`
+
+Start working on a task. Orchestrates three actions in one command.
+
+```bash
+vk begin task_20260201_abc123
+```
+
+**What it does:**
+
+1. Sets task status to `in-progress`
+2. Starts the time tracker
+3. Updates agent status to `working` (auto-fetches task title)
+
+**Flags:**
+
+| Flag     | Description           |
+| -------- | --------------------- |
+| `--json` | Output result as JSON |
+
+---
+
+#### `vk done <id> "summary"`
+
+Complete a task with a summary. Orchestrates four actions in one command.
+
+```bash
+vk done task_20260201_abc123 "Added OAuth2 with Google and GitHub providers"
+```
+
+**What it does:**
+
+1. Stops the time tracker
+2. Sets task status to `done`
+3. Adds a comment with the summary text
+4. Updates agent status to `idle`
+
+**Flags:**
+
+| Flag     | Description           |
+| -------- | --------------------- |
+| `--json` | Output result as JSON |
+
+---
+
+#### `vk block <id> "reason"`
+
+Block a task with a reason.
+
+```bash
+vk block task_20260201_abc123 "Waiting on API credentials from client"
+```
+
+**What it does:**
+
+1. Sets task status to `blocked`
+2. Adds a comment with the block reason
+
+**Flags:**
+
+| Flag     | Description           |
+| -------- | --------------------- |
+| `--json` | Output result as JSON |
+
+---
+
+#### `vk unblock <id>`
+
+Unblock a task and resume work.
+
+```bash
+vk unblock task_20260201_abc123
+```
+
+**What it does:**
+
+1. Sets task status to `in-progress`
+2. Restarts the time tracker
+
+**Flags:**
+
+| Flag     | Description           |
+| -------- | --------------------- |
+| `--json` | Output result as JSON |
+
+---
+
+### Task Commands
+
+Core task management commands.
+
+#### `vk list`
+
+List tasks with optional filters.
+
+```bash
+vk list                           # All tasks
+vk list --status in-progress      # Filter by status
+vk list --type code               # Filter by type
+vk list --project my-app          # Filter by project
+vk list --status in-progress --type code  # Combine filters
+vk list --json                    # JSON output
+```
+
+**Aliases:** `ls`
+
+**Flags:**
+
+| Flag        | Description                                         |
+| ----------- | --------------------------------------------------- |
+| `--status`  | Filter by status (todo, in-progress, blocked, done) |
+| `--type`    | Filter by task type                                 |
+| `--project` | Filter by project name                              |
+| `--json`    | Output as JSON                                      |
+
+---
+
+#### `vk show <id>`
+
+Show detailed information for a task.
+
+```bash
+vk show task_20260201_abc123
+vk show abc123                    # Partial ID matching supported
+vk show abc123 --json
+```
+
+**Flags:**
+
+| Flag     | Description    |
+| -------- | -------------- |
+| `--json` | Output as JSON |
+
+---
+
+#### `vk create <title>`
+
+Create a new task.
+
+```bash
+vk create "Implement OAuth login"
+vk create "Fix button alignment" --type code --priority high --project my-app
+vk create "Audit without commits" --commit-policy forbidden
+```
+
+**Flags:**
+
+| Flag              | Description                                             |
+| ----------------- | ------------------------------------------------------- |
+| `--type`          | Task type (code, research, content, etc.)               |
+| `--priority`      | Priority level (low, medium, high)                      |
+| `--project`       | Project name                                            |
+| `--commit-policy` | Task commit policy (`forbidden`, `allowed`, `required`) |
+| `--json`          | Output as JSON                                          |
+
+---
+
+#### `vk update <id>`
+
+Update task fields.
+
+```bash
+vk update abc123 --status review
+vk update abc123 --title "New title" --priority high
+vk update abc123 --commit-policy required
+```
+
+**Flags:**
+
+| Flag              | Description                                             |
+| ----------------- | ------------------------------------------------------- |
+| `--status`        | New status                                              |
+| `--title`         | New title                                               |
+| `--priority`      | New priority                                            |
+| `--type`          | New type                                                |
+| `--project`       | New project                                             |
+| `--commit-policy` | Task commit policy (`forbidden`, `allowed`, `required`) |
+| `--json`          | Output as JSON                                          |
+
+---
+
+### Time Tracking
+
+Full time management from the terminal.
+
+#### `vk time start <id>`
+
+Start the time tracker for a task.
+
+```bash
+vk time start task_20260201_abc123
+```
+
+---
+
+#### `vk time stop <id>`
+
+Stop the time tracker.
+
+```bash
+vk time stop task_20260201_abc123
+```
+
+---
+
+#### `vk time entry <id> <seconds> "description"`
+
+Add a manual time entry.
+
+```bash
+vk time entry task_20260201_abc123 3600 "Implemented login flow"
+vk time entry abc123 1800 "Code review"
+```
+
+**Arguments:**
+
+| Argument        | Description                         |
+| --------------- | ----------------------------------- |
+| `<id>`          | Task ID (supports partial matching) |
+| `<seconds>`     | Duration in seconds                 |
+| `"description"` | Description of the work done        |
+
+---
+
+#### `vk time show <id>`
+
+Display time tracking summary for a task.
+
+```bash
+vk time show task_20260201_abc123
+vk time show abc123 --json
+```
+
+**Output includes:** total time, whether a timer is currently running, and individual time entries with descriptions.
+
+**Flags:**
+
+| Flag     | Description    |
+| -------- | -------------- |
+| `--json` | Output as JSON |
+
+---
+
+### Comments
+
+Add comments to tasks from the terminal.
+
+#### `vk comment <id> "text"`
+
+```bash
+vk comment task_20260201_abc123 "Fixed the race condition in the auth flow"
+vk comment abc123 "Completed OAuth integration" --author Veritas
+```
+
+**Flags:**
+
+| Flag       | Description                     |
+| ---------- | ------------------------------- |
+| `--author` | Author name (default: CLI user) |
+| `--json`   | Output as JSON                  |
+
+---
+
+### Agent Status
+
+Manage the global agent status indicator.
+
+#### `vk agent status`
+
+Show the current agent status.
+
+```bash
+vk agent status
+vk agent status --json
+```
+
+---
+
+#### `vk agent working <id>`
+
+Set agent status to working on a specific task. Automatically fetches the task title.
+
+```bash
+vk agent working task_20260201_abc123
+```
+
+---
+
+#### `vk agent idle`
+
+Set agent status to idle.
+
+```bash
+vk agent idle
+```
+
+---
+
+#### `vk agent sub-agent <count>`
+
+Set agent status to sub-agent mode with a count of active sub-agents.
+
+```bash
+vk agent sub-agent 3
+```
+
+---
+
+### Project Management
+
+Manage projects from the terminal.
+
+#### `vk project list`
+
+List all projects.
+
+```bash
+vk project list
+vk project list --json
+```
+
+---
+
+#### `vk project create "name"`
+
+Create a new project.
+
+```bash
+vk project create "my-app"
+vk project create "rubicon" --color "#7c3aed" --description "Main product"
+```
+
+**Flags:**
+
+| Flag            | Description         |
+| --------------- | ------------------- |
+| `--color`       | Project color (hex) |
+| `--description` | Project description |
+| `--json`        | Output as JSON      |
+
+---
+
+### Agent Commands
+
+Manage AI agents on code tasks.
+
+| Command                                                                                      | Description                                                   |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `vk start <id> [--phase <phase>]`                                                            | Start an agent; optionally bind an execution phase            |
+| `vk launch-preview <id> [--phase <phase>]`                                                   | Preview effective launch inputs, blockers, and drift          |
+| `vk workspace-trust scan <id>`                                                               | Inventory repository-controlled execution configuration       |
+| `vk workspace-trust decide <id> --mode <mode> --inventory <digest> --reason <text>`          | Authorize or deny one exact inventory                         |
+| `vk workspace-trust revoke <id> --inventory <digest> --reason <text>`                        | Revoke the current exact-inventory decision                   |
+| `vk stop <id>`                                                                               | Stop a run only when its persisted manifest supports stop     |
+| `vk agent:recovery <id>`                                                                     | Inspect the latest retry or fallback decision                 |
+| `vk agent:file-provenance <id> --attempt <id> --root <root> --path <path> --sha256 <digest>` | Resolve exact, stale, unknown, or unsupported file provenance |
+| `vk agent:cancel-recovery <id> --attempt <id>`                                               | Cancel the exact pending recovery parent                      |
+| `vk agent:phase <id> --attempt <id>`                                                         | Read effective launch phase, sources, and transition history  |
+| `vk agent:access <id> --attempt <id>`                                                        | Read exact redacted run authority and historical versions     |
+| `vk agent:change-access <id> ...`                                                            | Preview or apply a server-owned Run Access change             |
+| `vk agent:transition-phase <id> ...`                                                         | Apply or request approval for one exact phase transition      |
+| `vk agent:decide-phase-approval <approvalId> ...`                                            | Approve or reject an exact pending phase expansion            |
+| `vk agent:resume <id> --source-attempt <id> -m <text> [--phase <phase>]`                     | Resume the exact persisted provider conversation              |
+| `vk agent:follow-up <id> --source-attempt <id> -m <text> [--phase <phase>]`                  | Start a provider-native follow-up turn                        |
+| `vk agent:fork <id> --source-attempt <id> -m <text> [--phase <phase>]`                       | Fork provider history without mutating its source             |
+| `vk agent:steer <id> --attempt <id> -m <text>`                                               | Steer the exact active provider turn                          |
+| `vk agent:interrupt <id> --attempt <id>`                                                     | Interrupt the exact active provider turn                      |
+| `vk agent:compact <id> --attempt <id>`                                                       | Compact a supported provider conversation                     |
+| `vk agent:archive <id> --attempt <id>`                                                       | Archive a supported provider conversation                     |
+| `vk agent:close <id> --attempt <id>`                                                         | Close a supported provider conversation                       |
+| `vk acp status --json`                                                                       | Check ACP server-view API and permission readiness            |
+| `vk acp serve --stdio [--task <id>]`                                                         | Expose a Veritas-managed task to an ACP v1 client             |
+| `vk agents:pending`                                                                          | List pending agent requests                                   |
+| `vk agents:status <id>`                                                                      | Check agent running status                                    |
+| `vk agents:complete <id> -s --attempt-id <id> --manifest-digest <sha256:...>`                | Mark the matching agent attempt complete (success)            |
+| `vk agents:complete <id> -f --attempt-id <id> --manifest-digest <sha256:...>`                | Mark the matching agent attempt complete (failure)            |
+
+Require one or more capabilities before launch:
+
+```bash
+vk start TASK-001 --agent codex \
+  --require-capability tool.mcp output.structured \
+  --commit-policy allowed \
+  --json
+```
+
+Preview without dispatching, or compare a new launch with a parent attempt:
+
+```bash
+vk launch-preview TASK-001 --agent codex \
+  --phase verify \
+  --parent-attempt attempt_parent \
+  --json
+vk start TASK-001 --agent codex \
+  --phase verify \
+  --parent-attempt attempt_parent
+```
+
+Preview output includes the immutable run-launch digest, redacted command and
+argument plan, phase evidence and source references, per-field origins,
+enforcement blockers, and material drift. It applies the same readiness gate
+and override rules as start. A parent phase binding is material; attempt IDs and
+probe timestamps alone do not count as material drift.
+
+`--phase` accepts `explore`, `plan`, `implement`, `verify`, or `publish`.
+Explicit phases fail closed before attempt mutation when the selected runtime,
+sandbox, host, or tool policy cannot prove every required dimension. Omitting
+the flag creates an explicit legacy phase for a new launch. Resume, follow-up,
+fork, retry, fallback, and provider changes inherit and intersect the exact
+parent phase, so a descendant cannot widen authority by changing providers or
+omitting the flag. In the current staged v6.x delivery, use
+`launch-preview --phase ...` to inspect the evidence; explicit task or workflow
+starts remain blocked until #1033 supplies command and external-action
+enforcement.
+
+Inspect workspace execution trust before launching a newly cloned or changed
+repository:
+
+```bash
+vk workspace-trust scan TASK-001
+vk workspace-trust decide TASK-001 \
+  --mode restricted \
+  --inventory sha256:... \
+  --reason "Reviewed instructions; keep the run read-only"
+```
+
+Decision modes are `trusted`, `restricted`, and `denied`. The exact inventory
+digest from `scan` is required, and stale content is rejected. Decision and
+revocation commands require an administrator. `launch-preview` reports the
+effective trust status and any resulting enforcement blocker.
+
+`--require-capability <capabilities...>` is additive to the baseline launch,
+profile, sandbox, and budget requirements. The server returns a structured
+conflict and the CLI exits non-zero when any capability is unsupported,
+unknown, missing, or backed by an invalid/failed manifest.
+
+`--commit-policy <forbidden|allowed|required>` sets the policy for this run.
+It overrides a task default and the legacy auto-commit setting. Omitting the
+flag keeps existing tasks compatible: commits are allowed but not required
+unless a task or legacy setting explicitly requires one.
+
+Lifecycle commands fail closed from the persisted runtime manifest. Resume
+requires the exact source worktree; fork permits a compatible worktree at the
+same repository and base revision. `--fork-turn <id>` selects an optional
+provider-native history boundary. Unsupported controls preserve the server's
+reason, and a recorded operator message is never reported as delivered unless
+the adapter executed a verified native steering operation.
+
+Use `vk agents:status TASK-001 --json` to inspect the persisted manifest and
+capability-derived `controls` set. `vk stop` does not infer support from the
+agent name. It resolves the current `attemptId` from status and includes it in
+the stop request, so a replacement run fails a delayed stop closed. The CLI
+preserves the server's reason when `run.stop` is unavailable or the active and
+persisted manifest digests do not match.
+
+Automatic recovery is separate from stopping an active provider. Use
+`vk agent:recovery TASK-001 --json` to inspect its classification, backoff,
+route, causal parent, manifest evidence, and cumulative budget. A cancellation
+must include the exact parent attempt:
+
+```bash
+vk agent:cancel-recovery TASK-001 --attempt attempt_parent --json
+```
+
+The server rejects stale parent IDs, recoveries that already launched, and
+recoveries that are already terminal.
+
+Inspect and transition the exact active phase:
+
+```bash
+vk agent:phase TASK-001 --attempt attempt_123 --json
+vk agent:transition-phase TASK-001 \
+  --attempt attempt_123 \
+  --operation move-to-implement \
+  --target-evidence ./implement-evidence.json \
+  --reason "The approved plan is ready to implement." \
+  --json
+```
+
+`agent:phase` reports the launch phase even before the first transition. Human
+output distinguishes parent, agent-profile, sandbox, tool-catalog, and launch
+policy sources; `--json` returns the server-owned snapshot unchanged.
+
+Use `vk agent:access TASK-001 --attempt attempt_123` for the joined operator
+view of filesystem, network, tools, integrations, approvals, budgets,
+concurrency, and harness support. Human output is compact; `--json` preserves
+the exact `run-access-summary/v1` response and its prior immutable phase
+versions. See [Run Access Summary v1](architecture/RUN-ACCESS-SUMMARY-V1.md).
+
+Use `vk agent:change-access TASK-001 --attempt attempt_123 --target-phase verify
+--reason "Run the reviewed verification boundary."` to preview an exact
+authority diff. Add `--apply` to submit the displayed revision. Expansions
+return an approval ID; decide it, then rerun with the same `--request` and
+`--approval-id`. A provider or process-boundary blocker means the active run
+must pause and relaunch in the selected phase.
+
+The first transition also requires `--from-evidence <file>` and
+`--manifest <sha256:...>`. Later requests read the current journal record and
+automatically bind its sequence, evidence digest, and manifest. Narrowing
+applies immediately. Expansion returns an exact approval; decide it with
+`vk agent:decide-phase-approval <id> --decision approve`, then retry the same
+transition with the same `--operation` and `--approval-id`. Emergency expansion
+requires `--override-until` and `--override-reason`; the authenticated caller
+must be an administrator and the expiry cannot exceed 24 hours.
+
+---
+
+### Admission Commands
+
+Inspect the capacity reservation that must exist before a provider can start:
+
+```bash
+vk admission list
+vk admission list --state active --provider codex-cli --json
+vk admission list --workflow-run run_20260725_abc123 --json
+vk admission list --workflow-run run_20260725_abc123 --workflow-step implement
+vk admission list --root-reservation admission_0123456789abcdef
+vk admission list --root-objective objective_0123456789abcdef --json
+vk admission get admission_0123456789abcdef --json
+vk admission tree objective_0123456789abcdef
+vk admission tree objective_0123456789abcdef --limit 25 --json
+vk admission queue list
+vk admission queue list --state queued requeued --source workflow --min-age 60000 --json
+vk admission queue get admission_queue_0123456789abcdef
+vk admission queue get admission_queue_0123456789abcdef --json
+vk admission queue cancel admission_queue_0123456789abcdef \
+  --reason "Operator cancelled the queued launch." \
+  --idempotency-key operator-queue-cancel-20260725
+vk admission cancel-tree objective_0123456789abcdef \
+  --reason "Operator stopped runaway child-agent expansion." \
+  --idempotency-key operator-tree-cancel-20260725
+vk admission resume-tree objective_0123456789abcdef \
+  --reason "Operator confirmed fan-out pressure cleared." \
+  --idempotency-key operator-tree-resume-20260725
+```
+
+`admission list` filters by workspace, task, root task, provider, host, state,
+workflow run, workflow step, root reservation, root objective, node, parent
+node, and result limit. Active records
+show the lease expiry and requested run, process, and estimated-memory
+capacity. Workflow roots use provider `workflow-control`; executable child
+steps show their resolved provider, selected host, and root reservation.
+Released records retain the terminal reason and idempotency identity for
+operator diagnosis. `admission tree` reports committed and reserved tokens,
+cost, tool calls, runtime, retries, fan-out, policy availability, and bounded
+contributors without double counting descendant totals. It also shows durable
+cancellation or circuit-breaker control state when present. Inspection
+commands are read-only and require `agent:read`.
+
+`admission queue list` filters by workspace, root objective, node, launch
+source, queue state, raw numeric priority, limiting scope, age window, page,
+and result limit. `admission queue get` shows one entry with position,
+priority aging, readiness, lease posture, redacted launch identity, limiting
+policy, conditional start factors, selection evidence, and safe navigation
+identifiers. Human output labels the snapshot as conditional and never presents
+an ETA or exact start time. Use `--json` for the complete versioned REST shape.
+
+`admission queue cancel` stops one queued or leased launch before provider
+dispatch and releases its reservation. `admission cancel-tree` records
+cancellation on the root first, drains queued descendants, releases unbound
+reservations, and asks the local supervisor to interrupt verified running
+attempts. `admission resume-tree` re-evaluates durable breaker evidence and
+resumes a paused tree only after every blocking signal clears. All three
+commands require `admin:manage`, require an operator reason, and accept a stable
+`--idempotency-key` for safe retries. If omitted, the CLI generates a new key.
+Use `--json` to inspect the complete control or any verified running attempts
+that still require reconciliation. A blocked resume returns
+`EXECUTION_TREE_RESUME_BLOCKED`; do not retry it in a loop without changing the
+reported pressure. A cancelled root rejects late resume, retry, fallback,
+workflow-step, and child-agent launches before provider dispatch.
+
+The Operations admission panel exposes the same controls. Queue rows can cancel
+one pending launch or its entire tree. Durable tree-control cards show bounded
+breaker signals and observed descendant/depth evidence, then allow an
+administrator to resume or cancel the tree with an audited reason.
+
+---
+
+### Durable Goal Commands
+
+Create and control one evidence-gated objective across multiple runs:
+
+```bash
+vk goals create \
+  --objective "Deliver the provider migration." \
+  --acceptance "All provider fixtures pass" "Operator docs are current" \
+  --requirement "provider-tests|test|Focused provider fixtures pass." \
+  --requirement "operator-docs|artifact|Operator documentation is reviewed." \
+  --root-task task_0123456789abcdef \
+  --mode automatic \
+  --max-turns 20 \
+  --max-rollovers 2 \
+  --compact-after-tokens 120000 \
+  --require-rollover-approval \
+  --json
+
+vk goals list --state active blocked awaiting-approval --json
+vk goals get goal_0123456789abcdef --json
+
+vk goals transition goal_0123456789abcdef \
+  --revision 3 \
+  --state paused \
+  --reason "Operator paused before external coordination." \
+  --json
+
+vk goals transition goal_0123456789abcdef \
+  --revision 4 \
+  --state complete \
+  --reason "All configured evidence is verified." \
+  --evidence-json '[{"requirementId":"provider-tests","evidenceId":"ci-30182450098","summary":"Focused provider fixtures passed."},{"requirementId":"operator-docs","evidenceId":"review-20260726","summary":"Operator docs reviewed."}]' \
+  --json
+
+vk goals link-run goal_0123456789abcdef \
+  --revision 2 \
+  --task task_0123456789abcdef \
+  --attempt attempt_0123456789abcdef \
+  --conversation conversation_0123456789abcdef \
+  --json
+
+vk goals rollover goal_0123456789abcdef \
+  --revision 6 \
+  --json
+```
+
+`goals create` requires exactly one `--root-task` or `--root-workflow`.
+Completion requirements use `id|kind|description`; supported kinds are
+`test`, `build`, `artifact`, `operator`, `external`, and `other`. At least one
+required evidence item must exist, and a transition to `complete` fails until
+every required item has verified evidence.
+
+Every mutation requires the current `--revision`. A stale revision returns a
+conflict instead of overwriting a newer operator or supervisor decision.
+Blocked transitions use `--blocker-json` for the exact blocker, attempt count,
+next safe action, and required authority or external state change. The server
+derives the transition actor, workspace, verification timestamp, and evidence
+verifier from authenticated context; caller-supplied identity fields are
+rejected. Use `--json` for stable automation output.
+
+`goals get --json` includes the deduplicated `usageEvents`, full
+`continuationChain`, and restart-safe `continuationAttempts`. Automatic goals
+continue only after the prior completion is durable and required evidence,
+blockers, turn limits, and aggregate budgets are evaluated. A continuation is
+persisted as `planned` before it enters the normal admission path, then becomes
+`dispatched` with its attempt or queue identity. On restart, the same admission
+idempotency key is reused; an already-created child attempt is linked without a
+duplicate launch.
+
+Manual goals pause after an incomplete run. Automatic goals block when the
+provider has no verified continuation handle and no rollover allowance, or
+when admission fails. They enter `usage-limited` or `budget-limited` at their
+configured boundary. A configured `--compact-after-tokens` threshold starts a
+fresh conversation only while `--max-rollovers` still has capacity. Each
+rollover persists `kind: "rollover"` before dispatch and carries a bounded
+goal contract with objective, constraints, acceptance criteria, verified
+evidence links, remaining requirements, recent state decisions, and aggregate
+usage. If `--require-rollover-approval` is set, the goal enters
+`awaiting-approval`; run `goals rollover` with the current revision to approve
+and dispatch that exact handoff. Resume other limited states explicitly after
+addressing the reported condition; do not build a second client-side
+continuation loop.
+
+---
+
+### Prompt Commands
+
+Sync file-based prompt templates into the runtime prompt registry.
+
+```bash
+vk prompts import prompt-registry --dry-run
+vk prompts import prompt-registry
+vk prompts import prompt-registry --force --json
+```
+
+`vk prompts import` scans Markdown files, skips `README.md` by default, derives
+stable IDs from frontmatter `id` values or filenames, and reports created,
+updated, unchanged, conflicting, and malformed templates. Runtime templates that
+differ from disk are conflicts unless `--force` is passed.
+
+---
+
+### Automation Commands
+
+Manage automation tasks.
+
+| Command                       | Alias | Description                        |
+| ----------------------------- | ----- | ---------------------------------- |
+| `vk automation:pending`       | `ap`  | List pending automation tasks      |
+| `vk automation:running`       | `ar`  | List running automation tasks      |
+| `vk automation:start <id>`    | `as`  | Start an automation task           |
+| `vk automation:complete <id>` | `ac`  | Mark automation complete or failed |
+
+---
+
+### Scheduler Commands
+
+Inspect and control recurring work from the terminal.
+
+| Command                                 | Description                                       |
+| --------------------------------------- | ------------------------------------------------- |
+| `vk scheduler list`                     | List recurring scheduler items and recent events  |
+| `vk scheduler run-due`                  | Run all due scheduler items                       |
+| `vk scheduler run <id>`                 | Run one scheduler item now                        |
+| `vk scheduler pause <id>`               | Pause one scheduler item                          |
+| `vk scheduler resume <id>`              | Resume one scheduler item                         |
+| `vk scheduler validate <id>`            | Validate one scheduler item                       |
+| `vk scheduler draft preview`            | Compile intent without saving or activating       |
+| `vk scheduler draft save`               | Save an inactive draft                            |
+| `vk scheduler draft list`               | List latest inactive draft revisions              |
+| `vk scheduler draft show`               | Inspect a latest or exact draft revision          |
+| `vk scheduler draft revise`             | Append an immutable inactive revision             |
+| `vk scheduler draft clone`              | Clone an inactive draft                           |
+| `vk scheduler draft delete`             | Delete inactive revisions with exact confirmation |
+| `vk scheduler draft activation-preview` | Review exact standing authority and evidence      |
+| `vk scheduler draft activate`           | Request approval or activate the approved version |
+| `vk scheduler automation list`          | List immutable versions, bindings, and claims     |
+| `vk scheduler automation pause`         | Pause a binding with compare-and-set              |
+| `vk scheduler automation resume`        | Resume a binding with compare-and-set             |
+| `vk scheduler automation revoke`        | Permanently revoke a binding                      |
+
+Item IDs include a source prefix: `scheduled-deliverable:<id>`, `workflow:<id>`, or `queue-monitor:<id>`.
+
+Draft preview, save, and revise require `--intent` and `--request-id`; optional structured values are supplied through `--hints '<json>'`. Use `--json` to receive the exact `automation-draft/v1` body shown by the Settings preview. Preview requires `workflow:read`; mutations require `workflow:write`.
+
+Activation preview returns the exact `requestRevision`. Pass it to `draft activate` to create a Run Approval, approve that request in Run Approvals, then repeat the identical command with `--approval-id`. Pause, resume, and revoke require the binding's current `--expected-revision` plus an operator reason.
+
+---
+
+### Queue Monitor Commands
+
+Inspect and run policy-gated GitHub queue intake monitors.
+
+| Command                          | Description                                     |
+| -------------------------------- | ----------------------------------------------- |
+| `vk queue-monitors list`         | List queue monitors, health, and recent events  |
+| `vk queue-monitors run <id>`     | Run one monitor now                             |
+| `vk queue-monitors explain <id>` | Build a fresh candidate packet without mutation |
+| `vk queue-monitors health <id>`  | Show monitor health and action item state       |
+| `vk queue-monitors pause <id>`   | Pause one monitor                               |
+| `vk queue-monitors resume <id>`  | Resume one monitor                              |
+
+Every queue monitor command supports `--json`. `run` requires `workflow:execute`; list, health, and explain require `workflow:read`.
+
+---
+
+### SQLite Journal Maintenance
+
+Preview and schedule safe journal-mode conversion for the configured
+authoritative database.
+
+| Command                                      | Permission     | Description                                         |
+| -------------------------------------------- | -------------- | --------------------------------------------------- |
+| `vk sqlite journal preview --target <mode>`  | `backup:write` | Show filesystem, sidecars, ownership, backup, risks |
+| `vk sqlite journal apply ...`                | `admin:manage` | Schedule the confirmed preview for the next restart |
+| `vk sqlite journal status [operationId]`     | `backup:read`  | Show operation and policy state                     |
+| `vk sqlite journal override revoke --reason` | `admin:manage` | Revoke active compatibility/override policy         |
+
+`apply` requires `--preview-id`, the one-time `--preview-token`, a matching
+`--confirm`, and `--acknowledge-risks`. It does not convert the live database;
+restart the server once so bootstrap can run before any SQLite connection opens.
+All commands support `--json`. `delete` mode also requires explicit single-host
+environment posture and bounded override metadata; see
+[Maintenance Center](MAINTENANCE-CENTER.md).
+
+---
+
+### GitHub Sync
+
+Manage GitHub Issues bidirectional sync.
+
+| Command              | Description                                       |
+| -------------------- | ------------------------------------------------- |
+| `vk github sync`     | Trigger a manual GitHub Issues sync               |
+| `vk github status`   | Show last sync status (timestamp, counts, errors) |
+| `vk github config`   | View or update GitHub sync configuration          |
+| `vk github mappings` | List issue↔task mappings                          |
+
+---
+
+### Utilities
+
+| Command               | Description                                                                    |
+| --------------------- | ------------------------------------------------------------------------------ |
+| `vk summary`          | Project stats: status counts, project progress, high-priority items            |
+| `vk summary standup`  | Daily standup summary (`--yesterday`, `--date YYYY-MM-DD`, `--json`, `--text`) |
+| `vk doctor`           | Validate API, routing, executable, and harness support readiness (`--json`)    |
+| `vk notify <message>` | Create a notification (`--type`, `--title`, `--task` options)                  |
+| `vk notify:check`     | Check for tasks that need notifications                                        |
+| `vk notify:pending`   | Get pending notifications formatted for Teams                                  |
+
+`vk doctor` reads the same redacted harness support projection shown in
+Settings. Enabled `degraded` or `unsupported` profiles fail the doctor check;
+enabled `configured` profiles warn until their installed build has current
+certification evidence. Use `vk doctor --json` for support-safe automation and
+diagnostics, including redacted readiness reasons, safe probe commands, and
+remediation.
+
+For Claude Code, doctor reports the bounded version, auth-status, and agent
+discovery probes, plus separate bare-mode authentication readiness. A
+successful interactive OAuth status is diagnostic only because Veritas
+launches Claude Code with `--bare`; configure an explicit supported
+environment credential before enabling the profile.
+
+For Codex app-server, doctor requires the exact `codex-cli 0.145.0` executable,
+`codex login status`, the system-owned strict-stdio launch contract, and the
+current provider build/probe evidence. Custom app-server arguments or version
+drift degrade the profile and block dispatch. `codex-cli`, `codex-sdk`, and
+`codex-app-server` are reported as separate profiles with separate capability
+manifests.
+
+### Run-scoped Tool Servers
+
+| Command                                                           | Description                                      |
+| ----------------------------------------------------------------- | ------------------------------------------------ |
+| `vk tool-servers list [--json]`                                   | List registered definitions                      |
+| `vk tool-servers get <id> --json`                                 | Read one definition                              |
+| `vk tool-servers create <definition.json>`                        | Create a validated definition                    |
+| `vk tool-servers update <id> <definition.json>`                   | Replace a definition                             |
+| `vk tool-servers delete <id>`                                     | Delete a definition                              |
+| `vk tool-servers enable <id>` / `disable <id>`                    | Change launch eligibility                        |
+| `vk tool-servers version <id> <version>`                          | Change version identity and invalidate discovery |
+| `vk tool-servers discover <id> [--force] [--json]`                | Refresh version-bound discovery                  |
+| `vk tool-servers catalog <taskId> <attemptId> --json`             | Read an immutable run catalog                    |
+| `vk tool-servers call <taskId> <attemptId> <serverId> <tool> ...` | Invoke through policy, approval, and event gates |
+
+Calls require `--arguments '<json-object>'`. Use a stable `--operation-id`
+when retrying transport failures. If the tool requires approval, the command
+returns the exact approval identity; retry with `--approval-id` after that
+request is approved. The `tools` command is an alias for `tool-servers`.
+
+---
+
+## Workflow Commands Deep Dive
+
+### The Problem
+
+Before v1.4, starting or finishing a task required multiple separate API calls. A typical agent workflow looked like this:
+
+```bash
+# Starting a task (3 calls)
+curl -X PATCH http://localhost:3001/api/tasks/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"status":"in-progress"}'
+
+curl -X POST http://localhost:3001/api/tasks/<id>/time/start
+
+curl -X POST http://localhost:3001/api/agent/status \
+  -H "Content-Type: application/json" \
+  -d '{"status":"working","taskId":"<id>","taskTitle":"Implement OAuth"}'
+
+# ... work happens ...
+
+# Completing a task (4 calls)
+curl -X POST http://localhost:3001/api/tasks/<id>/time/stop
+
+curl -X PATCH http://localhost:3001/api/tasks/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"status":"done"}'
+
+curl -X POST http://localhost:3001/api/tasks/<id>/comments \
+  -H "Content-Type: application/json" \
+  -d '{"author":"agent","text":"Added OAuth2 with Google and GitHub providers"}'
+
+curl -X POST http://localhost:3001/api/agent/status \
+  -H "Content-Type: application/json" \
+  -d '{"status":"idle"}'
+```
+
+That's 7 curl commands across the lifecycle — easy to get wrong, tedious to type, and guaranteed to be inconsistent if you're doing it manually.
+
+### The Solution
+
+```bash
+vk begin <id>
+# ... work happens ...
+vk done <id> "Added OAuth2 with Google and GitHub providers"
+```
+
+Two commands. Same result. Every step is orchestrated in the correct order, every time.
+
+### What Each Command Orchestrates
+
+| Command      | Step 1               | Step 2           | Step 3          | Step 4       |
+| ------------ | -------------------- | ---------------- | --------------- | ------------ |
+| `vk begin`   | Status → in-progress | Timer → start    | Agent → working | —            |
+| `vk done`    | Timer → stop         | Status → done    | Comment → added | Agent → idle |
+| `vk block`   | Status → blocked     | Comment → reason | —               | —            |
+| `vk unblock` | Status → in-progress | Timer → restart  | —               | —            |
+
+### Handling Blocked Tasks
+
+Real-world tasks get blocked. The `vk block` and `vk unblock` commands handle this gracefully:
+
+```bash
+# Task hits a blocker
+vk block abc123 "Waiting on API credentials from client"
+
+# Blocker resolved — pick up where you left off
+vk unblock abc123
+```
+
+The block reason is automatically recorded as a comment on the task, creating an audit trail of why work was paused.
+
+---
+
+## Scripting & Automation
+
+Every command supports `--json` output for machine consumption, making `vk` a first-class tool for scripting and automation.
+
+### Piping and JSON Processing
+
+```bash
+# Get all in-progress task IDs
+vk list --status in-progress --json | jq -r '.[] | .id'
+
+# Count tasks by status
+vk list --json | jq 'group_by(.status) | map({status: .[0].status, count: length})'
+
+# Get time spent on a task
+vk time show abc123 --json | jq '.totalTime'
+```
+
+### Agent Automation
+
+Use workflow commands in agent configurations (like `AGENTS.md`) to standardize task lifecycle management:
+
+```bash
+# In an agent's task handler
+TASK_ID="$1"
+
+# Start work
+vk begin "$TASK_ID"
+
+# ... perform the work ...
+
+# Complete with summary
+vk done "$TASK_ID" "Completed implementation of feature X"
+```
+
+### CI/CD Integration
+
+```bash
+# Create a task for each deployment
+TASK_ID=$(vk create "Deploy v2.1.2 to staging" --type automation --project ops --json | jq -r '.id')
+
+# Track the deployment
+vk begin "$TASK_ID"
+
+# ... deployment steps ...
+
+if [ $? -eq 0 ]; then
+  vk done "$TASK_ID" "Successfully deployed v2.1.2 to staging"
+else
+  vk block "$TASK_ID" "Deployment failed — check CI logs"
+fi
+```
+
+### Batch Operations
+
+```bash
+# Block all tasks in a project
+vk list --project legacy-app --status in-progress --json | \
+  jq -r '.[].id' | \
+  xargs -I {} vk block {} "Project on hold pending budget approval"
+```
+
+---
+
+## Configuration
+
+The CLI reads configuration from environment variables:
+
+| Variable     | Default                 | Description                |
+| ------------ | ----------------------- | -------------------------- |
+| `VK_API_URL` | `http://localhost:3001` | Veritas Kanban server URL  |
+| `VK_API_KEY` | _(none)_                | API key for authentication |
+
+### Setting the API URL
+
+```bash
+# Default — local development
+export VK_API_URL=http://localhost:3001
+
+# Remote server
+export VK_API_URL=https://kanban.example.com
+```
+
+### Setting the API Key
+
+```bash
+# Set your API key for authenticated endpoints
+export VK_API_KEY=your-api-key-here
+```
+
+If you're running locally with localhost auth bypass enabled, read commands may work without a key. Write commands need `VK_API_KEY` unless `VERITAS_AUTH_LOCALHOST_ROLE` is set to `agent` or `admin`. Prefer an `agent` role key for CLI automation.
+
+For v5, issue dedicated CLI keys instead of sharing the admin key. Routine
+automation should use an `agent` role key; read-only dashboards and reporting
+scripts should use `read-only`. Reserve the admin key for setup, migration,
+backup/import, and policy operations.
+
+The CLI preflights protected commands against `/api/auth/context` before it
+calls the target endpoint. If `VK_API_KEY` lacks the mapped permission, the
+command fails locally without sending the mutating request.
+
+### Read/Write Smoke Check
+
+Use this check after linking `vk` and exporting `VK_API_URL`/`VK_API_KEY`. It proves the CLI can both read from and write to the configured VK server.
+
+```bash
+# Read check
+vk list --json | jq 'length'
+
+# Write check, then cleanup
+TASK_ID=$(vk create "CLI auth smoke test" \
+  --type automation \
+  --priority low \
+  --description "Temporary task created by CLI auth smoke test." \
+  --json | jq -r '.id')
+vk show "$TASK_ID" --json | jq -e --arg id "$TASK_ID" '.id == $id'
+vk delete "$TASK_ID" --json
+```
+
+Expected result: the read command prints a number, the show command exits `0`, and the delete command returns `{ "deleted": true }`. If read succeeds but write fails with `401` or `403`, confirm the exported `VK_API_KEY` matches an `agent` or `admin` role key in `VERITAS_API_KEYS`, then restart the server.
+
+### File Work Products
+
+Runs with a manifest-bound artifact grant write completed deliverables below `VERITAS_ARTIFACT_ROOT`, then register a relative file:
+
+```bash
+vk work-products register \
+  --task task_release \
+  --run run_release \
+  --attempt attempt_release \
+  --request-id release-pdf-v1 \
+  --event runevt_output \
+  --path release.pdf \
+  --title "Release PDF" \
+  --media-type application/pdf \
+  --json
+```
+
+```bash
+vk work-products inspect wp_ID --json
+vk work-products list --task task_release --include-archived --json
+vk work-products download wp_ID --version 1 --output ./release.pdf --json
+vk work-products purge wp_ID --confirm wp_ID --json
+```
+
+Registration never accepts a host path. Reuse the same request ID only for an idempotent retry. Use `--product wp_ID` with a new request ID to create a new immutable file version. Download refuses to overwrite an existing destination unless `--force` is supplied. Purge rejects active products and removes every body plus product/version metadata only after archive and an exact ID confirmation.
+
+Inspect provenance for exact bytes before trusting or approving a run-produced file:
+
+```bash
+vk agent:file-provenance task_release \
+  --attempt attempt_release \
+  --root run-artifact \
+  --path release.pdf \
+  --sha256 sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --json
+```
+
+The result is `exact` only when the supplied digest matches the newest record at the normalized path. `stale`, `unknown`, and `gap` are fail-closed results. The command never accepts or returns an absolute host path.
+
+---
+
+## Tips & Tricks
+
+### Shell Aliases
+
+Add these to your `.bashrc` or `.zshrc` for even faster workflows:
+
+```bash
+# Quick task lifecycle
+alias vkb='vk begin'
+alias vkd='vk done'
+alias vkl='vk list --status in-progress'
+
+# Common filters
+alias vktodo='vk list --status todo'
+alias vkblocked='vk list --status blocked'
+alias vkdone='vk list --status done'
+
+# Agent status shortcuts
+alias vka='vk agent status'
+alias vkai='vk agent idle'
+```
+
+### Partial ID Matching
+
+You can use an exact task ID or a unique suffix. Exact IDs take precedence. Empty identifiers and suffixes matching more than one task are rejected before any update, archive, or deletion; ambiguity errors list candidate IDs so you can choose explicitly:
+
+```bash
+# Full ID
+vk show task_20260201_abc123
+
+# Partial — just the unique suffix
+vk show abc123
+```
+
+### Quick Standup
+
+Generate your daily standup in one command:
+
+```bash
+# Today's standup in the terminal
+vk summary standup
+
+# Yesterday's standup (for morning standups)
+vk summary standup --yesterday
+
+# Pipe to clipboard (macOS)
+vk summary standup --text | pbcopy
+```
+
+### Combined Create + Begin
+
+Create a task and immediately start working on it:
+
+```bash
+# Create and capture the ID
+TASK_ID=$(vk create "Fix login bug" --type code --project my-app --json | jq -r '.id')
+
+# Start working
+vk begin "$TASK_ID"
+```
+
+### Monitoring Agent Status
+
+Check what the agent is up to:
+
+```bash
+# Current agent status
+vk agent status
+
+# See all in-progress tasks (what's being worked on)
+vk list --status in-progress
+```
+
+---
+
+_Part of [Veritas Kanban](../README.md) · Built by [Digital Meld](https://digitalmeld.io)_
+
+### API deadlines and errors
+
+Shared API requests have a 30-second deadline, including response-body reads. Set `VK_API_TIMEOUT_MS` to a positive integer of milliseconds for a different default. Agent launch requests explicitly allow 120 seconds for provider preflight and worktree preparation. Client integrations can set `timeoutMs` per request and supply an `AbortSignal`; cancellation also covers uncached permission preflight. Writes are never retried automatically. A timeout does not prove that the server rejected or rolled back a write: inspect the task or operation before trying it again.
+
+API errors retain HTTP status and server error code. MCP tool errors and CLI task commands using `--json` include structured metadata. Forwarded details use an allowlist for validation, revision, permission, and retry fields; complete task snapshots and credential fields are omitted. A rejected preflight does not remain cached as a permanent transport failure.

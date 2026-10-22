@@ -1,0 +1,346 @@
+/**
+ * Storage factory / registry.
+ *
+ * Usage:
+ *   import { initStorage, getStorage } from './storage/index.js';
+ *
+ *   await initStorage();                // call once at startup
+ *   const storage = getStorage();       // anywhere in the app
+ *   const tasks   = await storage.tasks.findAll();
+ */
+
+import type { StorageProvider } from './interfaces.js';
+import { FileStorageProvider, type FileStorageOptions } from './file-storage.js';
+import { SqliteStorageProvider, type SqliteStorageOptions } from './sqlite/sqlite-storage.js';
+
+export type {
+  TaskRepository,
+  SettingsRepository,
+  ActivityRepository,
+  TemplateRepository,
+  PromptRegistryRepository,
+  StatusHistoryRepository,
+  ManagedListRepository,
+  ManagedListProvider,
+  TelemetryRepository,
+  RunEventRepository,
+  RunEventRepositoryAppendInput,
+  RunApprovalRepository,
+  PhaseTransitionRepository,
+  RunSupervisorRepository,
+  DurableGoalRepository,
+  ReflectionExtractionJobRepository,
+  AdmissionReservationRepository,
+  ToolControlPlaneRepository,
+  RunOutputArtifactRepository,
+  WorkProductArtifactRepository,
+  SetupContextRepository,
+  WorkspaceFileRepository,
+  WorkspaceExecutionTrustRepository,
+  StorageProvider,
+} from './interfaces.js';
+export { LocalWorkspaceFileRepository } from './workspace-file-repository.js';
+export { FileProgressRepository, type ProgressRepository } from './progress-repository.js';
+export { FileStatusHistoryStore } from './status-history-repository.js';
+export {
+  FileTransitionHooksConfigRepository,
+  type TransitionHooksConfigRepository,
+} from './transition-hooks-config-repository.js';
+export {
+  FileLifecycleHooksRepository,
+  type LifecycleHooksRepository,
+} from './lifecycle-hooks-repository.js';
+export {
+  FileSchedulerStateRepository,
+  type SchedulerItemState,
+  type SchedulerState,
+  type SchedulerStateRepository,
+} from './scheduler-state-repository.js';
+export {
+  FileReflectionStateRepository,
+  type ReflectionState,
+  type ReflectionStateRepository,
+} from './reflection-state-repository.js';
+export {
+  FileWorkflowExecutionFileRepository,
+  type WorkflowExecutionFileRepository,
+} from './workflow-execution-file-repository.js';
+export {
+  FileWorkflowRunRepository,
+  type WorkflowRunFilters,
+  type WorkflowRunMetadata,
+  type WorkflowRunRepository,
+} from './workflow-run-repository.js';
+export { FileScheduledDeliverablesStore } from './scheduled-deliverables-repository.js';
+export { FileBroadcastRepository } from './broadcast-repository.js';
+export {
+  FileAgentPermissionRepository,
+  InMemoryAgentPermissionRepository,
+  type AgentPermissionRepository,
+} from './agent-permission-repository.js';
+export {
+  FileCeremonyStateRepository,
+  InMemoryCeremonyStateRepository,
+  type CeremonyState,
+  type CeremonyStateRepository,
+} from './ceremony-state-repository.js';
+export { FileDelegationRepository, type DelegationRepository } from './delegation-repository.js';
+export {
+  FileErrorAnalysisRepository,
+  InMemoryErrorAnalysisRepository,
+  type ErrorAnalysisRepository,
+} from './error-analysis-repository.js';
+export {
+  LocalConflictWorkspaceRepository,
+  type ConflictWorkspaceRepository,
+} from './conflict-workspace-repository.js';
+export { FileWorkflowDefinitionRepository } from './workflow-definition-repository.js';
+export {
+  FileWorkspaceExecutionTrustRepository,
+  InMemoryWorkspaceExecutionTrustRepository,
+} from './workspace-execution-trust-repository.js';
+export {
+  FileWorktreeManifestRepository,
+  InMemoryWorktreeManifestRepository,
+  type WorktreeManifestRepository,
+} from './worktree-manifest-repository.js';
+export {
+  FileWorkspaceCheckpointRepository,
+  getWorkspaceCheckpointIdForOperation,
+  getWorkspaceCheckpointRewindIdForOperation,
+  getWorkspaceCheckpointsDir,
+  type FileWorkspaceCheckpointRepositoryOptions,
+  type WorkspaceCheckpointCaptureInput,
+  type WorkspaceCheckpointCommandResult,
+  type WorkspaceCheckpointCommandRunner,
+  type WorkspaceCheckpointCurrentInspectionInput,
+  type WorkspaceCheckpointListQuery,
+  type WorkspaceCheckpointLookup,
+  type WorkspaceCheckpointOperationLookup,
+  type WorkspaceCheckpointRewindInput,
+  type WorkspaceCheckpointRewindLookup,
+  type WorkspaceCheckpointRewindRecoveryInput,
+  type WorkspaceCheckpointRewindRollbackInput,
+  type WorkspaceCheckpointRetentionInput,
+  type WorkspaceCheckpointRepository,
+} from './workspace-checkpoint-repository.js';
+export {
+  GitWorkspaceCheckpointDiffRunner,
+  type GitWorkspaceCheckpointDiffRunnerOptions,
+  type WorkspaceCheckpointDiffCommandResult,
+  type WorkspaceCheckpointDiffCommandRunner,
+  type WorkspaceCheckpointDiffRunner,
+} from './workspace-checkpoint-diff-runner.js';
+export {
+  FileDependencyCircuitStateRepository,
+  InMemoryDependencyCircuitStateRepository,
+  type DependencyCircuitStateRepository,
+} from './dependency-circuit-state-repository.js';
+export {
+  FileDependencyCircuitOverrideRepository,
+  InMemoryDependencyCircuitOverrideRepository,
+  type DependencyCircuitOverrideRepository,
+} from './dependency-circuit-override-repository.js';
+export {
+  FileStorageProvider,
+  FileTaskRepository,
+  FileSettingsRepository,
+  FileActivityRepository,
+  FileTemplateRepository,
+  FilePromptRegistryRepository,
+  FileStatusHistoryRepository,
+  FileManagedListRepository,
+  FileManagedListProvider,
+  FileTelemetryRepository,
+} from './file-storage.js';
+export { FileRunEventRepository, getRunEventsDir } from './run-event-repository.js';
+export {
+  FileRunOutputArtifactRepository,
+  getRunOutputArtifactsDir,
+} from './run-output-artifact-repository.js';
+export {
+  FileWorkProductArtifactRepository,
+  SecureWorkProductArtifactSourceReader,
+  getWorkProductArtifactsDir,
+  type WorkProductArtifactCreateResult,
+  type WorkProductArtifactDeleteResult,
+  type WorkProductArtifactDownload,
+  type WorkProductArtifactLookup,
+  type WorkProductArtifactSourceReader,
+} from './work-product-artifact-repository.js';
+export { FileRunApprovalRepository, getRunApprovalsPath } from './run-approval-repository.js';
+export {
+  FilePhaseTransitionRepository,
+  InMemoryPhaseTransitionRepository,
+  getPhaseTransitionsPath,
+} from './phase-transition-repository.js';
+export { FileDurableGoalRepository, getDurableGoalsPath } from './durable-goal-repository.js';
+export {
+  FileReflectionExtractionJobRepository,
+  getReflectionExtractionJobsPath,
+} from './reflection-extraction-job-repository.js';
+export {
+  FileAdmissionReservationRepository,
+  getAdmissionReservationsPath,
+} from './admission-reservation-repository.js';
+export type { FileStorageOptions } from './file-storage.js';
+export {
+  DEFAULT_SQLITE_FILENAME,
+  SqliteDatabase,
+  UnsupportedSqliteSchemaError,
+  calculateMigrationChecksum,
+  resolveSqliteDatabasePath,
+} from './sqlite/database.js';
+export type { SqliteConnectionOptions } from './sqlite/database.js';
+export { SQLITE_BASE_MIGRATIONS, sortedMigrations } from './sqlite/migrations.js';
+export type { SqliteMigration } from './sqlite/migrations.js';
+export { SqliteStorageProvider } from './sqlite/sqlite-storage.js';
+export type { SqliteStorageOptions } from './sqlite/sqlite-storage.js';
+export { SqliteTaskRepository } from './sqlite/task-repository.js';
+export type { TaskStorageState } from './sqlite/task-repository.js';
+export { SqliteSettingsRepository } from './sqlite/settings-repository.js';
+export {
+  SqliteManagedListProvider,
+  SqliteManagedListRepository,
+} from './sqlite/managed-list-repository.js';
+export { SqliteTemplateRepository } from './sqlite/template-repository.js';
+export { SqlitePromptRegistryRepository } from './sqlite/prompt-registry-repository.js';
+export { SqliteActivityRepository } from './sqlite/activity-repository.js';
+export { SqliteStatusHistoryRepository } from './sqlite/status-history-repository.js';
+export { SqliteTelemetryRepository } from './sqlite/telemetry-repository.js';
+export { SqliteRunEventRepository } from './sqlite/run-event-repository.js';
+export { SqliteRunOutputArtifactRepository } from './sqlite/run-output-artifact-repository.js';
+export { SqliteWorkProductArtifactRepository } from './sqlite/work-product-artifact-repository.js';
+export { SqliteRunApprovalRepository } from './sqlite/run-approval-repository.js';
+export { SqlitePhaseTransitionRepository } from './sqlite/phase-transition-repository.js';
+export { SqliteDurableGoalRepository } from './sqlite/durable-goal-repository.js';
+export { SqliteReflectionExtractionJobRepository } from './sqlite/reflection-extraction-job-repository.js';
+export { SqliteAdmissionReservationRepository } from './sqlite/admission-reservation-repository.js';
+export {
+  FileToolControlPlaneRepository,
+  InMemoryToolControlPlaneRepository,
+} from './tool-control-plane-repository.js';
+export { SqliteToolControlPlaneRepository } from './sqlite/tool-control-plane-repository.js';
+export { SqliteSetupContextRepository } from './sqlite/setup-context-repository.js';
+export {
+  SqliteDecisionRepository,
+  SqliteDriftRepository,
+  SqliteFeedbackRepository,
+  SqliteScoringRepository,
+} from './sqlite/governance-repositories.js';
+export {
+  SqliteAgentPolicyRepository,
+  SqliteAuditRepository,
+  SqliteToolPolicyRepository,
+} from './sqlite/audit-policy-repositories.js';
+export {
+  SqliteWorkflowDefinitionRepository,
+  SqliteWorkflowRunRepository,
+} from './sqlite/workflow-repositories.js';
+export { SqliteChatRepository } from './sqlite/chat-repository.js';
+export { FileChatRepository } from './chat-repository.js';
+export type {
+  ChatRepository,
+  SquadMessageListOptions,
+  SquadMessageMetadata,
+  SquadMetadataFile,
+  SquadMetadataRepository,
+  SquadReadMetadata,
+} from './chat-repository.js';
+export { SqliteNotificationRepository } from './sqlite/notification-repository.js';
+export { SqliteScheduledDeliverablesRepository } from './sqlite/scheduled-deliverables-repository.js';
+export { SqliteIdentityRepository, WORKSPACE_ROLES } from './sqlite/identity-repository.js';
+export type {
+  IdentityUser,
+  WorkspaceIdentity,
+  WorkspaceInvitation,
+  WorkspaceMembership,
+  WorkspaceRole,
+} from './sqlite/identity-repository.js';
+export { SqliteDeviceSessionRepository } from './sqlite/device-session-repository.js';
+export type {
+  DeviceConnectionState,
+  DevicePairingCodeRecord,
+  DeviceSessionRecord,
+} from './sqlite/device-session-repository.js';
+
+// ---------------------------------------------------------------------------
+// Supported backend types (extend this union as new backends are added)
+// ---------------------------------------------------------------------------
+export type StorageType = 'file' | 'sqlite';
+type StorageOptions = FileStorageOptions | SqliteStorageOptions;
+
+// ---------------------------------------------------------------------------
+// Module-level singleton
+// ---------------------------------------------------------------------------
+let activeProvider: StorageProvider | null = null;
+
+export function getStorageTypeFromEnv(env: NodeJS.ProcessEnv = process.env): StorageType {
+  const storageType = env.VERITAS_STORAGE?.trim() || 'file';
+
+  if (storageType === 'file' || storageType === 'sqlite') {
+    return storageType;
+  }
+
+  throw new Error(`Unsupported VERITAS_STORAGE value: ${storageType}`);
+}
+
+export function getSqlitePathFromEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const sqlitePath = env.VERITAS_SQLITE_PATH?.trim();
+  return sqlitePath && sqlitePath.length > 0 ? sqlitePath : undefined;
+}
+
+/**
+ * Initialise the storage layer.
+ *
+ * @param type    Backend type.
+ * @param options Backend-specific options forwarded to the provider.
+ */
+export async function initStorage(
+  type: StorageType = getStorageTypeFromEnv(),
+  options?: StorageOptions
+): Promise<void> {
+  // Shut down any previously-active provider
+  if (activeProvider) {
+    await activeProvider.shutdown();
+    activeProvider = null;
+  }
+
+  switch (type) {
+    case 'file':
+      activeProvider = new FileStorageProvider(options as FileStorageOptions | undefined);
+      break;
+    case 'sqlite':
+      activeProvider = new SqliteStorageProvider(options as SqliteStorageOptions | undefined);
+      break;
+    default: {
+      // Exhaustive check – compile error if a new StorageType is added
+      // without a matching case.
+      const _exhaustive: never = type;
+      throw new Error(`Unknown storage type: ${_exhaustive}`);
+    }
+  }
+
+  await activeProvider.initialize();
+}
+
+export async function shutdownStorage(): Promise<void> {
+  if (!activeProvider) {
+    return;
+  }
+
+  await activeProvider.shutdown();
+  activeProvider = null;
+}
+
+/**
+ * Return the active storage provider.
+ *
+ * Throws if `initStorage` has not been called yet.
+ */
+export function getStorage(): StorageProvider {
+  if (!activeProvider) {
+    throw new Error('Storage has not been initialised. Call initStorage() first.');
+  }
+  return activeProvider;
+}

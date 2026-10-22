@@ -1,0 +1,539 @@
+/**
+ * Chat Routes — test coverage for #250
+ *
+ * Tests HTTP status codes, request validation, error handling,
+ * and auth middleware enforcement for /api/chat/* endpoints.
+ */
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import request from 'supertest';
+import express from 'express';
+
+// ── Mock dependencies before importing route ─────────────────────────────────
+
+const { mockChatService, mockSendGatewayChat, mockBuildContext } = vi.hoisted(() => ({
+  mockChatService: {
+    getSession: vi.fn(),
+    getSessionForTask: vi.fn(),
+    listSessions: vi.fn(),
+    createSession: vi.fn(),
+    addMessage: vi.fn(),
+    deleteSession: vi.fn(),
+    sendSquadMessage: vi.fn(),
+    getSquadMessages: vi.fn(),
+    searchSquadMessages: vi.fn(),
+    getSquadUnreadState: vi.fn(),
+    markSquadRead: vi.fn(),
+    getSquadThread: vi.fn(),
+    updateSquadMessageState: vi.fn(),
+    addSquadReaction: vi.fn(),
+  },
+  mockSendGatewayChat: vi.fn().mockResolvedValue(undefined),
+  mockBuildContext: vi.fn(),
+}));
+
+vi.mock('../../services/chat-service.js', () => ({
+  getChatService: () => mockChatService,
+}));
+
+vi.mock('../../services/gateway-chat-client.js', () => ({
+  sendGatewayChat: mockSendGatewayChat,
+  loadGatewayToken: vi.fn().mockResolvedValue('token'),
+}));
+
+vi.mock('../../services/veritas-context-service.js', () => ({
+  getVeritasContextService: () => ({
+    buildContext: mockBuildContext,
+  }),
+}));
+
+vi.mock('../../services/broadcast-service.js', () => ({
+  broadcastChatMessage: vi.fn(),
+  broadcastSquadEvent: vi.fn(),
+  broadcastSquadMessage: vi.fn(),
+}));
+
+vi.mock('../../services/squad-webhook-service.js', () => ({
+  fireSquadWebhook: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../services/config-service.js', () => {
+  const ConfigService = function (this: any) {
+    this.getConfig = vi.fn().mockResolvedValue({});
+    this.getFeatureSettings = vi.fn().mockResolvedValue({
+      general: { humanDisplayName: 'Human' },
+      squadWebhook: null,
+    });
+  };
+  return { ConfigService };
+});
+
+vi.mock('../../lib/logger.js', () => ({
+  createLogger: () => ({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  }),
+}));
+
+import { chatRoutes } from '../../routes/chat.js';
+
+// ── App builders ─────────────────────────────────────────────────────────────
+
+function buildApp(authenticated = true) {
+  const app = express();
+  app.use(express.json());
+
+  if (authenticated) {
+    app.use((req: any, _res: any, next: any) => {
+      req.auth = { role: 'admin', keyName: 'test-key', isLocalhost: true };
+      next();
+    });
+  } else {
+    // Simulate auth middleware rejecting unauthenticated requests
+    app.use((_req: any, res: any) => {
+      res.status(401).json({ code: 'AUTH_REQUIRED', message: 'Authentication required' });
+    });
+  }
+
+  app.use('/', chatRoutes);
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    res.status(err.statusCode || 500).json({ code: err.code || 'ERROR', message: err.message });
+  });
+  return app;
+}
+
+const sampleSession = {
+  id: 'sess_1',
+  taskId: null,
+  agent: 'veritas',
+  messages: [],
+  mode: 'ask',
+  createdAt: new Date().toISOString(),
+};
+
+const sampleMessage = {
+  id: 'msg_1',
+  role: 'user',
+  content: 'hello',
+  timestamp: new Date().toISOString(),
+};
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe('Chat Routes', () => {
+  let app: express.Express;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockBuildContext.mockResolvedValue({ contextBlock: '', results: [], degraded: false });
+    app = buildApp(true);
+  });
+
+  // ── Auth enforcement ───────────────────────────────────────────────────────
+
+  describe('auth enforcement', () => {
+    it('POST /send returns 401 without auth', async () => {
+      const unauthApp = buildApp(false);
+      const res = await request(unauthApp).post('/send').send({ message: 'hello' });
+      expect(res.status).toBe(401);
+    });
+
+    it('GET /sessions returns 401 without auth', async () => {
+      const unauthApp = buildApp(false);
+      const res = await request(unauthApp).get('/sessions');
+      expect(res.status).toBe(401);
+    });
+
+    it('DELETE /sessions/:id returns 401 without auth', async () => {
+      const unauthApp = buildApp(false);
+      const res = await request(unauthApp).delete('/sessions/sess_1');
+      expect(res.status).toBe(401);
+    });
+
+    it('POST /squad returns 401 without auth', async () => {
+      const unauthApp = buildApp(false);
+      const res = await request(unauthApp).post('/squad').send({ agent: 'K-2SO', message: 'done' });
+      expect(res.status).toBe(401);
+    });
+
+    it('GET /squad returns 401 without auth', async () => {
+      const unauthApp = buildApp(false);
+      const res = await request(unauthApp).get('/squad');
+      expect(res.status).toBe(401);
+    });
+  });
+
+  // ── POST /send ─────────────────────────────────────────────────────────────
+
+  describe('POST /send', () => {
+    beforeEach(() => {
+      mockChatService.createSession.mockResolvedValue(sampleSession);
+      mockChatService.addMessage.mockResolvedValue(sampleMessage);
+    });
+
+    it('returns 200 with echo of sent message', async () => {
+      const res = await request(app).post('/send').send({ message: 'hello' });
+      expect(res.status).toBe(200);
+    });
+
+    it('returns 4xx/5xx when message is empty string', async () => {
+      const res = await request(app).post('/send').send({ message: '' });
+      // ZodError from schema.parse throws as unhandled → 500 via error handler
+      // Route uses zod .parse() not safeParse, so invalid input returns 500
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('returns 4xx/5xx when message is missing', async () => {
+      const res = await request(app).post('/send').send({});
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('returns 4xx/5xx when mode is invalid', async () => {
+      const res = await request(app).post('/send').send({ message: 'hi', mode: 'invalid' });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('accepts valid mode: ask', async () => {
+      const res = await request(app).post('/send').send({ message: 'hi', mode: 'ask' });
+      expect(res.status).toBe(200);
+    });
+
+    it('accepts valid mode: build', async () => {
+      const res = await request(app).post('/send').send({ message: 'hi', mode: 'build' });
+      expect(res.status).toBe(200);
+    });
+
+    it('injects retrieval context for VERITAS gateway messages', async () => {
+      mockBuildContext.mockResolvedValue({
+        contextBlock: '<veritas_context>\nRelevant task\n</veritas_context>',
+        results: [],
+        degraded: false,
+      });
+
+      const res = await request(app).post('/send').send({ message: 'what overlaps?' });
+
+      expect(res.status).toBe(200);
+      expect(mockBuildContext).toHaveBeenCalledWith({
+        message: 'what overlaps?',
+        taskId: undefined,
+      });
+      expect(mockSendGatewayChat).toHaveBeenCalledWith(
+        'what overlaps?\n\n<veritas_context>\nRelevant task\n</veritas_context>',
+        'kanban-chat-sess_1',
+        expect.any(Object)
+      );
+    });
+
+    it('skips retrieval context when requested', async () => {
+      const res = await request(app)
+        .post('/send')
+        .send({ message: 'plain chat', includeContext: false });
+
+      expect(res.status).toBe(200);
+      expect(mockBuildContext).not.toHaveBeenCalled();
+      expect(mockSendGatewayChat).toHaveBeenCalledWith(
+        'plain chat',
+        'kanban-chat-sess_1',
+        expect.any(Object)
+      );
+    });
+
+    it('accepts optional taskId and sessionId', async () => {
+      mockChatService.getSession.mockResolvedValue(sampleSession);
+      const res = await request(app)
+        .post('/send')
+        .send({ message: 'hello', taskId: 'task_1', sessionId: 'sess_1' });
+      expect(res.status).toBe(200);
+    });
+
+    it('returns 500 on service error', async () => {
+      mockChatService.addMessage.mockRejectedValue(new Error('Storage error'));
+      const res = await request(app).post('/send').send({ message: 'hello' });
+      expect(res.status).toBe(500);
+    });
+  });
+
+  // ── GET /sessions ──────────────────────────────────────────────────────────
+
+  describe('GET /sessions', () => {
+    it('returns 200 with list of sessions', async () => {
+      mockChatService.listSessions.mockResolvedValue([sampleSession]);
+      const res = await request(app).get('/sessions');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+    });
+
+    it('returns empty array when no sessions', async () => {
+      mockChatService.listSessions.mockResolvedValue([]);
+      const res = await request(app).get('/sessions');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([]);
+    });
+
+    it('returns 500 on service error', async () => {
+      mockChatService.listSessions.mockRejectedValue(new Error('DB error'));
+      const res = await request(app).get('/sessions');
+      expect(res.status).toBe(500);
+    });
+  });
+
+  // ── GET /sessions/:id ──────────────────────────────────────────────────────
+
+  describe('GET /sessions/:id', () => {
+    it('returns 200 for existing session', async () => {
+      mockChatService.getSession.mockResolvedValue(sampleSession);
+      const res = await request(app).get('/sessions/sess_1');
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe('sess_1');
+    });
+
+    it('returns 404 for non-existent session', async () => {
+      mockChatService.getSession.mockResolvedValue(null);
+      const res = await request(app).get('/sessions/missing');
+      expect(res.status).toBe(404);
+    });
+
+    it('returns 500 on service error', async () => {
+      mockChatService.getSession.mockRejectedValue(new Error('Read error'));
+      const res = await request(app).get('/sessions/sess_1');
+      expect(res.status).toBe(500);
+    });
+  });
+
+  // ── GET /sessions/:id/history ──────────────────────────────────────────────
+
+  describe('GET /sessions/:id/history', () => {
+    it('returns 200 with message array', async () => {
+      mockChatService.getSession.mockResolvedValue({ ...sampleSession, messages: [sampleMessage] });
+      const res = await request(app).get('/sessions/sess_1/history');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+    });
+
+    it('returns 404 for non-existent session', async () => {
+      mockChatService.getSession.mockResolvedValue(null);
+      const res = await request(app).get('/sessions/missing/history');
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // ── DELETE /sessions/:id ──────────────────────────────────────────────────
+
+  describe('DELETE /sessions/:id', () => {
+    it('returns 204 on successful delete', async () => {
+      mockChatService.deleteSession.mockResolvedValue(undefined);
+      const res = await request(app).delete('/sessions/sess_1');
+      expect(res.status).toBe(204);
+    });
+
+    it('returns 500 on service error', async () => {
+      mockChatService.deleteSession.mockRejectedValue(new Error('Delete failed'));
+      const res = await request(app).delete('/sessions/sess_1');
+      expect(res.status).toBe(500);
+    });
+  });
+
+  // ── POST /squad ───────────────────────────────────────────────────────────
+
+  describe('POST /squad', () => {
+    const validSquadMsg = { agent: 'K-2SO', message: 'Task complete' };
+
+    it('returns 201 on valid squad message', async () => {
+      mockChatService.sendSquadMessage.mockResolvedValue({ id: 'msg_s1', ...validSquadMsg });
+      const res = await request(app).post('/squad').send(validSquadMsg);
+      expect(res.status).toBe(201);
+    });
+
+    it('returns 4xx/5xx when agent is missing', async () => {
+      // ZodError from schema.parse → 500 via error handler
+      const res = await request(app).post('/squad').send({ message: 'hello' });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('returns 4xx/5xx when message is empty', async () => {
+      const res = await request(app).post('/squad').send({ agent: 'K-2SO', message: '' });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('returns 4xx/5xx when event type is invalid', async () => {
+      const res = await request(app)
+        .post('/squad')
+        .send({ agent: 'K-2SO', message: 'hi', event: 'invalid.event' });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+    });
+
+    it('accepts valid event type', async () => {
+      mockChatService.sendSquadMessage.mockResolvedValue({ id: 'msg_s2', ...validSquadMsg });
+      const res = await request(app)
+        .post('/squad')
+        .send({ agent: 'K-2SO', message: 'Spawned', event: 'agent.spawned' });
+      expect(res.status).toBe(201);
+    });
+
+    it('passes collaboration metadata to the service', async () => {
+      mockChatService.sendSquadMessage.mockResolvedValue({
+        id: 'msg_s3',
+        ...validSquadMsg,
+        mentions: [{ target: 'case' }],
+        replyToId: 'msg_parent',
+      });
+      const res = await request(app)
+        .post('/squad')
+        .send({
+          ...validSquadMsg,
+          replyToId: 'msg_parent',
+          mentions: [{ target: 'case', kind: 'agent' }],
+          taskId: 'task-1',
+          runId: 'run-1',
+          pinned: true,
+          decision: true,
+        });
+
+      expect(res.status).toBe(201);
+      expect(mockChatService.sendSquadMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          replyToId: 'msg_parent',
+          mentions: [{ target: 'case', kind: 'agent' }],
+          taskId: 'task-1',
+          runId: 'run-1',
+          pinned: true,
+          decision: true,
+        }),
+        undefined
+      );
+    });
+
+    it('returns 500 on service error', async () => {
+      mockChatService.sendSquadMessage.mockRejectedValue(new Error('Write failed'));
+      const res = await request(app).post('/squad').send(validSquadMsg);
+      expect(res.status).toBe(500);
+    });
+  });
+
+  // ── GET /squad ────────────────────────────────────────────────────────────
+
+  describe('GET /squad', () => {
+    it('returns 200 with squad messages array', async () => {
+      mockChatService.getSquadMessages.mockResolvedValue([
+        { id: 'm1', agent: 'VERITAS', message: 'hi' },
+      ]);
+      const res = await request(app).get('/squad');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body)).toBe(true);
+    });
+
+    it('passes query parameters to the service', async () => {
+      mockChatService.getSquadMessages.mockResolvedValue([]);
+      const res = await request(app).get('/squad?agent=K-2SO&limit=10&includeSystem=false');
+      expect(res.status).toBe(200);
+    });
+
+    it('returns 500 on service error', async () => {
+      mockChatService.getSquadMessages.mockRejectedValue(new Error('Read failed'));
+      const res = await request(app).get('/squad');
+      expect(res.status).toBe(500);
+    });
+  });
+
+  describe('Squad collaboration endpoints', () => {
+    it('searches squad messages with bounded query params', async () => {
+      mockChatService.searchSquadMessages.mockResolvedValue({
+        query: 'review',
+        results: [
+          { messageId: 'm1', timestamp: '2026-01-01T00:00:00Z', agent: 'CASE', snippet: 'review' },
+        ],
+      });
+
+      const res = await request(app).get('/squad/search?q=review&limit=5&includeSystem=false');
+
+      expect(res.status).toBe(200);
+      expect(mockChatService.searchSquadMessages).toHaveBeenCalledWith({
+        query: 'review',
+        limit: 5,
+        agent: undefined,
+        includeSystem: false,
+      });
+    });
+
+    it('gets and marks unread state for an actor', async () => {
+      mockChatService.getSquadUnreadState.mockResolvedValue({
+        actor: 'case',
+        unreadCount: 2,
+        mentionCount: 1,
+      });
+      mockChatService.markSquadRead.mockResolvedValue({
+        actor: 'case',
+        unreadCount: 0,
+        mentionCount: 0,
+      });
+
+      const getRes = await request(app).get('/squad/unread?actor=case');
+      const postRes = await request(app)
+        .post('/squad/read')
+        .send({ actor: 'case', messageId: 'msg_1' });
+
+      expect(getRes.status).toBe(200);
+      expect(postRes.status).toBe(200);
+      expect(mockChatService.getSquadUnreadState).toHaveBeenCalledWith('case');
+      expect(mockChatService.markSquadRead).toHaveBeenCalledWith({
+        actor: 'case',
+        messageId: 'msg_1',
+      });
+    });
+
+    it('returns 400 for unread state without actor', async () => {
+      const res = await request(app).get('/squad/unread');
+      expect(res.status).toBe(400);
+    });
+
+    it('returns a compact squad thread', async () => {
+      mockChatService.getSquadThread.mockResolvedValue([
+        { id: 'msg_root', agent: 'VERITAS', message: 'root' },
+        { id: 'msg_reply', agent: 'CASE', message: 'reply', replyToId: 'msg_root' },
+      ]);
+
+      const res = await request(app).get('/squad/msg_reply/thread');
+
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveLength(2);
+    });
+
+    it('returns 404 for missing squad threads', async () => {
+      mockChatService.getSquadThread.mockResolvedValue([]);
+      const res = await request(app).get('/squad/missing/thread');
+      expect(res.status).toBe(404);
+    });
+
+    it('updates pinned/decision state and reactions', async () => {
+      mockChatService.updateSquadMessageState.mockResolvedValue({
+        id: 'msg_1',
+        agent: 'CASE',
+        message: 'decision',
+        pinned: true,
+      });
+      mockChatService.addSquadReaction.mockResolvedValue({
+        id: 'msg_1',
+        agent: 'CASE',
+        message: 'decision',
+        reactions: [{ actor: 'human', reaction: 'ack', createdAt: 'now' }],
+      });
+
+      const pinRes = await request(app).post('/squad/msg_1/pin').send({ pinned: true });
+      const reactRes = await request(app)
+        .post('/squad/msg_1/react')
+        .send({ actor: 'human', reaction: 'ack' });
+
+      expect(pinRes.status).toBe(200);
+      expect(reactRes.status).toBe(200);
+      expect(mockChatService.updateSquadMessageState).toHaveBeenCalledWith('msg_1', {
+        pinned: true,
+      });
+      expect(mockChatService.addSquadReaction).toHaveBeenCalledWith({
+        messageId: 'msg_1',
+        actor: 'human',
+        reaction: 'ack',
+      });
+    });
+  });
+});

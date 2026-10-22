@@ -1,0 +1,5012 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const {
+  mockSpawn,
+  mockGetConfig,
+  mockSaveConfig,
+  mockGetTask,
+  mockListTasks,
+  mockUpdateTask,
+  mockPatchTaskAttempt,
+  mockCheckAgent,
+  mockTelemetryEmit,
+  mockGovernanceRecord,
+  mockLogActivity,
+  mockStartTrace,
+  mockStartStep,
+  mockEndStep,
+  mockCompleteTrace,
+  mockSdkConstructor,
+  mockSdkStartThread,
+  mockSdkRunStreamed,
+  mockHandleDurableGoalCompletion,
+  mockReconcileDurableGoalContinuation,
+  mockWorkspaceRewindExecute,
+  mockWorkspaceRewindOptions,
+} = vi.hoisted(() => ({
+  mockSpawn: vi.fn(),
+  mockGetConfig: vi.fn(),
+  mockSaveConfig: vi.fn(),
+  mockGetTask: vi.fn(),
+  mockListTasks: vi.fn(),
+  mockUpdateTask: vi.fn(),
+  mockPatchTaskAttempt: vi.fn(),
+  mockCheckAgent: vi.fn(),
+  mockTelemetryEmit: vi.fn(),
+  mockGovernanceRecord: vi.fn(),
+  mockLogActivity: vi.fn(),
+  mockStartTrace: vi.fn(),
+  mockStartStep: vi.fn(),
+  mockEndStep: vi.fn(),
+  mockCompleteTrace: vi.fn(),
+  mockSdkConstructor: vi.fn(),
+  mockSdkStartThread: vi.fn(),
+  mockSdkRunStreamed: vi.fn(),
+  mockHandleDurableGoalCompletion: vi.fn(),
+  mockReconcileDurableGoalContinuation: vi.fn(),
+  mockWorkspaceRewindExecute: vi.fn(),
+  mockWorkspaceRewindOptions: {
+    current: undefined as
+      | import('../services/workspace-checkpoint-rewind-service.js').WorkspaceCheckpointRewindServiceOptions
+      | undefined,
+  },
+}));
+
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawn: mockSpawn,
+  };
+});
+
+vi.mock('../services/filesystem-sandbox-service.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/filesystem-sandbox-service.js')>();
+  const filesystemSandbox = {
+    probe: vi.fn(async () => ({
+      backend: 'none' as const,
+      state: 'unavailable' as const,
+      capabilityVersion: 'filesystem-sandbox-probe/v2',
+      platformBackend: 'none' as const,
+      supported: [],
+      reason: 'Native filesystem sandbox probing is disabled in provider unit tests.',
+    })),
+    compile: vi.fn(
+      async (
+        input: Parameters<
+          import('../services/filesystem-sandbox-service.js').FilesystemSandboxService['compile']
+        >[0]
+      ) => ({
+        evidence: {
+          schemaVersion: 'filesystem-sandbox-evidence/v1' as const,
+          providerRuntimeManifestDigest: input.providerRuntimeManifestDigest,
+          backend: 'none' as const,
+          state: 'advisory' as const,
+          platformBackend: 'none' as const,
+          capabilityVersion: 'filesystem-sandbox-probe/v2',
+          policyHash: `sha256:${'b'.repeat(64)}`,
+          roots: [],
+          protectedPaths: [],
+          dotfileMasking: false,
+          descendantsEnforced: false,
+          cleanupOwner: 'none' as const,
+        },
+        environment: {},
+      })
+    ),
+    activate: vi.fn(),
+    cleanup: vi.fn(),
+    wrap: vi.fn((_plan: unknown, command: string, args: string[], cwd: string) => ({
+      command,
+      args: [...args],
+      cwd,
+      environment: {},
+    })),
+  };
+  return {
+    ...actual,
+    getFilesystemSandboxService: () => filesystemSandbox,
+  };
+});
+
+vi.mock('@openai/codex-sdk', () => ({
+  Codex: class {
+    constructor(options: unknown) {
+      mockSdkConstructor(options);
+    }
+
+    startThread = mockSdkStartThread;
+  },
+}));
+
+vi.mock('../services/config-service.js', () => ({
+  ConfigService: function () {
+    return { getConfig: mockGetConfig, saveConfig: mockSaveConfig };
+  },
+  getConfigService: () => ({ getConfig: mockGetConfig, saveConfig: mockSaveConfig }),
+}));
+
+vi.mock('../services/task-service.js', () => ({
+  TaskService: function () {
+    return {
+      getTask: mockGetTask,
+      listTasks: mockListTasks,
+      updateTask: mockUpdateTask,
+      patchTaskAttempt: mockPatchTaskAttempt,
+    };
+  },
+  getTaskService: () => ({
+    getTask: mockGetTask,
+    listTasks: mockListTasks,
+    updateTask: mockUpdateTask,
+    patchTaskAttempt: mockPatchTaskAttempt,
+  }),
+}));
+
+vi.mock('../services/telemetry-service.js', () => ({
+  getTelemetryService: () => ({ emit: mockTelemetryEmit, getConfig: () => ({ traces: true }) }),
+}));
+
+vi.mock('../services/governance-trace-service.js', () => ({
+  getGovernanceTraceService: () => ({ record: mockGovernanceRecord }),
+}));
+
+vi.mock('../services/activity-service.js', () => ({
+  activityService: { logActivity: mockLogActivity },
+}));
+
+vi.mock('../services/trace-service.js', () => ({
+  getTraceService: () => ({
+    startTrace: mockStartTrace,
+    startStep: mockStartStep,
+    endStep: mockEndStep,
+    completeTrace: mockCompleteTrace,
+  }),
+}));
+
+vi.mock('../services/agent-routing-service.js', () => ({
+  getAgentRoutingService: () => ({
+    resolveAgent: vi.fn().mockResolvedValue({ agent: 'codex', reason: 'test' }),
+  }),
+}));
+
+vi.mock('../services/agent-health-service.js', () => ({
+  AgentHealthService: function () {
+    return { checkAgent: mockCheckAgent };
+  },
+}));
+
+vi.mock('../services/circuit-registry.js', () => ({
+  getBreaker: () => ({ execute: (fn: () => Promise<void>) => fn() }),
+}));
+
+vi.mock('../services/workspace-checkpoint-rewind-service.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../services/workspace-checkpoint-rewind-service.js')>();
+  return {
+    ...actual,
+    WorkspaceCheckpointRewindService: class {
+      constructor(
+        options: import('../services/workspace-checkpoint-rewind-service.js').WorkspaceCheckpointRewindServiceOptions
+      ) {
+        mockWorkspaceRewindOptions.current = options;
+      }
+
+      execute = mockWorkspaceRewindExecute;
+    },
+  };
+});
+
+import {
+  AgentReadinessError,
+  ClawdbotAgentService,
+  type AgentProviderAdmissionEvidence,
+  type AgentStatus,
+  type CredentialLeaseLifecycle,
+} from '../services/clawdbot-agent-service.js';
+import type { ThreadEvent } from '@openai/codex-sdk';
+import type {
+  AgentConfig,
+  RunApprovalRequest,
+  SandboxPolicyDryRunResult,
+  Task,
+  TaskAttempt,
+  ExecutionTreeIdentity,
+  AdmissionQueueClaim,
+  RunRecoveryRecord,
+  WorkspaceCheckpointRewindTransaction,
+} from '@veritas-kanban/shared';
+import { providerRuntimeManifestFixture } from './fixtures/provider-runtime-manifest.js';
+import {
+  TaskEnvelopeService,
+  type CompletionEvidenceSource,
+} from '../services/task-envelope-service.js';
+import { ProviderCompletionService } from '../services/provider-completion-service.js';
+import { HttpOpenClawTaskAdapter } from '../services/openclaw-workflow-adapter.js';
+import { startOpenClawCompletionFixture } from './fixtures/openclaw-completion-gateway.js';
+import type { ReflectionExtractionJobService } from '../services/reflection-extraction-job-service.js';
+import type {
+  CreateRunApprovalRequestInput,
+  RunApprovalBrokerService,
+} from '../services/run-approval-broker-service.js';
+import { digestRunLaunchValue } from '../utils/run-launch-manifest-digest.js';
+import type { RunSupervisorService } from '../services/run-supervisor-service.js';
+import type {
+  PrepareRunToolCatalogInput,
+  ToolControlPlaneService,
+} from '../services/tool-control-plane-service.js';
+import { calculateRunToolCatalogDigest } from '../utils/tool-control-plane-digest.js';
+import type { FilesystemSandboxService } from '../services/filesystem-sandbox-service.js';
+import type { SandboxPolicyService } from '../services/sandbox-policy-service.js';
+import type { WorkspaceExecutionTrustService } from '../services/workspace-execution-trust-service.js';
+import type { AdmissionControlService } from '../services/admission-control-service.js';
+import type { RunTerminalService } from '../services/run-terminal-service.js';
+import type { WorkspaceCheckpointService } from '../services/workspace-checkpoint-service.js';
+import type { RunFileExecutionPolicyService } from '../services/run-file-execution-policy-service.js';
+import type { RunLaunchCompiler } from '../services/run-launch-compiler.js';
+
+const fixtureDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'codex');
+
+type TestableClawdbotAgentService = ClawdbotAgentService & {
+  logsDir: string;
+  runLaunchCompiler: Pick<
+    RunLaunchCompiler,
+    'buildRunLaunchEnvironment' | 'buildRunLaunchRuntime' | 'normalizeRunLaunchTaskPrompt'
+  >;
+  handleCodexEvent(
+    event: Record<string, unknown>,
+    logPath: string,
+    task?: Task,
+    attemptId?: string,
+    agentConfig?: Partial<AgentConfig>
+  ): Promise<{
+    summary?: string;
+    usage?: { inputTokens: number; outputTokens: number; totalTokens?: number; model?: string };
+  }>;
+  recordCodexThread(task: Task, attemptId: string, threadId: string): Promise<void>;
+};
+
+function testReflectionExtractionJobs(): Pick<ReflectionExtractionJobService, 'enqueue'> {
+  return {
+    enqueue: vi.fn().mockResolvedValue({}),
+  } as unknown as Pick<ReflectionExtractionJobService, 'enqueue'>;
+}
+
+function testableService(
+  tmpDir: string,
+  credentialLeases?: CredentialLeaseLifecycle,
+  approvalBroker?: RunApprovalBrokerService,
+  toolControlPlane?: ToolControlPlaneService,
+  filesystemSandbox?: Pick<FilesystemSandboxService, 'compile' | 'activate' | 'cleanup' | 'wrap'>,
+  sandboxPolicies?: Pick<SandboxPolicyService, 'dryRunWithTrace'>,
+  workspaceExecutionTrust: Pick<
+    WorkspaceExecutionTrustService,
+    'scan' | 'evaluateForLaunch' | 'assertFresh'
+  > = testWorkspaceExecutionTrust(),
+  admission: AdmissionControlService = testAdmissionControl(),
+  runTerminals: Pick<
+    RunTerminalService,
+    'execute' | 'list' | 'cleanupAttempt' | 'reconcileAttempt'
+  > = testRunTerminals(),
+  workspaceCheckpoints: Pick<
+    WorkspaceCheckpointService,
+    'captureBoundary'
+  > = testWorkspaceCheckpoints(),
+  runFileExecutionPolicy: Pick<
+    RunFileExecutionPolicyService,
+    'evaluate' | 'revalidate'
+  > = testRunFileExecutionPolicy()
+): TestableClawdbotAgentService {
+  const completionEvidence = testCompletionEvidence();
+  const taskEnvelopes = new TaskEnvelopeService(completionEvidence);
+  const service = new ClawdbotAgentService(
+    undefined,
+    undefined,
+    taskEnvelopes,
+    undefined,
+    new ProviderCompletionService(completionEvidence),
+    credentialLeases,
+    undefined,
+    undefined,
+    approvalBroker,
+    testRunSupervisor(),
+    undefined,
+    toolControlPlane,
+    undefined,
+    undefined,
+    filesystemSandbox,
+    sandboxPolicies,
+    workspaceExecutionTrust,
+    undefined,
+    { getCurrent: vi.fn().mockResolvedValue(null) },
+    admission,
+    undefined,
+    {
+      handleRunCompletion: mockHandleDurableGoalCompletion,
+      reconcilePlannedForTask: mockReconcileDurableGoalContinuation,
+    },
+    testReflectionExtractionJobs(),
+    undefined,
+    runTerminals,
+    workspaceCheckpoints,
+    runFileExecutionPolicy
+  ) as unknown as TestableClawdbotAgentService;
+  service.logsDir = tmpDir;
+  return service;
+}
+
+function testRunFileExecutionPolicy(): Pick<
+  RunFileExecutionPolicyService,
+  'evaluate' | 'revalidate'
+> {
+  return {
+    evaluate: vi.fn(async (input) => ({
+      schemaVersion: 'run-file-execution-approval-evidence/v1',
+      workspaceId: input.workspaceId,
+      taskId: input.taskId,
+      rootObjectiveId: input.rootObjectiveId,
+      executionNodeId: input.executionNodeId,
+      runId: input.runId,
+      attemptId: input.attemptId,
+      workflowStepId: input.workflowStepId,
+      terminalRequestId: input.request.requestId,
+      terminalRequestDigest: `sha256:${'d'.repeat(64)}`,
+      commandId: 'cmd_test',
+      launchManifestDigest: input.launchManifestDigest,
+      phaseEvidenceDigest: input.phaseEvidenceDigest,
+      policy: {
+        schemaVersion: 'run-file-execution-policy/v1',
+        agentCreated: 'standard-approval',
+        commandCreated: 'standard-approval',
+        toolCreated: 'standard-approval',
+      },
+      references: [],
+      decision: 'standard-approval',
+      reasonCode: 'no-referenced-files',
+      digest: `sha256:${'e'.repeat(64)}`,
+    })),
+    revalidate: vi.fn(async () => undefined),
+  };
+}
+
+function testWorkspaceCheckpoints(): Pick<WorkspaceCheckpointService, 'captureBoundary'> {
+  return {
+    captureBoundary: vi.fn(async () => ({
+      status: 'skipped' as const,
+      reason: 'unmanaged-worktree' as const,
+    })),
+  };
+}
+
+function testRunTerminals(): Pick<
+  RunTerminalService,
+  'execute' | 'list' | 'cleanupAttempt' | 'reconcileAttempt'
+> {
+  return {
+    execute: vi.fn(),
+    list: vi.fn(() => []),
+    cleanupAttempt: vi.fn(async () => []),
+    reconcileAttempt: vi.fn(async (workspaceId, taskId, attemptId) => ({
+      schemaVersion: 'run-terminal-reconciliation/v1',
+      workspaceId,
+      taskId,
+      attemptId,
+      handles: [],
+      recoveredHandleIds: [],
+      interruptedHandleIds: [],
+    })),
+  };
+}
+
+function testAdmissionControl(): AdmissionControlService {
+  let sequence = 0;
+  const admit = vi.fn(async (input: { taskId: string }) => ({
+    outcome: 'admitted',
+    reservation: { id: `admission-test-${input.taskId}-${++sequence}` },
+  }));
+  return {
+    admit,
+    admitOrQueue: admit,
+    bindAttempt: vi.fn(async (id: string) => ({ id })),
+    bindQueuedAttempt: vi.fn(async (_queueId: string, id: string) => ({ id })),
+    get: vi.fn(async (id: string) => ({ id, request: { budgetPolicies: [] } })),
+    recordBudgetUsage: vi.fn(async (id: string) => ({ id })),
+    release: vi.fn(async (id: string) => ({ id })),
+    releaseIfUnbound: vi.fn(async (id: string) => ({ id })),
+    releaseByAttempt: vi.fn(async () => null),
+    expireAbandoned: vi.fn(async () => []),
+    recoverVerifiedRun: vi.fn(async () => null),
+    claimNextQueued: vi.fn(async () => null),
+    assertExecutionTreeLaunchAllowed: vi.fn(async () => undefined),
+    cancelExecutionTree: vi.fn(),
+  } as unknown as AdmissionControlService;
+}
+
+function testWorkspaceExecutionTrust(): Pick<
+  WorkspaceExecutionTrustService,
+  'scan' | 'evaluateForLaunch' | 'assertFresh'
+> {
+  const identity = {
+    schemaVersion: 'workspace-execution-trust/v1' as const,
+    digest: `sha256:${'1'.repeat(64)}`,
+    canonicalWorkspacePathDigest: `sha256:${'2'.repeat(64)}`,
+    canonicalRepositoryRootDigest: `sha256:${'3'.repeat(64)}`,
+    gitCommonDirectoryDigest: `sha256:${'4'.repeat(64)}`,
+    remoteIdentityDigest: `sha256:${'5'.repeat(64)}`,
+  };
+  const inventory = {
+    schemaVersion: 'workspace-execution-trust-inventory/v1' as const,
+    digest: `sha256:${'6'.repeat(64)}`,
+    scannerRevision: 1,
+    scannedAt: '2026-07-23T20:00:00.000Z',
+    identity,
+    entries: [],
+    projectPolicy: {
+      maximumTrust: 'trusted' as const,
+      valid: true,
+    },
+  };
+  const evaluation = {
+    schemaVersion: 'workspace-execution-trust/v1' as const,
+    status: 'not-required' as const,
+    source: 'No repository-controlled execution components were discovered.',
+    requiresExplicitDecision: false,
+    identity,
+    inventory,
+    restrictionChecks: [],
+  };
+  return {
+    scan: vi.fn(async () => ({ inventory })),
+    evaluateForLaunch: vi.fn(async () => evaluation),
+    assertFresh: vi.fn(async () => undefined),
+  };
+}
+
+function testRunSupervisor(): RunSupervisorService {
+  return {
+    register: vi.fn(async (input: { attemptId: string }) => ({
+      id: `runsupervisor_test_${input.attemptId}`,
+    })),
+    attachLocalProcess: vi.fn(),
+    attachRemoteSession: vi.fn(),
+    checkpoint: vi.fn(),
+    markTerminal: vi.fn().mockResolvedValue(undefined),
+    findByAttempt: vi.fn().mockResolvedValue(null),
+    get: vi.fn().mockResolvedValue({ control: { kind: 'local-process' } }),
+    stopLocalProcess: vi.fn(),
+    isLocalProcessAlive: vi.fn().mockReturnValue(true),
+  } as unknown as RunSupervisorService;
+}
+
+function testCompletionEvidence(): CompletionEvidenceSource {
+  return {
+    captureLaunchBaseline: async (_worktreePath, capturedAt) => ({
+      capturedAt,
+      headSha: 'a'.repeat(40),
+      dirty: false,
+      files: [],
+    }),
+    captureCompletionEvidence: async ({ taskEnvelope, capturedAt }) => ({
+      capturedAt,
+      headSha: taskEnvelope.workspace.baseline.headSha,
+      changedFiles: [],
+      commits: [],
+      artifacts: [],
+      verification: taskEnvelope.verificationGates.map((gate) => ({
+        gateId: gate.id,
+        status: 'passed' as const,
+        summary: 'Mock harness verification passed.',
+        evidenceIds: [`verification-${gate.id}`],
+      })),
+      sideEffects: [],
+    }),
+  };
+}
+
+function createFakeChild(fixture: string, exitCode = 0) {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    pid: number;
+    killed: boolean;
+    kill: ReturnType<typeof vi.fn>;
+  };
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 12345;
+  child.killed = false;
+  child.kill = vi.fn(() => {
+    child.killed = true;
+    child.emit('close', 143, 'SIGTERM');
+    return true;
+  });
+
+  queueMicrotask(() => {
+    child.stdout.once('end', () => {
+      child.emit('close', exitCode, null);
+    });
+    child.stdout.end(fixture);
+  });
+
+  return child;
+}
+
+function createControllableChild() {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    pid: number;
+    killed: boolean;
+    kill: ReturnType<typeof vi.fn>;
+  };
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 12345;
+  child.killed = false;
+  child.kill = vi.fn(() => {
+    child.killed = true;
+    return true;
+  });
+  return child;
+}
+
+function createFakeCodexAppServerChild(
+  received: Array<Record<string, unknown>>,
+  options: { requestApproval?: boolean; holdTurnOpen?: boolean } = {}
+) {
+  const child = new EventEmitter() as EventEmitter & {
+    stdin: PassThrough;
+    stdout: PassThrough;
+    stderr: PassThrough;
+    pid: number;
+    killed: boolean;
+    exitCode: number | null;
+    signalCode: NodeJS.Signals | null;
+    kill: ReturnType<typeof vi.fn>;
+  };
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 54321;
+  child.killed = false;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = vi.fn((signal: NodeJS.Signals = 'SIGTERM') => {
+    if (child.exitCode != null || child.signalCode != null) return false;
+    child.killed = true;
+    child.signalCode = signal;
+    queueMicrotask(() => child.emit('close', null, signal));
+    return true;
+  });
+  const writeCompletion = (
+    status: 'completed' | 'interrupted' = 'completed',
+    threadId = 'thread-app-server-fixture',
+    turnId = 'turn-app-server-fixture'
+  ) => {
+    const tokenUsage = {
+      cachedInputTokens: 0,
+      inputTokens: 11,
+      outputTokens: 4,
+      reasoningOutputTokens: 0,
+      totalTokens: 15,
+    };
+    child.stdout.write(
+      [
+        JSON.stringify({
+          method: 'item/agentMessage/delta',
+          params: {
+            threadId,
+            turnId,
+            itemId: 'message-app-server-fixture',
+            delta: 'app-server completed',
+          },
+        }),
+        JSON.stringify({
+          method: 'thread/tokenUsage/updated',
+          params: {
+            threadId,
+            turnId,
+            tokenUsage: { last: tokenUsage, total: tokenUsage },
+          },
+        }),
+        JSON.stringify({
+          method: 'turn/completed',
+          params: {
+            threadId,
+            turn: { id: turnId, items: [], status },
+          },
+        }),
+      ].join('\n') + '\n'
+    );
+  };
+
+  let inputBuffer = '';
+  child.stdin.setEncoding('utf8');
+  child.stdin.on('data', (chunk: string) => {
+    inputBuffer += chunk;
+    const lines = inputBuffer.split(/\r?\n/);
+    inputBuffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const request = JSON.parse(line) as Record<string, unknown>;
+      received.push(request);
+      const id = request.id;
+      if (id === 'approval-app-server-fixture' && request.method === undefined) {
+        writeCompletion();
+      } else if (request.method === 'initialize') {
+        child.stdout.write(
+          `${JSON.stringify({
+            id,
+            result: {
+              codexHome: '/tmp/codex-home',
+              platformFamily: 'unix',
+              platformOs: 'macos',
+              userAgent: 'codex-cli 0.145.0',
+            },
+          })}\n`
+        );
+      } else if (request.method === 'thread/start') {
+        child.stdout.write(
+          `${JSON.stringify({
+            id,
+            result: {
+              approvalPolicy: 'on-request',
+              approvalsReviewer: 'user',
+              cwd: tmpPath(request, 'params', 'cwd'),
+              model: 'gpt-5.6',
+              modelProvider: 'openai',
+              sandbox: { type: 'workspaceWrite', networkAccess: false, writableRoots: [] },
+              thread: {
+                cliVersion: '0.145.0',
+                createdAt: 1,
+                cwd: tmpPath(request, 'params', 'cwd'),
+                ephemeral: false,
+                id: 'thread-app-server-fixture',
+                modelProvider: 'openai',
+                preview: 'fixture',
+                sessionId: 'thread-app-server-fixture',
+                source: 'appServer',
+                status: { type: 'idle' },
+                turns: [],
+                updatedAt: 1,
+              },
+            },
+          })}\n`
+        );
+      } else if (request.method === 'turn/start') {
+        const requestedThreadId = tmpPath(request, 'params', 'threadId');
+        const startedTurnId =
+          requestedThreadId === 'thread-app-server-rewind'
+            ? 'turn-app-server-recovered'
+            : 'turn-app-server-fixture';
+        child.stdout.write(
+          `${JSON.stringify({
+            id,
+            result: {
+              turn: { id: startedTurnId, items: [], status: 'inProgress' },
+            },
+          })}\n`
+        );
+        if (options.requestApproval) {
+          child.stdout.write(
+            `${JSON.stringify({
+              id: 'approval-app-server-fixture',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: 'thread-app-server-fixture',
+                turnId: 'turn-app-server-fixture',
+                itemId: 'command-app-server-fixture',
+                startedAtMs: 1,
+                command: 'pnpm test',
+                cwd: '/tmp/worktree',
+                reason: 'Run the verification gate.',
+              },
+            })}\n`
+          );
+        } else if (!options.holdTurnOpen) {
+          writeCompletion();
+        }
+      } else if (request.method === 'turn/steer') {
+        child.stdout.write(
+          `${JSON.stringify({
+            id,
+            result: { turnId: 'turn-app-server-fixture' },
+          })}\n`
+        );
+      } else if (request.method === 'thread/fork') {
+        child.stdout.write(
+          `${JSON.stringify({
+            id,
+            result: {
+              approvalPolicy: 'on-request',
+              approvalsReviewer: 'user',
+              cwd: tmpPath(request, 'params', 'cwd'),
+              model: 'gpt-5.6',
+              modelProvider: 'openai',
+              sandbox: { type: 'workspaceWrite', networkAccess: false, writableRoots: [] },
+              thread: {
+                cliVersion: '0.145.0',
+                createdAt: 2,
+                cwd: tmpPath(request, 'params', 'cwd'),
+                ephemeral: false,
+                id: 'thread-app-server-rewind',
+                modelProvider: 'openai',
+                preview: 'rewind fixture',
+                sessionId: 'thread-app-server-rewind',
+                source: 'appServer',
+                status: { type: 'idle' },
+                turns: [],
+                updatedAt: 2,
+              },
+            },
+          })}\n`
+        );
+      } else if (request.method === 'thread/compact/start') {
+        child.stdout.write(`${JSON.stringify({ id, result: {} })}\n`);
+      } else if (request.method === 'turn/interrupt') {
+        child.stdout.write(`${JSON.stringify({ id, result: {} })}\n`);
+        if (options.holdTurnOpen) {
+          writeCompletion(
+            'interrupted',
+            tmpPath(request, 'params', 'threadId'),
+            tmpPath(request, 'params', 'turnId')
+          );
+        }
+      }
+    }
+  });
+  child.stdin.once('finish', () => {
+    child.stdout.end();
+    child.exitCode = 0;
+    queueMicrotask(() => child.emit('close', 0, null));
+  });
+  return child;
+}
+
+function tmpPath(record: Record<string, unknown>, parent: string, child: string): string {
+  const nested = record[parent];
+  if (!nested || typeof nested !== 'object' || Array.isArray(nested)) return '/tmp/worktree';
+  const value = (nested as Record<string, unknown>)[child];
+  return typeof value === 'string' ? value : '/tmp/worktree';
+}
+
+async function waitFor(assertion: () => void | Promise<void>): Promise<void> {
+  const started = Date.now();
+  let lastError: unknown;
+  while (Date.now() - started < 10_000) {
+    try {
+      await assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw lastError;
+}
+
+describe('ClawdbotAgentService Codex providers', () => {
+  let tmpDir: string;
+  let task: Task;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mockWorkspaceRewindOptions.current = undefined;
+    mockHandleDurableGoalCompletion.mockResolvedValue({ action: 'not-found' });
+    mockReconcileDurableGoalContinuation.mockResolvedValue({ action: 'not-found' });
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-provider-'));
+    task = {
+      id: 'task_codex_fixture',
+      title: 'Codex fixture task',
+      description:
+        'Exercise mocked Codex JSONL and produce a report artifact with verification evidence.',
+      type: 'code',
+      status: 'todo',
+      priority: 'medium',
+      agent: 'codex',
+      project: 'veritas',
+      created: new Date().toISOString(),
+      updated: new Date().toISOString(),
+      git: {
+        repo: 'BradGroux/veritas-kanban',
+        branch: 'codex-fixture',
+        baseBranch: 'main',
+        worktreePath: tmpDir,
+      },
+      subtasks: [
+        {
+          id: 'sub_fixture',
+          title: 'Confirm fixture output',
+          completed: false,
+          created: new Date().toISOString(),
+          acceptanceCriteria: ['Codex fixture records the expected output artifact'],
+        },
+      ],
+      verificationSteps: [
+        { id: 'verify_fixture', description: 'Run mocked Codex provider test', checked: false },
+      ],
+    } as Task;
+
+    mockGetTask.mockImplementation(async () => task);
+    mockListTasks.mockImplementation(async () => [task]);
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      task = { ...task, ...update } as Task;
+      return task;
+    });
+    mockPatchTaskAttempt.mockImplementation(async (_id, attemptId, patch) => {
+      if (task.attempt?.id !== attemptId) return null;
+      task = { ...task, attempt: { ...task.attempt, ...patch } } as Task;
+      return task;
+    });
+    mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+      type: agent.type,
+      name: agent.name,
+      enabled: agent.enabled,
+      configured: true,
+      command: agent.command,
+      executableFound: true,
+      executablePath: `/usr/local/bin/${agent.command}`,
+      providerVersion: 'codex-cli 0.144.0',
+      providerVersionSource: 'codex --version',
+      authenticated: true,
+      healthy: true,
+      checkedAt: '2026-06-03T00:00:00.000Z',
+    }));
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex',
+          name: 'OpenAI Codex',
+          command: 'codex',
+          args: ['exec', '--json'],
+          enabled: true,
+          provider: 'codex-cli',
+          model: 'gpt-5.5',
+        },
+      ],
+    });
+    mockSdkStartThread.mockReturnValue({ runStreamed: mockSdkRunStreamed });
+    mockGovernanceRecord.mockResolvedValue({ id: 'governance_trace_fixture' });
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it.each(['success', 'failed'] as const)(
+    'records native OpenClaw %s through the normal attempt lifecycle',
+    async (outcome) => {
+      task = {
+        ...task,
+        agent: 'openclaw',
+        subtasks: task.subtasks?.map((item) => ({ ...item, completed: true })),
+        verificationSteps: task.verificationSteps?.map((item) => ({ ...item, checked: true })),
+      };
+      mockGetConfig.mockResolvedValue({
+        agents: [
+          {
+            type: 'openclaw',
+            name: 'OpenClaw',
+            command: 'openclaw',
+            args: [],
+            enabled: true,
+            provider: 'openclaw',
+          },
+        ],
+      });
+      const readiness = vi
+        .spyOn(HttpOpenClawTaskAdapter.prototype, 'probeCompletion')
+        .mockResolvedValue({ gatewayUrl: 'http://127.0.0.1:18789', version: '2026.9.2' });
+      const spawnTask = vi.spyOn(HttpOpenClawTaskAdapter.prototype, 'spawnTask').mockResolvedValue({
+        sessionKey: 'agent:openclaw:subagent:fixture',
+        runId: 'run-fixture',
+        status: 'accepted',
+      });
+      const wait = vi.spyOn(HttpOpenClawTaskAdapter.prototype, 'waitForRun').mockResolvedValue({
+        version: '2026.9.2',
+        result: {
+          runId: 'run-fixture',
+          status: 'ok',
+          endedAt: Date.now(),
+          terminalReply: {
+            disposition: 'visible',
+            text: JSON.stringify({
+              schemaVersion: 'veritas-openclaw-completion/v1',
+              status: outcome,
+              summary: 'Native completion lifecycle verified',
+            }),
+          },
+        },
+      });
+      try {
+        const service = testableService(tmpDir);
+        const active = await service.startAgent(task.id, 'openclaw', { commitPolicy: 'allowed' });
+        expect(active.status).toBe('running');
+        await vi.waitFor(() => expect(task.attempt?.completionResult?.status).toBe(outcome));
+        expect(task.attempt?.completionResult?.terminalSource).toBe('remote-session');
+        expect(task.attempt?.openclawRun).toMatchObject({
+          runId: 'run-fixture',
+          attemptId: active.attemptId,
+          providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+        });
+        expect(spawnTask).toHaveBeenCalledOnce();
+        expect(spawnTask.mock.calls[0][0].prompt).not.toContain('/api/agents/');
+        expect(readiness).toHaveBeenCalledTimes(2);
+        expect(wait).toHaveBeenCalledWith('run-fixture', 30_000, expect.any(AbortSignal));
+        const updated = mockUpdateTask.mock.calls.length;
+        await service.completeAgent(
+          task.id,
+          { status: outcome, summary: 'Native completion lifecycle verified' },
+          {
+            attemptId: active.attemptId,
+            providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+            terminalSource: 'remote-session',
+          }
+        );
+        expect(mockUpdateTask.mock.calls.length).toBe(updated);
+      } finally {
+        readiness.mockRestore();
+        spawnTask.mockRestore();
+        wait.mockRestore();
+      }
+    }
+  );
+
+  it('rejects OpenClaw without completion readiness before creating an active attempt', async () => {
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'openclaw',
+          name: 'OpenClaw',
+          command: 'openclaw',
+          args: [],
+          enabled: true,
+          provider: 'openclaw',
+        },
+      ],
+    });
+    const readiness = vi
+      .spyOn(HttpOpenClawTaskAdapter.prototype, 'probeCompletion')
+      .mockRejectedValue(new Error('Completion authentication unavailable'));
+    const spawnTask = vi.spyOn(HttpOpenClawTaskAdapter.prototype, 'spawnTask');
+    try {
+      await expect(testableService(tmpDir).startAgent(task.id, 'openclaw')).rejects.toThrow(
+        'Completion authentication unavailable'
+      );
+      expect(task.attempt).toBeUndefined();
+      expect(task.status).toBe('todo');
+      expect(mockUpdateTask).not.toHaveBeenCalled();
+      expect(spawnTask).not.toHaveBeenCalled();
+    } finally {
+      readiness.mockRestore();
+      spawnTask.mockRestore();
+    }
+  });
+
+  it.skipIf(process.env.VK_OPENCLAW_SMOKE !== '1')(
+    '@smoke native OpenClaw child reaches persisted success and failure',
+    async () => {
+      const { spawn: actualSpawn } =
+        await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      const fixture = await startOpenClawCompletionFixture(actualSpawn);
+      vi.stubEnv('OPENCLAW_GATEWAY_URL', fixture.gatewayUrl);
+      vi.stubEnv('OPENCLAW_GATEWAY_TOKEN', fixture.token);
+      try {
+        mockGetConfig.mockResolvedValue({
+          agents: [
+            {
+              type: 'openclaw',
+              name: 'OpenClaw',
+              command: 'openclaw',
+              args: [],
+              enabled: true,
+              provider: 'openclaw',
+            },
+          ],
+        });
+        for (const outcome of ['success', 'failed'] as const) {
+          task = {
+            ...task,
+            id: `task_native_openclaw_${outcome}`,
+            attempt: undefined,
+            attempts: [],
+            status: 'todo',
+            agent: 'openclaw',
+            description: `${task.description} ${outcome === 'failed' ? 'FIXTURE_OUTCOME_FAILED' : 'FIXTURE_OUTCOME_SUCCESS'}`,
+            subtasks: task.subtasks?.map((item) => ({ ...item, completed: true })),
+            verificationSteps: task.verificationSteps?.map((item) => ({ ...item, checked: true })),
+          };
+          const service = testableService(tmpDir);
+          const active = await service.startAgent(task.id, 'openclaw', { commitPolicy: 'allowed' });
+          await vi.waitFor(() => expect(task.attempt?.completionResult?.status).toBe(outcome), {
+            timeout: 30_000,
+            interval: 100,
+          });
+          expect(task.attempt?.completionResult).toMatchObject({
+            terminalSource: 'remote-session',
+            summary: 'Isolated native child completed',
+          });
+          expect(task.attempt?.openclawRun).toMatchObject({
+            taskId: task.id,
+            attemptId: active.attemptId,
+            providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+          });
+          expect(task.status).toBe(outcome === 'success' ? 'done' : 'in-progress');
+          expect(task.attempt?.status).toBe(outcome === 'success' ? 'complete' : 'failed');
+          const persisted = JSON.parse(JSON.stringify(task));
+          expect(persisted.attempt.completionResult.attemptId).toBe(active.attemptId);
+          expect(fixture.modelCalls).toBeGreaterThan(0);
+        }
+      } finally {
+        await fixture.close();
+      }
+    },
+    90_000
+  );
+
+  it('isolates independent roots and preserves identity across provider handoffs', () => {
+    const service = testableService(tmpDir);
+    const buildExecutionTreeIdentity = (
+      service as unknown as {
+        buildExecutionTreeIdentity(input: {
+          taskId: string;
+          workspaceId: string;
+          attemptId: string;
+          parentAttempt?: TaskAttempt;
+          provider: 'codex-cli' | 'claude-code';
+          conversationIntent: 'fresh' | 'follow-up';
+          rootIdempotencyKey?: string;
+        }): ExecutionTreeIdentity;
+      }
+    ).buildExecutionTreeIdentity.bind(service);
+    const first = buildExecutionTreeIdentity({
+      taskId: task.id,
+      workspaceId: 'veritas',
+      attemptId: 'attempt-root-a',
+      provider: 'codex-cli',
+      conversationIntent: 'fresh',
+    });
+    const second = buildExecutionTreeIdentity({
+      taskId: task.id,
+      workspaceId: 'veritas',
+      attemptId: 'attempt-root-b',
+      provider: 'codex-cli',
+      conversationIntent: 'fresh',
+    });
+    expect(second.rootObjectiveId).not.toBe(first.rootObjectiveId);
+    const keyedFirst = buildExecutionTreeIdentity({
+      taskId: task.id,
+      workspaceId: 'veritas',
+      attemptId: 'attempt-keyed-a',
+      provider: 'codex-cli',
+      conversationIntent: 'fresh',
+      rootIdempotencyKey: 'stable-launch-key',
+    });
+    const keyedRetry = buildExecutionTreeIdentity({
+      taskId: task.id,
+      workspaceId: 'veritas',
+      attemptId: 'attempt-keyed-b',
+      provider: 'codex-cli',
+      conversationIntent: 'fresh',
+      rootIdempotencyKey: 'stable-launch-key',
+    });
+    expect(keyedRetry).toEqual(keyedFirst);
+
+    const handoff = buildExecutionTreeIdentity({
+      taskId: task.id,
+      workspaceId: 'veritas',
+      attemptId: 'attempt-handoff',
+      parentAttempt: {
+        id: first.nodeId,
+        agent: 'codex',
+        status: 'complete',
+        started: '2026-07-25T12:00:00.000Z',
+        provider: 'codex-cli',
+        executionTree: first,
+      } as TaskAttempt,
+      provider: 'claude-code',
+      conversationIntent: 'follow-up',
+    });
+    expect(handoff).toMatchObject({
+      rootObjectiveId: first.rootObjectiveId,
+      parentNodeId: first.nodeId,
+      edge: 'provider-handoff',
+      depth: 1,
+    });
+  });
+
+  it('classifies every agent execution edge through one admission source contract', () => {
+    const service = testableService(tmpDir);
+    const classify = (
+      service as unknown as {
+        agentAdmissionSource(
+          executionTree: ExecutionTreeIdentity,
+          recovery?: RunRecoveryRecord
+        ): string;
+      }
+    ).agentAdmissionSource.bind(service);
+    const identity = (edge: ExecutionTreeIdentity['edge']): ExecutionTreeIdentity => ({
+      schemaVersion: 'execution-tree-identity/v1',
+      rootObjectiveId: 'objective-source-contract',
+      nodeId: `node-${edge}`,
+      ...(edge === 'root' ? {} : { parentNodeId: 'node-parent' }),
+      edge,
+      depth: edge === 'root' ? 0 : 1,
+    });
+
+    expect(classify(identity('root'))).toBe('direct');
+    expect(classify(identity('resume'))).toBe('conversation');
+    expect(classify(identity('follow-up'))).toBe('conversation');
+    expect(classify(identity('fork'))).toBe('conversation');
+    expect(classify(identity('provider-handoff'))).toBe('conversation');
+    expect(classify(identity('child-agent'))).toBe('child-agent');
+    expect(classify(identity('retry'), { action: 'retry' } as RunRecoveryRecord)).toBe('recovery');
+    expect(classify(identity('fallback'), { action: 'fallback' } as RunRecoveryRecord)).toBe(
+      'fallback'
+    );
+  });
+
+  it('rejects provider dispatch when durable admission evidence is missing', () => {
+    const service = testableService(tmpDir);
+    const executionTree: ExecutionTreeIdentity = {
+      schemaVersion: 'execution-tree-identity/v1',
+      rootObjectiveId: 'objective-admission-guard',
+      nodeId: 'attempt-admission-guard',
+      edge: 'root',
+      depth: 0,
+    };
+    const evidence: AgentProviderAdmissionEvidence = {
+      schemaVersion: 'provider-admission-evidence/v1',
+      source: 'direct',
+      outcome: 'admitted',
+      reservationId: 'admission-expected',
+      executionTree,
+    };
+    const assertEvidence = (
+      service as unknown as {
+        assertProviderAdmissionEvidence(
+          input: AgentProviderAdmissionEvidence,
+          attempt: TaskAttempt
+        ): void;
+      }
+    ).assertProviderAdmissionEvidence.bind(service);
+
+    expect(() =>
+      assertEvidence(evidence, {
+        id: executionTree.nodeId,
+        agent: 'codex',
+        status: 'running',
+        admissionReservationId: 'admission-other',
+        executionTree,
+      } as TaskAttempt)
+    ).toThrow('Provider launch is missing required admission evidence.');
+  });
+
+  it('marks tree cancellation before interrupting each verified running attempt', async () => {
+    const admission = testAdmissionControl();
+    vi.mocked(admission.cancelExecutionTree).mockResolvedValue({
+      schemaVersion: 'execution-tree-cancellation/v1',
+      scope: 'execution-tree',
+      idempotencyKey: `sha256:${'a'.repeat(64)}`,
+      rootObjectiveId: 'objective-cancel',
+      control: {
+        schemaVersion: 'execution-tree-control/v1',
+        rootObjectiveId: 'objective-cancel',
+        state: 'cancelled',
+        trigger: 'operator',
+        reason: 'Stop runaway expansion.',
+        idempotencyKey: `sha256:${'a'.repeat(64)}`,
+        recordedAt: '2026-07-25T12:00:00.000Z',
+      },
+      queueEntriesCancelled: 2,
+      reservationsReleased: 1,
+      interruptedAttempts: 0,
+      runningAttempts: [
+        {
+          taskId: 'task-running',
+          attemptId: 'attempt-running',
+          reservationId: 'reservation-running',
+        },
+        {
+          taskId: 'task-detached',
+          attemptId: 'attempt-detached',
+          reservationId: 'reservation-detached',
+        },
+      ],
+    });
+    const service = testableService(
+      tmpDir,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      testWorkspaceExecutionTrust(),
+      admission
+    );
+    const stop = vi.spyOn(service, 'stopAgent').mockImplementation(async (taskId) => {
+      if (taskId === 'task-detached') throw new Error('Verified control unavailable');
+    });
+
+    const result = await service.cancelExecutionTree('objective-cancel', {
+      idempotencyKey: 'cancel-execution-tree-123',
+      reason: 'Stop runaway expansion.',
+    });
+
+    expect(admission.cancelExecutionTree).toHaveBeenCalledBefore(stop);
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      interruptedAttempts: 1,
+      reservationsReleased: 2,
+      runningAttempts: [{ taskId: 'task-detached', attemptId: 'attempt-detached' }],
+    });
+  });
+
+  it('queues a versioned agent launch and replays its exact options exactly once', async () => {
+    const fixture = await fs.readFile(path.join(fixtureDir, 'success.jsonl'), 'utf-8');
+    mockSpawn.mockReturnValue(createFakeChild(fixture));
+    const admission = testAdmissionControl();
+    let claim: AdmissionQueueClaim | undefined;
+    let currentEntry: AdmissionQueueClaim['entry'] | undefined;
+    vi.mocked(admission.admitOrQueue).mockImplementation(async (input, queue) => {
+      if (!('target' in queue) || queue.target.kind !== 'agent-launch') {
+        throw new Error('Expected a versioned agent launch target');
+      }
+      const now = '2026-07-25T12:00:00.000Z';
+      const request = {
+        schemaVersion: 'admission-request/v1',
+        idempotencyKey: `sha256:${'a'.repeat(64)}`,
+        source: input.source ?? 'direct',
+        taskId: input.taskId,
+        rootTaskId: input.rootTaskId ?? input.taskId,
+        workspaceId: input.workspaceId,
+        provider: input.provider,
+        hostId: input.hostId,
+        executionTree: input.executionTree,
+        budgetPolicies: input.budgetPolicies,
+        budgetRequest: input.budgetRequest,
+        requested: { runSlots: 1, processSlots: 1, estimatedMemoryMb: 512 },
+        requestedAt: now,
+      } as AdmissionQueueClaim['entry']['request'];
+      const queuedEntry = {
+        schemaVersion: 'admission-queue-entry/v1',
+        id: 'admission_queue_direct_fixture',
+        revision: 1,
+        state: 'queued',
+        enqueueSequence: 1,
+        target: queue.target,
+        attemptId: queue.attemptId,
+        request,
+        policies: [],
+        limitingPolicies: [
+          {
+            id: 'global:global',
+            scope: 'global',
+            scopeId: 'global',
+            limits: { concurrentRuns: 1 },
+          },
+        ],
+        retryAfterMs: 250,
+        retryCount: 0,
+        maxRetries: 3,
+        availableAt: now,
+        createdAt: now,
+        updatedAt: now,
+      } as AdmissionQueueClaim['entry'];
+      const lease = {
+        ownerId: 'queue-worker',
+        hostId: 'execution-host-a',
+        processId: 101,
+        acquiredAt: now,
+        heartbeatAt: now,
+        expiresAt: '2026-07-25T12:00:30.000Z',
+      };
+      currentEntry = {
+        ...queuedEntry,
+        revision: 2,
+        state: 'leased',
+        lease,
+        reservationId: 'admission_direct_fixture',
+      };
+      claim = {
+        entry: currentEntry,
+        reservation: {
+          schemaVersion: 'admission-reservation/v1',
+          id: 'admission_direct_fixture',
+          revision: 1,
+          state: 'active',
+          request,
+          policies: [],
+          lease,
+          createdAt: now,
+          updatedAt: now,
+        },
+      };
+      return {
+        schemaVersion: 'admission-decision/v1',
+        outcome: 'queued',
+        request,
+        queueEntry: queuedEntry,
+        limitingPolicies: queuedEntry.limitingPolicies,
+        retryAfterMs: queuedEntry.retryAfterMs,
+        reason: 'Queued for test.',
+        decidedAt: now,
+      };
+    });
+    admission.getQueueEntry = vi.fn(async () => currentEntry as AdmissionQueueClaim['entry']);
+    admission.markQueueDispatched = vi.fn(async (_id, attemptId) => {
+      currentEntry = {
+        ...(currentEntry as AdmissionQueueClaim['entry']),
+        revision: (currentEntry?.revision ?? 0) + 1,
+        state: 'dispatched',
+        dispatchedAttemptId: attemptId,
+      };
+      return currentEntry;
+    });
+    admission.requeueQueueEntry = vi.fn();
+    admission.terminateQueueEntry = vi.fn();
+    const service = testableService(
+      tmpDir,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      testWorkspaceExecutionTrust(),
+      admission
+    );
+
+    const queued = await service.startAgent(task.id, 'codex', {
+      commitPolicy: 'forbidden',
+    });
+    expect(queued).toMatchObject({
+      taskId: task.id,
+      status: 'queued',
+      queueId: 'admission_queue_direct_fixture',
+      retryAfterMs: 250,
+      limitingScopes: [{ scope: 'global', scopeId: 'global' }],
+    });
+    expect(admission.bindAttempt).not.toHaveBeenCalled();
+    expect(task.attempt).toBeUndefined();
+    expect(admission.admitOrQueue).toHaveBeenCalledWith(
+      expect.objectContaining({ source: 'direct' }),
+      expect.objectContaining({
+        target: expect.objectContaining({
+          kind: 'agent-launch',
+          agent: 'codex',
+          source: 'direct',
+          options: { commitPolicy: 'forbidden' },
+        }),
+      })
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    vi.mocked(admission.claimNextQueued).mockReset();
+    vi.mocked(admission.claimNextQueued)
+      .mockResolvedValueOnce(claim as AdmissionQueueClaim)
+      .mockResolvedValue(null);
+    await service.reconcileQueuedLaunches();
+    await service.reconcileQueuedLaunches();
+
+    expect(admission.markQueueDispatched).toHaveBeenCalledTimes(1);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(task.attempt?.id).toBe(claim?.entry.attemptId);
+    expect(task.attempt?.taskEnvelope?.commitPolicy).toBe('forbidden');
+    await waitFor(() => expect(task.attempt?.status).toBe('complete'));
+    expect(mockTelemetryEmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'run.started',
+        admissionSource: 'direct',
+        admissionOutcome: 'queued-dispatch',
+      })
+    );
+  });
+
+  it(
+    'runs the Codex CLI adapter against mocked JSONL and records telemetry',
+    { timeout: 20_000 },
+    async () => {
+      const fixture = await fs.readFile(path.join(fixtureDir, 'success.jsonl'), 'utf-8');
+      mockSpawn.mockReturnValue(createFakeChild(fixture));
+      const service = testableService(tmpDir);
+      const admission = (service as unknown as { admission: AdmissionControlService }).admission;
+
+      const status = await service.startAgent(task.id, 'codex');
+
+      expect(status.status).toBe('running');
+      expect(status.executionTree).toMatchObject({
+        schemaVersion: 'execution-tree-identity/v1',
+        nodeId: status.attemptId,
+        edge: 'root',
+        depth: 0,
+      });
+      expect(admission.admitOrQueue).toHaveBeenCalledWith(
+        expect.objectContaining({
+          executionTree: status.executionTree,
+          budgetRequest: expect.objectContaining({ fanOut: 1, retries: 0 }),
+        }),
+        expect.objectContaining({
+          attemptId: status.attemptId,
+          target: expect.objectContaining({
+            kind: 'agent-launch',
+            agent: 'codex',
+            source: 'direct',
+            options: {},
+          }),
+        })
+      );
+      expect(status.runLaunchManifest).toMatchObject({
+        schemaVersion: 'run-launch-manifest/v1',
+        taskId: task.id,
+        providerRuntime: {
+          digest: status.providerRuntimeManifest.digest,
+          provider: 'codex-cli',
+        },
+        runtime: {
+          command: 'codex',
+          model: 'gpt-5.5',
+        },
+        enforcement: {
+          enforceable: true,
+          blockers: [],
+        },
+        phase: {
+          evidence: {
+            identity: { mode: 'legacy', phase: 'legacy' },
+          },
+          sourceReferences: expect.arrayContaining([
+            expect.objectContaining({ kind: 'parent' }),
+            expect.objectContaining({ kind: 'agent-profile' }),
+            expect.objectContaining({ kind: 'sandbox' }),
+            expect.objectContaining({ kind: 'tool-catalog' }),
+            expect.objectContaining({ kind: 'launch-policy' }),
+          ]),
+        },
+      });
+      expect(status.activePhaseEvidence?.digest).toBe(
+        status.runLaunchManifest.phase?.evidence.digest
+      );
+      expect(status.runLaunchManifest.digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'codex',
+        expect.arrayContaining(['exec', '--json', '--sandbox', 'workspace-write']),
+        expect.objectContaining({ cwd: tmpDir, shell: false })
+      );
+      const spawnedArgs = mockSpawn.mock.calls[0]?.[1] as string[] | undefined;
+      const providerRequest = spawnedArgs?.at(-1);
+      expect(providerRequest).toContain('# Codex CLI Task Envelope');
+      expect(providerRequest).toContain(
+        'Allowed: a commit is permitted, but successful completion does not require one.'
+      );
+      expect(providerRequest).not.toContain(`/api/agents/${task.id}/complete`);
+      expect(
+        status.runLaunchManifest.instructions.find(
+          (instruction) => instruction.id === 'effective-task-request'
+        )?.origin
+      ).toBe('task-envelope:task-envelope/v1;adapter:codex-cli');
+      const spawnEnvironment = mockSpawn.mock.calls[0]?.[2]?.env as
+        Record<string, string> | undefined;
+      expect(status.runLaunchManifest.runtime.environmentKeys).toEqual(
+        Object.keys(spawnEnvironment ?? {}).sort((left, right) => left.localeCompare(right))
+      );
+      expect(status.runLaunchManifest.runtime.environmentKeys).toContain('VK_API_URL');
+
+      await waitFor(() => {
+        expect(mockUpdateTask).toHaveBeenCalledWith(
+          task.id,
+          expect.objectContaining({ status: 'done' })
+        );
+      });
+      expect(mockTelemetryEmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'run.tokens',
+          inputTokens: 12,
+          outputTokens: 8,
+          totalTokens: 20,
+          model: 'gpt-5.5',
+        })
+      );
+      await waitFor(() => {
+        expect(mockLogActivity).toHaveBeenCalledWith(
+          'agent_completed',
+          task.id,
+          task.title,
+          expect.objectContaining({ provider: 'codex-cli', success: true }),
+          'codex'
+        );
+      });
+      await waitFor(async () => {
+        expect(await service.getAgentStatus(task.id)).toBeNull();
+      });
+      expect(task.attempt?.providerRuntimeManifest).toMatchObject({
+        schemaVersion: 'provider-runtime-manifest/v1',
+        provider: 'codex-cli',
+        providerVersion: 'codex-cli 0.144.0',
+      });
+      expect(task.attempt?.providerRuntimeManifest?.digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(task.attempt?.harnessSupport).toMatchObject({
+        profileId: 'openai-codex-cli',
+        adapterId: 'codex-cli',
+        supportTier: 'configured',
+        failureClass: 'none',
+        manifestDigest: task.attempt?.providerRuntimeManifest?.digest,
+      });
+      expect(mockTelemetryEmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'run.started',
+          admissionSource: 'direct',
+          admissionOutcome: 'admitted',
+          harnessSupport: expect.objectContaining({
+            profileId: 'openai-codex-cli',
+            adapterId: 'codex-cli',
+            providerVersion: 'codex-cli 0.144.0',
+            manifestDigest: task.attempt?.providerRuntimeManifest?.digest,
+            supportTier: 'configured',
+            failureClass: 'none',
+          }),
+        })
+      );
+      expect(mockTelemetryEmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'run.completed',
+          harnessSupport: expect.objectContaining({
+            profileId: 'openai-codex-cli',
+            adapterId: 'codex-cli',
+            manifestDigest: task.attempt?.providerRuntimeManifest?.digest,
+            supportTier: 'configured',
+            failureClass: 'none',
+          }),
+        })
+      );
+      expect(task.attempt?.taskEnvelope).toMatchObject({
+        schemaVersion: 'task-envelope/v1',
+        commitPolicy: 'allowed',
+        workspace: {
+          baseline: { headSha: 'a'.repeat(40), dirty: false, files: [] },
+        },
+        launchManifest: {
+          digest: task.attempt?.providerRuntimeManifest?.digest,
+        },
+      });
+      expect(task.attempt?.taskEnvelope?.digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(task.attempt?.runLaunchManifest?.digest).toBe(status.runLaunchManifest.digest);
+      expect(task.attempt?.runLaunchManifestTraceId).toBe('governance_trace_fixture');
+      expect(task.attempts).toEqual([
+        expect.objectContaining({
+          id: task.attempt?.id,
+          runLaunchManifest: expect.objectContaining({
+            digest: status.runLaunchManifest.digest,
+          }),
+          providerRuntimeManifest: expect.objectContaining({
+            digest: task.attempt?.providerRuntimeManifest?.digest,
+          }),
+        }),
+      ]);
+      expect(task.deliverables).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: 'server/src/services/example.ts',
+            type: 'code',
+            agent: 'codex',
+          }),
+        ])
+      );
+      const log = await service.getAttemptLog(task.id, task.attempt?.id ?? 'missing');
+      expect(log).toContain(
+        `Provider manifest:** ${task.attempt?.providerRuntimeManifest?.digest}`
+      );
+      expect(log).toContain(`Task envelope:** ${task.attempt?.taskEnvelope?.digest}`);
+      expect(log).toContain(`Run launch manifest:** ${status.runLaunchManifest.digest}`);
+      expect(mockGovernanceRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Run launch manifest compiled',
+          outcome: 'allowed',
+          raw: expect.objectContaining({
+            runLaunchManifest: expect.objectContaining({
+              digest: status.runLaunchManifest.digest,
+            }),
+          }),
+        })
+      );
+      expect(mockStartStep).toHaveBeenCalledWith(
+        expect.any(String),
+        'stream',
+        expect.objectContaining({
+          eventType: 'stream.stdout',
+          stream: 'stdout',
+          provider: 'codex-cli',
+          chunkBytes: expect.any(Number),
+        })
+      );
+      expect(mockStartStep).toHaveBeenCalledWith(
+        expect.any(String),
+        'finalize',
+        expect.objectContaining({
+          eventType: 'run.finalizing',
+          exitCode: 0,
+          signal: null,
+          success: true,
+          provider: 'codex-cli',
+        })
+      );
+      expect(mockStartStep).toHaveBeenCalledWith(
+        expect.any(String),
+        'complete',
+        expect.objectContaining({
+          eventType: 'turn.completed',
+          totalTokens: 20,
+          model: 'gpt-5.5',
+          finalResult: 'Codex completed the task.',
+        })
+      );
+      expect(mockStartStep).toHaveBeenCalledWith(
+        expect.any(String),
+        'complete',
+        expect.objectContaining({
+          eventType: 'run.completed',
+          success: true,
+          provider: 'codex-cli',
+          model: 'gpt-5.5',
+        })
+      );
+    }
+  );
+
+  it('fails a required filesystem boundary before creating a provider process', async () => {
+    const compile = vi
+      .fn()
+      .mockRejectedValue(new Error('Required filesystem sandbox rules cannot be enforced.'));
+    const filesystemSandbox = {
+      compile,
+      activate: vi.fn(),
+      cleanup: vi.fn(),
+      wrap: vi.fn(),
+    } as Pick<FilesystemSandboxService, 'compile' | 'activate' | 'cleanup' | 'wrap'>;
+    const requiredPolicy: SandboxPolicyDryRunResult = {
+      decision: 'allow',
+      preset: {
+        id: 'required-contained',
+        name: 'Required contained',
+        enabled: true,
+        enforcement: 'required',
+        requiredCapabilities: [],
+        filesystem: {
+          readPaths: ['<workspace>'],
+          writePaths: ['<workspace>'],
+          deniedPaths: [],
+          dotfileMasking: false,
+          localOnlyHandles: true,
+        },
+        network: {
+          defaultEgress: 'deny',
+          allowedHosts: [],
+          allowedMethods: [],
+          allowedPathPrefixes: [],
+          blockPrivateNetwork: true,
+          blockMetadataEndpoints: true,
+          blockLoopback: true,
+        },
+        environment: { passthrough: ['PATH'], redactDisplay: true },
+        credentials: { mode: 'none', brokerRefs: [] },
+        createdAt: '2026-07-25T00:00:00.000Z',
+        updatedAt: '2026-07-25T00:00:00.000Z',
+      },
+      provider: 'codex-cli',
+      effective: {
+        sandboxMode: 'workspace-write',
+        networkAccessEnabled: false,
+        envPassthrough: ['PATH'],
+        credentialRefs: [],
+        filesystemBackend: {
+          backend: 'none',
+          state: 'unavailable',
+          capabilityVersion: 'filesystem-sandbox-probe/v2',
+          platformBackend: 'none',
+          supported: [],
+          reason: 'No conformant backend is available.',
+        },
+      },
+      evaluations: [],
+      unsupportedRules: [],
+      warnings: [],
+    };
+    const sandboxPolicies = {
+      dryRunWithTrace: vi.fn().mockResolvedValue({
+        result: requiredPolicy,
+        trace: {} as never,
+      }),
+    };
+    const service = testableService(
+      tmpDir,
+      undefined,
+      undefined,
+      undefined,
+      filesystemSandbox,
+      sandboxPolicies
+    );
+
+    await expect(
+      service.startAgent(task.id, 'codex', {
+        overrideReason: 'Operator acknowledged unrelated readiness checks.',
+      })
+    ).rejects.toThrow('Required filesystem sandbox rules cannot be enforced');
+    expect(compile).toHaveBeenCalledOnce();
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+  });
+
+  it(
+    'runs the Codex app-server adapter through a pinned JSON-RPC lifecycle',
+    { timeout: 20_000 },
+    async () => {
+      const received: Array<Record<string, unknown>> = [];
+      const child = createFakeCodexAppServerChild(received);
+      mockSpawn.mockReturnValue(child);
+      mockGetConfig.mockResolvedValue({
+        agents: [
+          {
+            type: 'codex-app-server',
+            name: 'OpenAI Codex app-server',
+            command: 'codex',
+            args: [],
+            enabled: true,
+            provider: 'codex-app-server',
+            model: 'gpt-5.6',
+          },
+        ],
+      });
+      mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+        type: agent.type,
+        name: agent.name,
+        enabled: agent.enabled,
+        configured: true,
+        command: agent.command,
+        executableFound: true,
+        executablePath: '/opt/homebrew/bin/codex',
+        providerVersion: 'codex-cli 0.145.0',
+        providerVersionSource: 'codex --version',
+        authenticated: true,
+        healthy: true,
+        checkedAt: '2026-07-23T00:00:00.000Z',
+      }));
+      const service = testableService(tmpDir);
+
+      const status = await service.startAgent(task.id, 'codex-app-server');
+
+      expect(status.provider).toBe('codex-app-server');
+      expect(status.providerRuntimeManifest).toMatchObject({
+        provider: 'codex-app-server',
+        providerVersion: 'codex-cli 0.145.0',
+        providerBuild: expect.stringContaining(
+          'openai/codex@25af12f7e61572b0bc18ddb1008be543b91519b0'
+        ),
+        protocolVersion: 'codex-app-server-jsonrpc/v2',
+      });
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'codex',
+        [
+          'app-server',
+          '--stdio',
+          '--strict-config',
+          '-c',
+          'mcp_servers={}',
+          '-c',
+          'hooks={}',
+          '--disable',
+          'plugins',
+          '--disable',
+          'apps',
+          '--disable',
+          'in_app_browser',
+          '--disable',
+          'computer_use',
+          '--disable',
+          'tool_call_mcp_elicitation',
+        ],
+        expect.objectContaining({ cwd: tmpDir, shell: false })
+      );
+      expect(mockSpawn.mock.calls[0]?.[2]?.env).toMatchObject({
+        CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: '1',
+      });
+
+      await waitFor(async () => {
+        expect(await service.getAgentStatus(task.id)).toBeNull();
+      });
+      expect(received.map(({ method }) => method)).toEqual([
+        'initialize',
+        'initialized',
+        'thread/start',
+        'turn/start',
+      ]);
+      expect(received.find(({ method }) => method === 'thread/start')).toMatchObject({
+        params: {
+          cwd: tmpDir,
+          model: 'gpt-5.6',
+          sandbox: 'workspace-write',
+          approvalPolicy: 'on-request',
+        },
+      });
+      expect(task.attempt).toMatchObject({
+        provider: 'codex-app-server',
+        status: 'complete',
+        threadId: 'thread-app-server-fixture',
+      });
+      expect(mockTelemetryEmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'run.tokens',
+          inputTokens: 11,
+          outputTokens: 4,
+          totalTokens: 15,
+          model: 'gpt-5.6',
+        })
+      );
+      expect(mockUpdateTask).toHaveBeenCalledWith(
+        task.id,
+        expect.objectContaining({ status: 'done' })
+      );
+    }
+  );
+
+  it('captures workspace boundaries before launch, steering, and compaction', async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const child = createFakeCodexAppServerChild(received, { holdTurnOpen: true });
+    mockSpawn.mockReturnValue(child);
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-app-server',
+          name: 'OpenAI Codex app-server',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-app-server',
+          model: 'gpt-5.6',
+        },
+      ],
+    });
+    mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+      type: agent.type,
+      name: agent.name,
+      enabled: agent.enabled,
+      configured: true,
+      command: agent.command,
+      executableFound: true,
+      executablePath: '/opt/homebrew/bin/codex',
+      providerVersion: 'codex-cli 0.145.0',
+      providerVersionSource: 'codex --version',
+      authenticated: true,
+      healthy: true,
+      checkedAt: '2026-07-23T00:00:00.000Z',
+    }));
+    const workspaceCheckpoints = testWorkspaceCheckpoints();
+    const captureBoundary = vi.mocked(workspaceCheckpoints.captureBoundary);
+    const service = testableService(
+      tmpDir,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      testWorkspaceExecutionTrust(),
+      testAdmissionControl(),
+      testRunTerminals(),
+      workspaceCheckpoints
+    );
+
+    const status = await service.startAgent(task.id, 'codex-app-server');
+    await waitFor(() => {
+      expect(received.some(({ method }) => method === 'turn/start')).toBe(true);
+    });
+    await waitFor(() => {
+      expect(mockPatchTaskAttempt).toHaveBeenCalledWith(
+        task.id,
+        status.attemptId,
+        expect.objectContaining({
+          conversation: expect.objectContaining({ currentTurnId: 'turn-app-server-fixture' }),
+        })
+      );
+    });
+    expect(captureBoundary).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: task.id,
+        attemptId: status.attemptId,
+        boundary: 'before-user-turn',
+        operationId: `launch:${status.attemptId}:before-user-turn`,
+      })
+    );
+
+    captureBoundary.mockClear();
+    await service.sendMessage(task.id, 'Please check the focused regression.', {
+      expectedAttemptId: status.attemptId,
+      actor: 'operator',
+    });
+    expect(captureBoundary).toHaveBeenCalledWith(
+      expect.objectContaining({
+        boundary: 'before-user-turn',
+        operationId: expect.stringMatching(/^operator-turn:/),
+        turnId: 'turn-app-server-fixture',
+      })
+    );
+    expect(received.some(({ method }) => method === 'turn/steer')).toBe(true);
+
+    captureBoundary.mockClear();
+    await service.compactConversation(task.id, status.attemptId);
+    expect(captureBoundary).toHaveBeenCalledWith(
+      expect.objectContaining({
+        boundary: 'before-compaction',
+        operationId: expect.stringMatching(/^compact:/),
+        turnId: 'turn-app-server-fixture',
+      })
+    );
+    expect(received.some(({ method }) => method === 'thread/compact/start')).toBe(true);
+
+    await service.stopAgent(task.id, status.attemptId);
+  });
+
+  it('quiesces and forks Codex app-server history for an approved workspace rewind', async () => {
+    const received: Array<Record<string, unknown>> = [];
+    const child = createFakeCodexAppServerChild(received, { holdTurnOpen: true });
+    mockSpawn.mockReturnValue(child);
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-app-server',
+          name: 'OpenAI Codex app-server',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-app-server',
+          model: 'gpt-5.6',
+        },
+      ],
+    });
+    mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+      type: agent.type,
+      name: agent.name,
+      enabled: agent.enabled,
+      configured: true,
+      command: agent.command,
+      executableFound: true,
+      executablePath: '/opt/homebrew/bin/codex',
+      providerVersion: 'codex-cli 0.145.0',
+      providerVersionSource: 'codex --version',
+      authenticated: true,
+      healthy: true,
+      checkedAt: '2026-07-23T00:00:00.000Z',
+    }));
+    const service = testableService(tmpDir);
+    const status = await service.startAgent(task.id, 'codex-app-server');
+    await waitFor(async () => {
+      expect(received.some(({ method }) => method === 'turn/start')).toBe(true);
+      expect((await service.getAgentStatus(task.id))?.conversation.currentTurnId).toBe(
+        'turn-app-server-fixture'
+      );
+    });
+    const targetCursor = JSON.stringify({
+      schemaVersion: 'provider-conversation-cursor/v1',
+      conversationId: 'thread-app-server-fixture',
+      turnId: 'turn-before-rewind',
+    });
+    mockWorkspaceRewindExecute.mockImplementationOnce(async (request) => {
+      const runtime = mockWorkspaceRewindOptions.current?.runtime;
+      if (!runtime) throw new Error('workspace rewind runtime was not provided');
+      const before = await runtime.inspect(request);
+      const quiesced = await runtime.quiesce({
+        ...request,
+        expectedStateDigest: before.stateDigest,
+        previewEvidenceDigest: `sha256:${'a'.repeat(64)}`,
+      });
+      const rewound = await runtime.commit({
+        request,
+        token: quiesced.token,
+        expectedStateDigest: before.stateDigest,
+        targetConversationCursor: targetCursor,
+        transaction: {
+          id: 'rewind-fixture',
+        } as WorkspaceCheckpointRewindTransaction,
+      });
+      return {
+        status: 'completed',
+        runtime: rewound,
+      };
+    });
+
+    const result = await service.rewindWorkspaceCheckpoint(task.id, {
+      attemptId: status.attemptId,
+      targetCheckpointId: 'checkpoint-target',
+      descendantCheckpointId: 'checkpoint-descendant',
+      requestId: 'rewind-request-fixture',
+    });
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      runtime: {
+        rewindAnchorCursor: targetCursor,
+      },
+    });
+    expect(received.map(({ method }) => method)).toContain('turn/interrupt');
+    expect(received.find(({ method }) => method === 'thread/fork')).toMatchObject({
+      params: {
+        threadId: 'thread-app-server-fixture',
+        lastTurnId: 'turn-before-rewind',
+      },
+    });
+    expect(mockPatchTaskAttempt).toHaveBeenCalledWith(
+      task.id,
+      status.attemptId,
+      expect.objectContaining({
+        threadId: 'thread-app-server-rewind',
+        conversation: expect.objectContaining({
+          conversationId: 'thread-app-server-rewind',
+          parentConversationId: 'thread-app-server-fixture',
+          forkTurnId: 'turn-before-rewind',
+        }),
+      })
+    );
+
+    await service.sendMessage(task.id, 'Continue from the recovered boundary.', {
+      expectedAttemptId: status.attemptId,
+    });
+    expect(received.filter(({ method }) => method === 'turn/start').at(-1)).toMatchObject({
+      params: {
+        threadId: 'thread-app-server-rewind',
+      },
+    });
+    await service.stopAgent(task.id, status.attemptId);
+  });
+
+  it(
+    'pauses a Codex app-server action until the correlated broker decision resumes it',
+    { timeout: 20_000 },
+    async () => {
+      const received: Array<Record<string, unknown>> = [];
+      const child = createFakeCodexAppServerChild(received, { requestApproval: true });
+      mockSpawn.mockReturnValue(child);
+      mockGetConfig.mockResolvedValue({
+        agents: [
+          {
+            type: 'codex-app-server',
+            name: 'OpenAI Codex app-server',
+            command: 'codex',
+            args: [],
+            enabled: true,
+            provider: 'codex-app-server',
+            model: 'gpt-5.6',
+          },
+        ],
+      });
+      mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+        type: agent.type,
+        name: agent.name,
+        enabled: agent.enabled,
+        configured: true,
+        command: agent.command,
+        executableFound: true,
+        executablePath: '/opt/homebrew/bin/codex',
+        providerVersion: 'codex-cli 0.145.0',
+        providerVersionSource: 'codex --version',
+        authenticated: true,
+        healthy: true,
+        checkedAt: '2026-07-23T00:00:00.000Z',
+      }));
+
+      let resolveDecision: ((value: { request: RunApprovalRequest }) => void) | undefined;
+      const decision = new Promise<{ request: RunApprovalRequest }>((resolve) => {
+        resolveDecision = resolve;
+      });
+      let pendingApproval: RunApprovalRequest | undefined;
+      const requestApproval = vi.fn(async (input: CreateRunApprovalRequestInput) => {
+        pendingApproval = {
+          schemaVersion: 'run-approval/v1',
+          id: 'runapproval_app_server1',
+          workspaceId: input.workspaceId,
+          taskId: input.taskId,
+          attemptId: input.attemptId,
+          provider: input.provider,
+          agentId: input.agentId,
+          requestKind: input.requestKind,
+          actionClass: input.actionClass,
+          action: input.action,
+          actionHash: 'a'.repeat(64),
+          details: input.details,
+          resourceScope: input.resourceScope,
+          workingDirectory: input.workingDirectory,
+          riskClass: input.riskClass,
+          policyReason: input.policyReason,
+          evidenceRevision: input.evidenceRevision,
+          providerRequestId: input.providerRequestId,
+          threadId: input.threadId,
+          turnId: input.turnId,
+          itemId: input.itemId,
+          mobileSafe: input.mobileSafe ?? false,
+          status: 'pending',
+          revision: 1,
+          createdAt: '2026-07-24T07:00:00.000Z',
+          updatedAt: '2026-07-24T07:00:00.000Z',
+          expiresAt: '2026-07-24T07:05:00.000Z',
+        };
+        return pendingApproval;
+      });
+      const approvalBroker = {
+        request: requestApproval,
+        awaitDecision: vi.fn(() => decision),
+        cancelAttempt: vi.fn(async () => []),
+      } as unknown as RunApprovalBrokerService;
+      const service = testableService(tmpDir, undefined, approvalBroker);
+
+      await service.startAgent(task.id, 'codex-app-server');
+      await waitFor(() => expect(requestApproval).toHaveBeenCalledOnce());
+      expect(requestApproval).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskId: task.id,
+          provider: 'codex-app-server',
+          providerRequestId: 'string:approval-app-server-fixture',
+          actionClass: 'shell',
+          action: 'Execute command: pnpm test',
+          workingDirectory: '/tmp/worktree',
+        })
+      );
+      expect(
+        received.find(
+          (record) => record.id === 'approval-app-server-fixture' && record.method === undefined
+        )
+      ).toBeUndefined();
+
+      resolveDecision?.({
+        request: {
+          ...(pendingApproval as RunApprovalRequest),
+          status: 'approved',
+          revision: 2,
+          resolution: {
+            decision: 'approved',
+            actor: {
+              id: 'reviewer-1',
+              type: 'user',
+              authMethod: 'session',
+              authenticatedAt: '2026-07-24T07:00:30.000Z',
+              workspaceId: 'local',
+            },
+            decidedAt: '2026-07-24T07:00:30.000Z',
+          },
+        },
+      });
+
+      await waitFor(async () => expect(await service.getAgentStatus(task.id)).toBeNull());
+      expect(
+        received.find(
+          (record) => record.id === 'approval-app-server-fixture' && record.method === undefined
+        )
+      ).toEqual({
+        id: 'approval-app-server-fixture',
+        result: { decision: 'accept' },
+      });
+      expect(task.attempt).toMatchObject({
+        provider: 'codex-app-server',
+        status: 'complete',
+      });
+    }
+  );
+
+  it('drains a final Claude Code result without a trailing newline before completion', async () => {
+    const fixture = await fs.readFile(
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        'fixtures',
+        'claude-code-v2.1.218.stream.jsonl'
+      ),
+      'utf-8'
+    );
+    const records = fixture.trim().split(/\r?\n/);
+    const terminal = {
+      ...(JSON.parse(records.at(-1) as string) as Record<string, unknown>),
+      apiKey: 'sk-must-not-be-persisted',
+    };
+    const stream = [...records.slice(0, -1), JSON.stringify(terminal)].join('\n');
+    mockSpawn.mockReturnValue(createFakeChild(stream));
+    vi.stubEnv('ANTHROPIC_API_KEY', 'test-claude-key');
+    task = { ...task, agent: 'claude-code' };
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'claude-code',
+          name: 'Claude Code',
+          command: 'claude',
+          args: [],
+          enabled: true,
+          provider: 'claude-code',
+          model: 'claude-opus-4-6',
+        },
+      ],
+    });
+    mockCheckAgent.mockResolvedValue({
+      type: 'claude-code',
+      name: 'Claude Code',
+      enabled: true,
+      configured: true,
+      command: 'claude',
+      executableFound: true,
+      executablePath: '/usr/local/bin/claude',
+      providerVersion: '2.1.218 (Claude Code)',
+      providerVersionSource: 'claude --version',
+      authenticated: true,
+      healthy: true,
+      checkedAt: '2026-07-23T00:00:00.000Z',
+    });
+    const service = testableService(tmpDir);
+
+    const active = await service.startAgent(task.id, 'claude-code');
+
+    await waitFor(() => expect(task.status).toBe('done'));
+    expect(active.runLaunchManifest).toMatchObject({
+      runtime: {
+        command: 'claude',
+        args: expect.arrayContaining([
+          '--bare',
+          '--output-format',
+          'stream-json',
+          '--permission-mode',
+          'dontAsk',
+        ]),
+        credentialReferences: expect.arrayContaining(['env:ANTHROPIC_API_KEY']),
+      },
+    });
+    expect(mockSpawn).toHaveBeenCalledWith(
+      'claude',
+      expect.arrayContaining([
+        '--bare',
+        '--output-format',
+        'stream-json',
+        '--permission-mode',
+        'dontAsk',
+      ]),
+      expect.objectContaining({ cwd: tmpDir, shell: false })
+    );
+    expect(task.attempt).toMatchObject({
+      id: active.attemptId,
+      status: 'complete',
+      threadId: '11111111-1111-4111-8111-111111111111',
+      completionResult: {
+        status: 'success',
+        terminalSource: 'process',
+      },
+    });
+    expect(mockTelemetryEmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'run.tokens',
+        inputTokens: 120,
+        outputTokens: 80,
+        totalTokens: 200,
+        cost: 0.041,
+      })
+    );
+    const log = await service.getAttemptLog(task.id, active.attemptId);
+    expect(log).toContain('Implemented and verified the requested change.');
+    expect(log).not.toContain('sk-must-not-be-persisted');
+    expect(log).toContain('"apiKey": "[REDACTED]"');
+  });
+
+  it('redacts provider identity secrets before emitting harness telemetry', async () => {
+    const fixture = await fs.readFile(path.join(fixtureDir, 'success.jsonl'), 'utf-8');
+    mockSpawn.mockReturnValue(createFakeChild(fixture));
+    mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+      type: agent.type,
+      name: agent.name,
+      enabled: agent.enabled,
+      configured: true,
+      command: agent.command,
+      executableFound: true,
+      executablePath: `/usr/local/bin/${agent.command}`,
+      providerVersion: 'codex-cli 0.144.0 token=telemetry-secret',
+      providerVersionSource: 'codex --version',
+      authenticated: true,
+      healthy: true,
+      checkedAt: '2026-06-03T00:00:00.000Z',
+    }));
+    const service = testableService(tmpDir);
+
+    await service.startAgent(task.id, 'codex');
+
+    await waitFor(() => {
+      expect(mockTelemetryEmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'run.started',
+          harnessSupport: expect.objectContaining({
+            providerVersion: 'codex-cli 0.144.0 token=[REDACTED]',
+          }),
+        })
+      );
+    });
+    expect(JSON.stringify(mockTelemetryEmit.mock.calls)).not.toContain('telemetry-secret');
+    await waitFor(async () => {
+      expect(await service.getAgentStatus(task.id)).toBeNull();
+    });
+  });
+
+  it('persists a run-level commit policy override in the immutable task envelope', async () => {
+    const fixture = await fs.readFile(path.join(fixtureDir, 'success.jsonl'), 'utf-8');
+    mockSpawn.mockReturnValue(createFakeChild(fixture));
+    const service = testableService(tmpDir);
+
+    const status = await service.startAgent(task.id, 'codex', { commitPolicy: 'forbidden' });
+
+    expect(status.taskEnvelope.commitPolicy).toBe('forbidden');
+    expect(status.taskEnvelope.allowedSideEffects).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'git-commit' })])
+    );
+    expect(task.attempt?.taskEnvelope?.digest).toBe(status.taskEnvelope.digest);
+    await waitFor(async () => {
+      expect(await service.getAgentStatus(task.id)).toBeNull();
+    });
+  });
+
+  it('previews the effective launch manifest without mutating attempt state', async () => {
+    const service = testableService(tmpDir);
+
+    const preview = await service.previewAgentLaunch(task.id, 'codex');
+
+    expect(preview.manifest).toMatchObject({
+      schemaVersion: 'run-launch-manifest/v1',
+      taskId: task.id,
+      attemptId: expect.stringMatching(/^preview_/),
+      providerRuntime: { provider: 'codex-cli' },
+      enforcement: { enforceable: true, blockers: [] },
+    });
+    expect(preview.manifest.origins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          field: 'providerRequirements',
+          scope: 'provider',
+          source: expect.stringMatching(/^provider-capabilities:codex-cli:\d+$/),
+        }),
+        expect.objectContaining({
+          field: 'runtime.workingDirectory',
+          source: 'adapter:codex-cli',
+        }),
+        expect.objectContaining({
+          field: 'runtime.worktree',
+          source: 'adapter:codex-cli',
+        }),
+      ])
+    );
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+    expect(mockGovernanceRecord).not.toHaveBeenCalled();
+    expect(task.attempt).toBeUndefined();
+  });
+
+  it('applies the same readiness gate to preview and fingerprints operator overrides', async () => {
+    task = {
+      ...task,
+      description: 'Too short',
+      subtasks: [],
+      verificationSteps: [],
+    } as Task;
+    const service = testableService(tmpDir);
+
+    await expect(service.previewAgentLaunch(task.id, 'codex')).rejects.toBeInstanceOf(
+      AgentReadinessError
+    );
+    const overrideReason = 'Operator accepts the incomplete task definition';
+    const preview = await service.previewAgentLaunch(task.id, 'codex', { overrideReason });
+
+    expect(preview.manifest.readiness).toMatchObject({
+      ready: false,
+      overridden: true,
+      overrideReasonDigest: expect.stringMatching(/^sha256:/),
+    });
+    expect(preview.manifest.readiness.missingRequired.length).toBeGreaterThan(0);
+    expect(preview.manifest.origins).toContainEqual(
+      expect.objectContaining({
+        field: 'readiness',
+        scope: 'run',
+        source: 'operator-readiness-override',
+      })
+    );
+    expect(JSON.stringify(preview.manifest)).not.toContain(overrideReason);
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+  });
+
+  it('fingerprints repository instructions byte-for-byte through workspace storage', async () => {
+    const repositoryInstructions = '\n  # Indented repository instructions\n\n';
+    await fs.writeFile(path.join(tmpDir, 'AGENTS.md'), repositoryInstructions, 'utf8');
+    const service = testableService(tmpDir);
+
+    const preview = await service.previewAgentLaunch(task.id, 'codex');
+    const evidence = preview.manifest.instructions.find(
+      (instruction) => instruction.id === 'repository:AGENTS.md'
+    );
+
+    expect(evidence).toMatchObject({
+      byteLength: Buffer.byteLength(repositoryInstructions, 'utf8'),
+      digest: digestRunLaunchValue(repositoryInstructions),
+    });
+    expect(evidence?.digest).not.toBe(
+      preview.manifest.instructions.find(
+        (instruction) => instruction.id === 'effective-task-request'
+      )?.digest
+    );
+  });
+
+  it('records every contributing budget source and runtime requirement origin', async () => {
+    mockGetConfig.mockResolvedValue({
+      features: {
+        agents: {
+          autoCommitOnComplete: false,
+        },
+        budget: {
+          enabled: true,
+          defaultRunBudget: {
+            enabled: true,
+            scope: 'workspace',
+            limits: { totalTokens: 100_000 },
+          },
+        },
+      },
+      agents: [
+        {
+          type: 'codex',
+          name: 'OpenAI Codex',
+          command: 'codex',
+          args: ['exec', '--json'],
+          enabled: true,
+          provider: 'codex-cli',
+          model: 'gpt-5.5',
+          budget: {
+            enabled: true,
+            scope: 'agent',
+            limits: { totalTokens: 75_000 },
+          },
+        },
+      ],
+    });
+    const service = testableService(tmpDir);
+
+    const preview = await service.previewAgentLaunch(task.id, 'codex', {
+      budget: {
+        enabled: true,
+        scope: 'run',
+        limits: { totalTokens: 50_000 },
+      },
+    });
+
+    expect(preview.manifest.budget.limits?.totalTokens).toBe(50_000);
+    expect(preview.manifest.origins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: 'budget', scope: 'workspace' }),
+        expect.objectContaining({ field: 'budget', scope: 'provider' }),
+        expect.objectContaining({
+          field: 'budget',
+          scope: 'run',
+          source: 'operator-run-budget',
+        }),
+        expect.objectContaining({ field: 'providerRequirements', scope: 'system-default' }),
+        expect.objectContaining({ field: 'providerRequirements', scope: 'workspace' }),
+        expect.objectContaining({
+          field: 'providerRequirements',
+          scope: 'provider',
+          source: expect.stringContaining(':budget'),
+        }),
+        expect.objectContaining({
+          field: 'providerRequirements',
+          scope: 'run',
+          source: 'operator-run-budget',
+        }),
+      ])
+    );
+  });
+
+  it('normalizes checkpoint age out of material instruction evidence', () => {
+    const service = testableService(tmpDir);
+    const first = service.runLaunchCompiler.normalizeRunLaunchTaskPrompt(
+      `Envelope sha256:${'c'.repeat(64)} Last Checkpoint: 2026-07-23T20:00:00.000Z (5 minutes ago)`,
+      'attempt-a',
+      tmpDir,
+      `sha256:${'c'.repeat(64)}`,
+      `sha256:${'a'.repeat(64)}`
+    );
+    const later = service.runLaunchCompiler.normalizeRunLaunchTaskPrompt(
+      `Envelope sha256:${'d'.repeat(64)} Last Checkpoint: 2026-07-23T20:00:00.000Z (125 minutes ago)`,
+      'attempt-b',
+      tmpDir,
+      `sha256:${'d'.repeat(64)}`,
+      `sha256:${'b'.repeat(64)}`
+    );
+
+    expect(first).toBe(later);
+  });
+
+  it('records the same non-empty OpenClaw environment alias used by adapter precedence', () => {
+    vi.stubEnv('OPENCLAW_GATEWAY_URL', '');
+    vi.stubEnv('CLAWDBOT_GATEWAY', 'http://127.0.0.1:18789');
+    vi.stubEnv('CLAWDBOT_GATEWAY_URL', 'http://127.0.0.1:18790');
+    vi.stubEnv('OPENCLAW_GATEWAY_TOKEN', '');
+    vi.stubEnv('CLAWDBOT_GATEWAY_TOKEN', 'configured-token');
+    vi.stubEnv('OPENCLAW_GATEWAY_SESSION_KEY', '');
+    vi.stubEnv('OPENCLAW_GATEWAY_ALLOW_PRIVATE', '');
+    const service = testableService(tmpDir);
+
+    const environment = service.runLaunchCompiler.buildRunLaunchEnvironment(
+      'openclaw',
+      {} as SandboxPolicyDryRunResult
+    );
+
+    expect(environment.environmentKeys).toEqual(['CLAWDBOT_GATEWAY', 'CLAWDBOT_GATEWAY_TOKEN']);
+    expect(environment.credentialReferences).toEqual(['env:CLAWDBOT_GATEWAY_TOKEN']);
+  });
+
+  it('records the exact redacted OpenClaw sessions_spawn request plan', () => {
+    vi.stubEnv('OPENCLAW_GATEWAY_URL', '');
+    vi.stubEnv('CLAWDBOT_GATEWAY', '');
+    vi.stubEnv('CLAWDBOT_GATEWAY_URL', '');
+    vi.stubEnv('OPENCLAW_GATEWAY_TOKEN', '');
+    vi.stubEnv('CLAWDBOT_GATEWAY_TOKEN', '');
+    vi.stubEnv('OPENCLAW_GATEWAY_SESSION_KEY', '');
+    vi.stubEnv('OPENCLAW_GATEWAY_ALLOW_PRIVATE', '');
+    const service = testableService(tmpDir);
+
+    const runtime = service.runLaunchCompiler.buildRunLaunchRuntime(
+      'openclaw',
+      {
+        type: 'openclaw',
+        name: 'OpenClaw',
+        enabled: true,
+        model: 'provider-model',
+      },
+      task.id,
+      path.join(tmpDir, 'run.md'),
+      'attempt-openclaw',
+      {} as SandboxPolicyDryRunResult
+    );
+
+    expect(runtime.args).toEqual([
+      'tool=sessions_spawn',
+      'task=<prompt>',
+      'taskName=task_task_codex_fixture_attempt_openclaw',
+      'label=Veritas task task_codex_fixture / attempt attempt-openclaw / OpenClaw',
+      'runtime=subagent',
+      'agentId=openclaw',
+      'mode=run',
+      'cleanup=keep',
+      'context=isolated',
+      'model=provider-model',
+      'sessionKey=default:main',
+      'gatewayUrl=default:http://127.0.0.1:18789',
+      'allowPrivateIp=false',
+      'requestTimeoutMs=60000',
+    ]);
+    expect(runtime.args.join(' ')).not.toContain('timeoutSeconds');
+  });
+
+  it('records the effective OpenClaw private-network exception', () => {
+    vi.stubEnv('OPENCLAW_GATEWAY_ALLOW_PRIVATE', 'true');
+    const service = testableService(tmpDir);
+
+    const runtime = service.runLaunchCompiler.buildRunLaunchRuntime(
+      'openclaw',
+      {
+        type: 'openclaw',
+        name: 'OpenClaw',
+        enabled: true,
+      },
+      task.id,
+      path.join(tmpDir, 'run.md'),
+      'attempt-openclaw-private',
+      {} as SandboxPolicyDryRunResult
+    );
+
+    expect(runtime.args).toContain('allowPrivateIp=true');
+    expect(runtime.environmentKeys).toContain('OPENCLAW_GATEWAY_ALLOW_PRIVATE');
+  });
+
+  it('records the Codex SDK executable override and thread safety settings', () => {
+    const service = testableService(tmpDir);
+    const sandboxPolicy = {
+      effective: {
+        sandboxMode: 'workspace-write',
+        networkAccessEnabled: false,
+        envPassthrough: [],
+        credentialRefs: [],
+      },
+    } as SandboxPolicyDryRunResult;
+
+    const overridden = service.runLaunchCompiler.buildRunLaunchRuntime(
+      'codex-sdk',
+      {
+        type: 'codex-sdk',
+        name: 'Codex SDK',
+        command: '/opt/codex-custom',
+        enabled: true,
+      },
+      task.id,
+      path.join(tmpDir, 'run.md'),
+      'attempt-sdk',
+      sandboxPolicy
+    );
+    const bundled = service.runLaunchCompiler.buildRunLaunchRuntime(
+      'codex-sdk',
+      {
+        type: 'codex-sdk',
+        name: 'Codex SDK',
+        command: 'codex',
+        enabled: true,
+      },
+      task.id,
+      path.join(tmpDir, 'run.md'),
+      'attempt-sdk',
+      sandboxPolicy
+    );
+
+    expect(overridden.command).toBe('/opt/codex-custom');
+    expect(overridden.args).toEqual([
+      'startThread',
+      'skipGitRepoCheck=true',
+      'sandboxMode=workspace-write',
+      'approvalPolicy=never',
+      'networkAccessEnabled=false',
+      'runStreamed',
+      '<prompt>',
+    ]);
+    expect(bundled.command).toBe('@openai/codex-sdk:bundled-codex');
+  });
+
+  it('returns unsupported runtime capabilities as launch-preview blockers', async () => {
+    const service = testableService(tmpDir);
+
+    const preview = await service.previewAgentLaunch(task.id, 'codex', {
+      requiredRuntimeCapabilities: ['run.approvals'],
+    });
+
+    expect(preview.manifest.providerRequirements.capabilities).toContainEqual(
+      expect.objectContaining({
+        id: 'run.approvals',
+        satisfied: false,
+      })
+    );
+    expect(preview.manifest.enforcement.blockers).toContainEqual(
+      expect.objectContaining({
+        code: 'provider-capability-unavailable',
+        field: 'providerRequirements.run.approvals',
+      })
+    );
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+  });
+
+  it('returns typed phase blockers before dispatch or attempt mutation', async () => {
+    const service = testableService(tmpDir);
+
+    const preview = await service.previewAgentLaunch(task.id, 'codex', {
+      phase: 'explore',
+    });
+
+    expect(preview.manifest.phase?.evidence.identity).toEqual({
+      mode: 'profile',
+      phase: 'explore',
+      profileId: 'builtin-explore',
+      profileVersion: 1,
+    });
+    expect(preview.manifest.enforcement).toMatchObject({
+      enforceable: false,
+      blockers: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'phase-required-authority-unsupported',
+          field: 'phase.evidence.command.execute',
+        }),
+        expect.objectContaining({
+          code: 'phase-required-authority-unsupported',
+          field: 'phase.evidence.external.action',
+        }),
+      ]),
+    });
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+  });
+
+  it('does not treat Codex untrusted approvals as complete phase command mediation', async () => {
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-app-server',
+          name: 'OpenAI Codex app-server',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-app-server',
+          model: 'gpt-5.6',
+        },
+      ],
+    });
+    mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+      type: agent.type,
+      name: agent.name,
+      enabled: agent.enabled,
+      configured: true,
+      command: agent.command,
+      executableFound: true,
+      executablePath: '/opt/homebrew/bin/codex',
+      providerVersion: 'codex-cli 0.145.0',
+      providerVersionSource: 'codex --version',
+      authenticated: true,
+      healthy: true,
+      checkedAt: '2026-07-23T00:00:00.000Z',
+    }));
+    const service = testableService(tmpDir);
+
+    const preview = await service.previewAgentLaunch(task.id, 'codex-app-server', {
+      phase: 'explore',
+    });
+
+    expect(preview.manifest.enforcement.blockers).toContainEqual(
+      expect.objectContaining({
+        code: 'phase-required-authority-unsupported',
+        field: 'phase.evidence.command.execute',
+      })
+    );
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+  });
+
+  it('compares replay and fork previews with compatible and incompatible parent manifests', async () => {
+    const service = testableService(tmpDir);
+    const parent = await service.previewAgentLaunch(task.id, 'codex');
+    const parentTask = {
+      ...task,
+      id: 'task_parent',
+      attempt: {
+        id: 'attempt_parent',
+        agent: 'codex',
+        status: 'complete',
+        runLaunchManifest: parent.manifest,
+      },
+    } as Task;
+    mockListTasks.mockImplementation(async () => [task, parentTask]);
+
+    const compatible = await service.previewAgentLaunch(task.id, 'codex', {
+      parentAttemptId: 'attempt_parent',
+    });
+    expect(compatible.parentAttemptId).toBe('attempt_parent');
+    expect(compatible.drift).toMatchObject({
+      material: true,
+      changes: expect.arrayContaining([
+        expect.objectContaining({ field: 'phase' }),
+        expect.objectContaining({ field: 'origins' }),
+      ]),
+    });
+    expect(compatible.manifest.phase?.sourceReferences).toContainEqual(
+      expect.objectContaining({
+        kind: 'parent',
+        originScope: 'parent',
+        parentAttemptId: 'attempt_parent',
+        parentManifestDigest: parent.manifest.digest,
+        parentEvidenceDigest: parent.manifest.phase?.evidence.digest,
+      })
+    );
+
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex',
+          name: 'OpenAI Codex',
+          command: 'codex',
+          args: ['exec', '--json'],
+          enabled: true,
+          provider: 'codex-cli',
+          model: 'gpt-5.6',
+        },
+      ],
+    });
+    const incompatible = await service.previewAgentLaunch(task.id, 'codex', {
+      parentAttemptId: 'attempt_parent',
+    });
+    expect(incompatible.drift).toMatchObject({
+      material: true,
+      changes: expect.arrayContaining([expect.objectContaining({ field: 'runtime' })]),
+    });
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+  });
+
+  it('binds a resumed conversation to the exact parent phase snapshot', async () => {
+    const service = testableService(tmpDir);
+    const sourceAttempt = {
+      id: 'attempt_parent',
+      agent: 'codex',
+      status: 'complete',
+      threadId: 'thread_parent',
+      providerRuntimeManifest: {},
+      taskEnvelope: {},
+      runLaunchManifest: {},
+    } as TaskAttempt;
+    vi.spyOn(
+      service as unknown as {
+        findAttempt(attemptId: string): Promise<TaskAttempt | undefined>;
+      },
+      'findAttempt'
+    ).mockResolvedValue(sourceAttempt);
+    const startAgent = vi
+      .spyOn(service, 'startAgent')
+      .mockResolvedValue({ attemptId: 'attempt_child' } as AgentStatus);
+
+    await service.resumeConversation(task.id, sourceAttempt.id, 'Continue safely', {
+      phase: 'verify',
+    });
+
+    expect(startAgent).toHaveBeenCalledWith(task.id, 'codex', {
+      phase: 'verify',
+      parentAttemptId: sourceAttempt.id,
+      conversation: {
+        mode: 'resume',
+        intent: 'resume',
+        sourceAttemptId: sourceAttempt.id,
+        message: 'Continue safely',
+      },
+    });
+  });
+
+  it('compiles transient preview and durable start tool catalogs before enforced launch', async () => {
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex',
+          name: 'OpenAI Codex',
+          command: 'codex',
+          args: ['exec', '--json'],
+          enabled: true,
+          provider: 'codex-cli',
+          model: 'gpt-5.5',
+        },
+      ],
+      agentProfiles: [
+        {
+          id: 'mcp-reviewer',
+          schemaVersion: 'agent-profile-package/v1',
+          version: '1.0.0',
+          displayName: 'MCP reviewer',
+          role: 'reviewer',
+          enabled: true,
+          capabilities: ['review'],
+          defaultTaskTypes: ['code'],
+          runtime: { agent: 'codex', provider: 'codex-cli' },
+          tools: { mcpServers: ['fixture'] },
+        },
+      ],
+    });
+    const catalogDigests: string[] = [];
+    const prepareRunCatalog = vi.fn(async (input: PrepareRunToolCatalogInput) => {
+      const catalog = {
+        schemaVersion: 'run-tool-catalog/v1' as const,
+        taskId: input.taskId,
+        attemptId: input.attemptId,
+        provider: input.provider,
+        providerRuntimeManifestDigest: input.providerRuntimeManifestDigest,
+        taskEnvelopeDigest: input.taskEnvelopeDigest,
+        entries: [],
+        createdAt: '2026-07-24T12:00:00.000Z',
+        digest: '',
+      };
+      catalog.digest = calculateRunToolCatalogDigest(catalog);
+      catalogDigests.push(catalog.digest);
+      return catalog;
+    });
+    const toolControlPlane = {
+      prepareRunCatalog,
+      environmentKeys: vi.fn(async () => []),
+    } as unknown as ToolControlPlaneService;
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir, undefined, undefined, toolControlPlane);
+
+    const preview = await service.previewAgentLaunch(task.id, undefined, {
+      profileId: 'mcp-reviewer',
+    });
+    expect(preview.manifest.tools.catalogDigest).toBe(catalogDigests[0]);
+    expect(prepareRunCatalog).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        taskId: task.id,
+        serverIds: ['fixture'],
+        persist: false,
+      })
+    );
+
+    const active = await service.startAgent(task.id, undefined, { profileId: 'mcp-reviewer' });
+    expect(active.runLaunchManifest.tools.catalogDigest).toBe(catalogDigests[1]);
+    expect(prepareRunCatalog).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        taskId: task.id,
+        attemptId: expect.stringMatching(/^attempt_/),
+        serverIds: ['fixture'],
+      })
+    );
+    expect(prepareRunCatalog.mock.calls[1]?.[0]).not.toHaveProperty('persist');
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(task.attempt).toMatchObject({ id: active.attemptId, status: 'running' });
+    await service.stopAgent(task.id, active.attemptId);
+  });
+
+  it('fails before attempt mutation when profile tool restrictions cannot be enforced', async () => {
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex',
+          name: 'OpenAI Codex',
+          command: 'codex',
+          args: ['exec', '--json'],
+          enabled: true,
+          provider: 'codex-cli',
+          model: 'gpt-5.5',
+        },
+      ],
+      agentProfiles: [
+        {
+          id: 'restricted-reviewer',
+          schemaVersion: 'agent-profile-package/v1',
+          version: '1.0.0',
+          displayName: 'Restricted reviewer',
+          role: 'reviewer',
+          enabled: true,
+          capabilities: ['review'],
+          defaultTaskTypes: ['code'],
+          runtime: { agent: 'codex', provider: 'codex-cli' },
+          instructions: { promptFile: 'prompts/reviewer.md' },
+          tools: { allowed: ['Read'] },
+          workflow: { id: 'restricted-review' },
+        },
+      ],
+    });
+    const service = testableService(tmpDir);
+
+    const preview = await service.previewAgentLaunch(task.id, undefined, {
+      profileId: 'restricted-reviewer',
+    });
+    expect(preview.manifest.enforcement).toMatchObject({
+      enforceable: false,
+      blockers: expect.arrayContaining([
+        expect.objectContaining({ code: 'tool-policy-unenforceable' }),
+        expect.objectContaining({ code: 'shared-resource-unavailable' }),
+      ]),
+    });
+    expect(preview.manifest.resources.shared).toEqual([
+      'instruction-file:prompts/reviewer.md',
+      'workflow:restricted-review',
+    ]);
+    expect(preview.manifest.origins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          field: 'providerRequirements',
+          scope: 'agent-profile',
+        }),
+        expect.objectContaining({
+          field: 'resources',
+          scope: 'workflow',
+          source: 'workflow:restricted-review',
+        }),
+      ])
+    );
+
+    await expect(
+      service.startAgent(task.id, undefined, { profileId: 'restricted-reviewer' })
+    ).rejects.toThrow(/cannot be enforced/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+    expect(task.attempt).toBeUndefined();
+    expect(mockGovernanceRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'Run launch manifest compiled',
+        outcome: 'blocked',
+      })
+    );
+  });
+
+  it('does not trust Codex file events without a persisted runtime snapshot', async () => {
+    const service = testableService(tmpDir);
+    const logPath = path.join(tmpDir, 'codex.md');
+    await fs.writeFile(logPath, '# log\n');
+
+    await expect(
+      service.handleCodexEvent(
+        {
+          type: 'item.completed',
+          item: {
+            type: 'file_change',
+            file_path: 'server/src/services/codex-provider.ts',
+          },
+        },
+        logPath,
+        task,
+        'attempt_fixture',
+        { type: 'codex', provider: 'codex-cli' }
+      )
+    ).rejects.toThrow('provider event does not match the active attempt');
+
+    expect(mockUpdateTask).not.toHaveBeenCalledWith(
+      task.id,
+      expect.objectContaining({ deliverables: expect.any(Array) })
+    );
+    expect(mockStartStep).not.toHaveBeenCalledWith(
+      'attempt_fixture',
+      expect.anything(),
+      expect.anything()
+    );
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      'deliverable_added',
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything()
+    );
+  });
+
+  it('accepts every Codex SDK 0.144 event contract consumed by the stream adapter', async () => {
+    const service = testableService(tmpDir);
+    const logPath = path.join(tmpDir, 'codex.md');
+    const events = [
+      { type: 'thread.started', thread_id: 'thread_fixture' },
+      { type: 'turn.started' },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 10,
+          cached_input_tokens: 2,
+          output_tokens: 5,
+          reasoning_output_tokens: 1,
+        },
+      },
+      { type: 'turn.failed', error: { message: 'fixture failure' } },
+      {
+        type: 'item.started',
+        item: { id: 'item_started', type: 'agent_message', text: 'starting' },
+      },
+      {
+        type: 'item.updated',
+        item: { id: 'item_updated', type: 'agent_message', text: 'working' },
+      },
+      {
+        type: 'item.completed',
+        item: { id: 'item_completed', type: 'agent_message', text: 'finished' },
+      },
+      { type: 'error', message: 'fixture stream error' },
+    ] satisfies ThreadEvent[];
+
+    const parsed = await Promise.all(
+      events.map((event) => service.handleCodexEvent(event, logPath))
+    );
+
+    expect(parsed[2]?.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+    });
+    expect(parsed[6]?.summary).toBe('finished');
+  });
+
+  it('classifies streamed output, retry, and abort lifecycle events in traces', async () => {
+    const service = testableService(tmpDir);
+    const logPath = path.join(tmpDir, 'codex.md');
+    await fs.writeFile(logPath, '# log\n');
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    await service.startAgent(task.id, 'codex');
+    const attemptId = task.attempt?.id;
+    if (!attemptId) throw new Error('Expected active attempt');
+
+    await service.handleCodexEvent(
+      {
+        type: 'response.output_text.delta',
+        delta: 'partial output OPENAI_API_KEY=sk-supersecret123456',
+        stream: 'stdout',
+      },
+      logPath,
+      task,
+      attemptId,
+      { type: 'codex', provider: 'codex-cli', model: 'gpt-5.5' }
+    );
+    await service.handleCodexEvent(
+      {
+        type: 'turn.retrying',
+        message: 'Retrying after rate limit',
+        retryAttempt: 2,
+        retryDelayMs: 1250,
+      },
+      logPath,
+      task,
+      attemptId,
+      { type: 'codex', provider: 'codex-cli', model: 'gpt-5.5' }
+    );
+
+    expect(mockStartStep).toHaveBeenCalledWith(
+      attemptId,
+      'stream',
+      expect.objectContaining({
+        eventType: 'response.output_text.delta',
+        stream: 'stdout',
+        content: 'partial output OPENAI_API_KEY=[REDACTED]',
+      })
+    );
+    expect(mockStartStep).toHaveBeenCalledWith(
+      attemptId,
+      'retry',
+      expect.objectContaining({
+        eventType: 'turn.retrying',
+        summary: 'Retrying after rate limit',
+        retryAttempt: 2,
+        retryDelayMs: 1250,
+      })
+    );
+    await service.stopAgent(task.id, attemptId);
+  });
+
+  it('fails status and provider event ingestion when the persisted snapshot changes', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+
+    await service.startAgent(task.id, 'codex');
+    const activeAttempt = task.attempt;
+    const attemptId = activeAttempt?.id;
+    if (!activeAttempt || !attemptId) throw new Error('Expected active attempt');
+    const originalManifest = activeAttempt.providerRuntimeManifest;
+    if (!originalManifest) throw new Error('Expected persisted runtime manifest');
+    task = {
+      ...task,
+      attempt: {
+        ...activeAttempt,
+        providerRuntimeManifest: providerRuntimeManifestFixture({ provider: 'codex-cli' }),
+      },
+    } as Task;
+
+    await expect(service.getAgentStatus(task.id)).rejects.toThrow('digest mismatch');
+
+    child.stdout.write(
+      `${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'stale' } })}\n`
+    );
+    await waitFor(() => expect(child.kill).toHaveBeenCalledWith('SIGTERM'));
+    expect(mockStartStep).not.toHaveBeenCalledWith(
+      attemptId,
+      expect.anything(),
+      expect.objectContaining({ eventType: 'item.completed' })
+    );
+    task = {
+      ...task,
+      attempt: { ...activeAttempt, providerRuntimeManifest: originalManifest },
+    } as Task;
+    await service.stopAgent(task.id, attemptId);
+  });
+
+  it('passes provider-native run temp and cache roots into the Codex SDK environment', async () => {
+    let releaseEvents: (() => void) | undefined;
+    const eventGate = new Promise<void>((resolve) => {
+      releaseEvents = resolve;
+    });
+    mockSdkRunStreamed.mockResolvedValue({
+      events: {
+        async *[Symbol.asyncIterator]() {
+          await eventGate;
+          yield {
+            type: 'item.completed',
+            item: { type: 'agent_message', text: 'SDK environment verified.' },
+          };
+        },
+      },
+    });
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-sdk',
+          name: 'OpenAI Codex SDK',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-sdk',
+          model: 'gpt-5.5',
+        },
+      ],
+    });
+    const rootPath = path.join(tmpDir, '.sandbox');
+    const tempPath = path.join(rootPath, 'tmp');
+    const cachePath = path.join(rootPath, 'cache');
+    const activateSandbox = vi.fn();
+    const filesystemSandbox = {
+      compile: vi.fn(
+        async (
+          input: Parameters<
+            import('../services/filesystem-sandbox-service.js').FilesystemSandboxService['compile']
+          >[0]
+        ) => ({
+          evidence: {
+            schemaVersion: 'filesystem-sandbox-evidence/v1' as const,
+            providerRuntimeManifestDigest: input.providerRuntimeManifestDigest,
+            backend: 'provider-native' as const,
+            state: 'native' as const,
+            platformBackend: 'provider-native' as const,
+            capabilityVersion: 'provider-runtime-manifest/v1@15',
+            policyHash: digestRunLaunchValue({ taskId: input.taskId }),
+            roots: [
+              {
+                id: 'run-temp',
+                access: 'write' as const,
+                scope: 'run-temp' as const,
+                pathDigest: digestRunLaunchValue({ path: tempPath }),
+              },
+              {
+                id: 'run-cache',
+                access: 'write' as const,
+                scope: 'run-cache' as const,
+                pathDigest: digestRunLaunchValue({ path: cachePath }),
+              },
+            ],
+            protectedPaths: ['.agents', '.codex', '.git', '.veritas-kanban'],
+            dotfileMasking: false,
+            descendantsEnforced: true,
+            cleanupOwner: 'run-supervisor' as const,
+          },
+          directories: { rootPath, tempPath, cachePath },
+          environment: {
+            TMPDIR: tempPath,
+            TMP: tempPath,
+            TEMP: tempPath,
+            XDG_CACHE_HOME: cachePath,
+          },
+        })
+      ),
+      activate: activateSandbox,
+      cleanup: vi.fn(),
+      wrap: vi.fn((_plan: unknown, command: string, args: string[], cwd: string) => ({
+        command,
+        args,
+        cwd,
+        environment: {},
+      })),
+    } as Pick<FilesystemSandboxService, 'compile' | 'activate' | 'cleanup' | 'wrap'>;
+    const service = testableService(tmpDir, undefined, undefined, undefined, filesystemSandbox);
+
+    await service.startAgent(task.id, 'codex-sdk');
+    await waitFor(() => expect(mockSdkConstructor).toHaveBeenCalled());
+    expect(mockSdkConstructor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          TMPDIR: tempPath,
+          TMP: tempPath,
+          TEMP: tempPath,
+          XDG_CACHE_HOME: cachePath,
+        }),
+      })
+    );
+    expect(activateSandbox.mock.invocationCallOrder[0]).toBeLessThan(
+      mockSdkConstructor.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY
+    );
+
+    releaseEvents?.();
+    await waitFor(async () => expect(await service.getAgentStatus(task.id)).toBeNull());
+  });
+
+  it('aborts and removes a Codex SDK run when stale evidence also blocks finalization', async () => {
+    let releaseEvents: (() => void) | undefined;
+    const eventGate = new Promise<void>((resolve) => {
+      releaseEvents = resolve;
+    });
+    let sdkSignal: AbortSignal | undefined;
+    mockSdkRunStreamed.mockImplementation(
+      async (_prompt: string, options: { signal?: AbortSignal }) => {
+        sdkSignal = options.signal;
+        return {
+          events: {
+            async *[Symbol.asyncIterator]() {
+              await eventGate;
+              yield {
+                type: 'item.completed',
+                item: { type: 'agent_message', text: 'stale SDK event' },
+              };
+            },
+          },
+        };
+      }
+    );
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-sdk',
+          name: 'OpenAI Codex SDK',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-sdk',
+          model: 'gpt-5.5',
+        },
+      ],
+    });
+    const service = testableService(tmpDir);
+
+    await service.startAgent(task.id, 'codex-sdk');
+    await waitFor(() => expect(mockSdkRunStreamed).toHaveBeenCalled());
+    const activeAttempt = task.attempt;
+    if (!activeAttempt?.providerRuntimeManifest) throw new Error('Expected SDK runtime manifest');
+    task = {
+      ...task,
+      attempt: {
+        ...activeAttempt,
+        providerRuntimeManifest: providerRuntimeManifestFixture({ provider: 'codex-sdk' }),
+      },
+    } as Task;
+
+    releaseEvents?.();
+
+    await waitFor(async () => expect(await service.getAgentStatus(task.id)).toBeNull());
+    expect(sdkSignal?.aborted).toBe(true);
+  });
+
+  it('retains an SDK terminal result when completion persistence exhausts automatic retries', async () => {
+    let releaseEvents: (() => void) | undefined;
+    const eventGate = new Promise<void>((resolve) => {
+      releaseEvents = resolve;
+    });
+    mockSdkRunStreamed.mockResolvedValue({
+      events: {
+        async *[Symbol.asyncIterator]() {
+          await eventGate;
+          yield {
+            type: 'item.completed',
+            item: { type: 'agent_message', text: 'SDK completed before persistence failed.' },
+          };
+        },
+      },
+    });
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-sdk',
+          name: 'OpenAI Codex SDK',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-sdk',
+          model: 'gpt-5.5',
+        },
+      ],
+    });
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex-sdk');
+    await waitFor(() => expect(mockSdkRunStreamed).toHaveBeenCalled());
+    let failedWrites = 0;
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      if (update.attempt?.ended && failedWrites < 3) {
+        failedWrites += 1;
+        throw new Error('persistent completion storage failure');
+      }
+      task = { ...task, ...update } as Task;
+      return task;
+    });
+
+    releaseEvents?.();
+
+    await waitFor(() => expect(failedWrites).toBe(3));
+    await expect(service.getAgentStatus(task.id)).resolves.toMatchObject({
+      attemptId: active.attemptId,
+      status: 'running',
+    });
+    await service.stopAgent(task.id, active.attemptId);
+
+    expect(task.attempt?.completionResult).toMatchObject({
+      status: 'success',
+      terminalSource: 'stream',
+      summary: 'SDK completed before persistence failed.',
+    });
+    const completionWrites = mockUpdateTask.mock.calls.filter(
+      ([, update]) => update.attempt?.id === active.attemptId && update.attempt?.ended
+    );
+    expect(completionWrites).toHaveLength(4);
+    expect(
+      new Set(completionWrites.map(([, update]) => update.attempt?.completionResult?.digest))
+    ).toEqual(new Set([task.attempt?.completionResult?.digest]));
+  });
+
+  it('retains an SDK execution failure when its completion write exhausts retries', async () => {
+    let releaseEvents: (() => void) | undefined;
+    const eventGate = new Promise<void>((resolve) => {
+      releaseEvents = resolve;
+    });
+    mockSdkRunStreamed.mockResolvedValue({
+      events: {
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              await eventGate;
+              throw new Error('SDK execution failed before completion');
+            },
+          };
+        },
+      },
+    });
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-sdk',
+          name: 'OpenAI Codex SDK',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-sdk',
+          model: 'gpt-5.5',
+        },
+      ],
+    });
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex-sdk');
+    await waitFor(() => expect(mockSdkRunStreamed).toHaveBeenCalled());
+    let failedWrites = 0;
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      if (update.attempt?.ended && failedWrites < 3) {
+        failedWrites += 1;
+        throw new Error('persistent completion storage failure');
+      }
+      task = { ...task, ...update } as Task;
+      return task;
+    });
+
+    releaseEvents?.();
+
+    await waitFor(() => expect(failedWrites).toBe(3));
+    await expect(service.getAgentStatus(task.id)).resolves.toMatchObject({
+      attemptId: active.attemptId,
+      status: 'running',
+    });
+    await service.stopAgent(task.id, active.attemptId);
+
+    expect(task.attempt?.completionResult).toMatchObject({
+      status: 'failed',
+      terminalSource: 'stream',
+      error: 'SDK execution failed before completion',
+    });
+    expect(task.attempt?.completionResult?.terminalSource).not.toBe('operator-interruption');
+  });
+
+  it('does not let a stopped SDK rejection remove its replacement run', async () => {
+    let releaseFirst: (() => void) | undefined;
+    let releaseSecond: (() => void) | undefined;
+    let firstRejected = false;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    let invocation = 0;
+    mockSdkRunStreamed.mockImplementation(async () => {
+      invocation += 1;
+      const currentInvocation = invocation;
+      return {
+        events: {
+          async *[Symbol.asyncIterator]() {
+            if (currentInvocation === 1) {
+              await firstGate;
+              firstRejected = true;
+              throw new Error('stopped run rejected late');
+            }
+            await secondGate;
+            yield { type: 'thread.started', thread_id: 'replacement-thread' };
+          },
+        },
+      };
+    });
+    mockGetConfig.mockResolvedValue({
+      agents: [
+        {
+          type: 'codex-sdk',
+          name: 'OpenAI Codex SDK',
+          command: 'codex',
+          args: [],
+          enabled: true,
+          provider: 'codex-sdk',
+          model: 'gpt-5.5',
+        },
+      ],
+    });
+    const service = testableService(tmpDir);
+
+    const first = await service.startAgent(task.id, 'codex-sdk');
+    await waitFor(() => expect(mockSdkRunStreamed).toHaveBeenCalledTimes(1));
+    await service.stopAgent(task.id, first.attemptId);
+    const replacement = await service.startAgent(task.id, 'codex-sdk');
+    expect(replacement.attemptId).not.toBe(first.attemptId);
+    await waitFor(() => expect(mockSdkRunStreamed).toHaveBeenCalledTimes(2));
+
+    releaseFirst?.();
+    await waitFor(() => expect(firstRejected).toBe(true));
+    await Promise.resolve();
+
+    await expect(service.getAgentStatus(task.id)).resolves.toMatchObject({
+      attemptId: replacement.attemptId,
+      status: 'running',
+    });
+    await service.stopAgent(task.id, replacement.attemptId);
+    releaseSecond?.();
+  });
+
+  it('serializes concurrent starts before asynchronous launch checks complete', async () => {
+    let releaseConfig: (() => void) | undefined;
+    const configGate = new Promise<void>((resolve) => {
+      releaseConfig = resolve;
+    });
+    const config = {
+      agents: [
+        {
+          type: 'codex',
+          name: 'OpenAI Codex',
+          command: 'codex',
+          args: ['exec', '--json'],
+          enabled: true,
+          provider: 'codex-cli',
+          model: 'gpt-5.5',
+        },
+      ],
+    };
+    mockGetConfig
+      .mockImplementationOnce(async () => {
+        await configGate;
+        return config;
+      })
+      .mockResolvedValue(config);
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+
+    const firstStart = service.startAgent(task.id, 'codex');
+    await waitFor(() => expect(mockGetConfig).toHaveBeenCalledTimes(1));
+
+    await expect(service.startAgent(task.id, 'codex')).rejects.toThrow(
+      'An agent is already running or starting for this task'
+    );
+
+    releaseConfig?.();
+    const first = await firstStart;
+    expect(first.status).toBe('running');
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    await service.stopAgent(task.id, first.attemptId);
+  });
+
+  it('persists one process completion and rejects a conflicting terminal race', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const revokeRun = vi.fn(async () => 1);
+    const service = testableService(tmpDir, { revokeRun });
+    const active = await service.startAgent(task.id, 'codex');
+    const provenance = {
+      attemptId: active.attemptId,
+      terminalSource: 'process' as const,
+      providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+    };
+
+    const naturalCompletion = service.completeAgent(
+      task.id,
+      { success: true, summary: 'natural completion won' },
+      provenance
+    );
+    await expect(
+      service.completeAgent(
+        task.id,
+        { success: false, error: 'competing stop completion' },
+        provenance
+      )
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await naturalCompletion;
+
+    expect(task.attempt).toMatchObject({
+      id: active.attemptId,
+      status: 'complete',
+      completionResult: {
+        status: 'success',
+        terminalSource: 'process',
+        summary: 'natural completion won',
+      },
+    });
+    expect(task.attempt?.completionResult?.digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(task.attempt?.completionResult?.idempotencyKey).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(mockHandleDurableGoalCompletion).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: task.id,
+        attemptId: active.attemptId,
+        completion: expect.objectContaining({
+          status: 'success',
+          summary: 'natural completion won',
+        }),
+      }),
+      expect.any(Function)
+    );
+    expect(
+      mockUpdateTask.mock.calls.filter(
+        ([, update]) =>
+          update.attempt?.id === active.attemptId &&
+          update.attempt?.ended &&
+          !update.attempt?.runRetry
+      )
+    ).toHaveLength(1);
+    expect(
+      mockTelemetryEmit.mock.calls.filter(([event]) => event.type === 'run.completed')
+    ).toHaveLength(1);
+    expect(mockLogActivity.mock.calls.filter(([type]) => type === 'agent_completed')).toHaveLength(
+      1
+    );
+    expect(revokeRun).toHaveBeenCalledTimes(1);
+    expect(revokeRun).toHaveBeenCalledWith({
+      taskId: task.id,
+      attemptId: active.attemptId,
+      runLaunchManifestDigest: active.runLaunchManifest.digest,
+      reason: 'run-completed',
+    });
+    await expect(
+      service.completeAgent(
+        task.id,
+        { success: true, summary: 'natural completion won' },
+        provenance
+      )
+    ).resolves.toBeUndefined();
+    expect(revokeRun).toHaveBeenCalledTimes(2);
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+  });
+
+  it('isolates reflection enqueue failures from provider completion', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const reflectionExtractionJobs = {
+      enqueue: vi.fn().mockRejectedValue(new Error('reflection queue unavailable')),
+    } as unknown as Pick<ReflectionExtractionJobService, 'enqueue'>;
+    const service = testableService(tmpDir);
+    (
+      service as unknown as {
+        reflectionExtractionJobs: Pick<ReflectionExtractionJobService, 'enqueue'>;
+      }
+    ).reflectionExtractionJobs = reflectionExtractionJobs;
+    const active = await service.startAgent(task.id, 'codex');
+
+    await service.completeAgent(
+      task.id,
+      { success: true, summary: 'Provider completion remains authoritative.' },
+      {
+        attemptId: active.attemptId,
+        terminalSource: 'process',
+        providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+      }
+    );
+    await waitFor(() => expect(reflectionExtractionJobs.enqueue).toHaveBeenCalledOnce());
+    await Promise.resolve();
+
+    expect(task.attempt).toMatchObject({
+      id: active.attemptId,
+      status: 'complete',
+      completionResult: { status: 'success' },
+    });
+  });
+
+  it('reports attempt-scoped terminals and cleans them up before completion commits', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const runTerminals = testRunTerminals();
+    const service = testableService(
+      tmpDir,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      runTerminals
+    );
+    const active = await service.startAgent(task.id, 'codex');
+    const handle = {
+      schemaVersion: 'run-terminal-handle/v1' as const,
+      id: 'terminal_status_test',
+      workspaceId: active.taskEnvelope.workspace.workspaceId,
+      taskId: task.id,
+      attemptId: active.attemptId,
+      launchManifestDigest: active.runLaunchManifest.digest,
+      requestId: 'terminal-status-request',
+      requestDigest: `sha256:${'b'.repeat(64)}`,
+      mode: 'pipe' as const,
+      startMode: 'background' as const,
+      state: 'running' as const,
+      commandId: `sha256:${'a'.repeat(64)}`,
+      startedAt: '2026-07-25T12:00:00.000Z',
+      output: {
+        nextCursor: 0,
+        retainedFromCursor: 1,
+        observedBytes: 0,
+        retainedBytes: 0,
+        droppedBytes: 0,
+        truncated: false,
+        volumeCircuitTripped: false,
+      },
+      capabilities: {
+        pipe: 'enforced' as const,
+        pty: 'unsupported' as const,
+        interactiveStdin: 'unsupported' as const,
+        restartReattachment: 'unsupported' as const,
+      },
+    };
+    vi.mocked(runTerminals.list).mockReturnValue([handle]);
+
+    await expect(service.getAgentStatus(task.id)).resolves.toMatchObject({
+      attemptId: active.attemptId,
+      terminals: [{ id: handle.id, attemptId: active.attemptId }],
+    });
+    expect(runTerminals.list).toHaveBeenCalledWith(
+      active.taskEnvelope.workspace.workspaceId,
+      task.id,
+      active.attemptId
+    );
+
+    await service.completeAgent(
+      task.id,
+      { success: true, summary: 'Terminal lifecycle complete.' },
+      {
+        attemptId: active.attemptId,
+        terminalSource: 'process',
+        providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+      }
+    );
+
+    expect(runTerminals.cleanupAttempt).toHaveBeenCalledWith(
+      active.taskEnvelope.workspace.workspaceId,
+      task.id,
+      active.attemptId
+    );
+    const completionWrite = mockUpdateTask.mock.invocationCallOrder.find(
+      (_, index) => mockUpdateTask.mock.calls[index]?.[1]?.attempt?.ended
+    );
+    expect(vi.mocked(runTerminals.cleanupAttempt).mock.invocationCallOrder[0]).toBeLessThan(
+      completionWrite as number
+    );
+  });
+
+  it('requires exact approval before starting a sandbox-bound run terminal', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const runTerminals = testRunTerminals();
+    let approvalStatus: RunApprovalRequest['status'] = 'pending';
+    const approvalRequest = vi.fn(async (input: CreateRunApprovalRequestInput) => {
+      return {
+        schemaVersion: 'run-approval/v1' as const,
+        id: 'runapproval_terminal_execute',
+        workspaceId: input.workspaceId ?? 'local',
+        taskId: input.taskId,
+        attemptId: input.attemptId,
+        provider: input.provider,
+        agentId: input.agentId,
+        requestKind: input.requestKind,
+        actionClass: input.actionClass,
+        action: input.action,
+        actionHash: 'a'.repeat(64),
+        details: input.details,
+        resourceScope: input.resourceScope,
+        workingDirectory: input.workingDirectory,
+        riskClass: input.riskClass,
+        policyReason: input.policyReason,
+        evidenceRevision: input.evidenceRevision,
+        providerRequestId: input.providerRequestId,
+        mobileSafe: input.mobileSafe ?? false,
+        decisionAuthority: input.decisionAuthority,
+        fileExecution: input.fileExecution,
+        status: approvalStatus,
+        revision: approvalStatus === 'approved' ? 2 : 1,
+        createdAt: '2026-07-25T12:00:00.000Z',
+        updatedAt: '2026-07-25T12:00:00.000Z',
+        expiresAt: '2026-07-25T12:05:00.000Z',
+      } as RunApprovalRequest;
+    });
+    const approvalBroker = {
+      request: approvalRequest,
+      get: vi.fn(async () => {
+        const input = approvalRequest.mock.calls.at(-1)?.[0];
+        if (!input) throw new Error('Approval was not requested.');
+        return approvalRequest(input);
+      }),
+      cancelAttempt: vi.fn(async () => []),
+    } as unknown as RunApprovalBrokerService;
+    const runFileExecutionPolicy = testRunFileExecutionPolicy();
+    const evaluateFileExecution = vi
+      .mocked(runFileExecutionPolicy.evaluate)
+      .getMockImplementation();
+    if (!evaluateFileExecution) throw new Error('File execution policy fixture is incomplete.');
+    vi.mocked(runFileExecutionPolicy.evaluate).mockImplementation(async (input) => ({
+      ...(await evaluateFileExecution(input)),
+      references: [
+        {
+          kind: 'direct-executable',
+          root: 'worktree',
+          relativePath: 'bin/tool',
+          contentSha256: `sha256:${'1'.repeat(64)}`,
+          byteSize: 42,
+          source: 'repository-baseline',
+          provenanceStatus: 'launch-baseline',
+          provenanceRecordId: null,
+          provenanceRecordDigest: null,
+          provenanceEvidenceDigest: `sha256:${'2'.repeat(64)}`,
+          decision: 'standard-approval',
+        },
+      ],
+    }));
+    const service = testableService(
+      tmpDir,
+      undefined,
+      approvalBroker,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      runTerminals,
+      undefined,
+      runFileExecutionPolicy
+    );
+    const active = await service.startAgent(task.id, 'codex');
+    const request = {
+      requestId: 'terminal-execute-request',
+      command: process.execPath,
+      args: ['--version'],
+      mode: 'pipe' as const,
+      startMode: 'background' as const,
+      cwd: '.',
+      environmentKeys: [],
+    };
+    const handle = {
+      schemaVersion: 'run-terminal-handle/v1' as const,
+      id: 'terminal_execute_test',
+      workspaceId: active.taskEnvelope.workspace.workspaceId,
+      taskId: task.id,
+      attemptId: active.attemptId,
+      launchManifestDigest: active.runLaunchManifest.digest,
+      requestId: request.requestId,
+      requestDigest: `sha256:${'b'.repeat(64)}`,
+      mode: request.mode,
+      startMode: request.startMode,
+      state: 'running' as const,
+      commandId: `sha256:${'c'.repeat(64)}`,
+      startedAt: '2026-07-25T12:00:00.000Z',
+      output: {
+        nextCursor: 0,
+        retainedFromCursor: 1,
+        observedBytes: 0,
+        retainedBytes: 0,
+        droppedBytes: 0,
+        truncated: false,
+        volumeCircuitTripped: false,
+      },
+      capabilities: {
+        pipe: 'enforced' as const,
+        pty: 'unsupported' as const,
+        interactiveStdin: 'unsupported' as const,
+        restartReattachment: 'unsupported' as const,
+      },
+    };
+    vi.mocked(runTerminals.execute).mockImplementation(async (context) => {
+      await context.beforeSpawn();
+      return handle;
+    });
+
+    await expect(
+      service.executeRunTerminal(task.id, active.attemptId, {
+        ...request,
+        requestId: 'terminal-secret-request',
+        args: ['sk_test_secret_value'],
+      })
+    ).rejects.toThrow('Credential-shaped values are not allowed');
+    expect(approvalRequest).not.toHaveBeenCalled();
+
+    vi.mocked(runFileExecutionPolicy.evaluate).mockImplementationOnce(async (input) => ({
+      ...(await evaluateFileExecution(input)),
+      decision: 'deny',
+      reasonCode: 'project-policy-deny',
+    }));
+    await expect(
+      service.executeRunTerminal(task.id, active.attemptId, {
+        ...request,
+        requestId: 'terminal-denied-file-request',
+      })
+    ).rejects.toThrow('Project policy denies execution');
+
+    const pendingAgent = (
+      service as unknown as {
+        activePendingAgent(taskId: string): { executionTree?: ExecutionTreeIdentity } | undefined;
+      }
+    ).activePendingAgent(task.id);
+    if (!pendingAgent?.executionTree) throw new Error('Active execution tree fixture is missing.');
+    const executionTree = pendingAgent.executionTree;
+    delete pendingAgent.executionTree;
+    await expect(
+      service.executeRunTerminal(task.id, active.attemptId, {
+        ...request,
+        requestId: 'terminal-missing-execution-tree-request',
+      })
+    ).rejects.toThrow('no durable execution-tree identity');
+    pendingAgent.executionTree = executionTree;
+
+    await expect(
+      service.executeRunTerminal(task.id, active.attemptId, request)
+    ).resolves.toMatchObject({
+      status: 'approval-required',
+      approval: { id: 'runapproval_terminal_execute', status: 'pending' },
+    });
+    expect(runTerminals.execute).not.toHaveBeenCalled();
+    expect(approvalRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: task.id,
+        attemptId: active.attemptId,
+        providerRequestId: request.requestId,
+        riskClass: 'high',
+        exactAction: {
+          request,
+          fileExecution: expect.objectContaining({
+            schemaVersion: 'run-file-execution-approval-evidence/v1',
+            terminalRequestId: request.requestId,
+            decision: 'standard-approval',
+          }),
+        },
+      })
+    );
+
+    approvalStatus = 'approved';
+    await expect(
+      service.executeRunTerminal(task.id, active.attemptId, request)
+    ).resolves.toMatchObject({
+      status: 'started',
+      approval: { status: 'approved' },
+      handle: { id: handle.id, requestId: request.requestId },
+    });
+    expect(runTerminals.reconcileAttempt).toHaveBeenCalledWith(
+      active.taskEnvelope.workspace.workspaceId,
+      task.id,
+      active.attemptId
+    );
+    expect(runTerminals.execute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: active.taskEnvelope.workspace.workspaceId,
+        taskId: task.id,
+        attemptId: active.attemptId,
+        launchManifestDigest: active.runLaunchManifest.digest,
+        worktreeRoot: tmpDir,
+        allowedCommands: [process.execPath],
+        fileExecutionEvidenceDigest: `sha256:${'e'.repeat(64)}`,
+        beforeSpawn: expect.any(Function),
+        wrap: expect.any(Function),
+      }),
+      request
+    );
+
+    const bindPhaseApproval = vi.spyOn(
+      service as unknown as {
+        bindPhaseApproval(...args: unknown[]): Promise<unknown>;
+      },
+      'bindPhaseApproval'
+    );
+    bindPhaseApproval
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ evidenceDigest: `sha256:${'3'.repeat(64)}` });
+    await expect(
+      service.executeRunTerminal(task.id, active.attemptId, {
+        ...request,
+        requestId: 'terminal-phase-drift-request',
+      })
+    ).rejects.toThrow('phase evidence changed after approval');
+    bindPhaseApproval.mockRestore();
+
+    let resolveLaunch: (() => void) | undefined;
+    let launchSettled = false;
+    const launchGate = new Promise<void>((resolve) => {
+      resolveLaunch = resolve;
+    });
+    vi.mocked(runTerminals.execute).mockImplementationOnce(async (context, input) => {
+      await launchGate;
+      launchSettled = true;
+      await context.beforeSpawn();
+      return {
+        ...handle,
+        id: 'terminal_finalization_race',
+        requestId: input.requestId,
+      };
+    });
+    vi.mocked(runTerminals.cleanupAttempt).mockImplementationOnce(async () => {
+      expect(launchSettled).toBe(true);
+      return [];
+    });
+    const racingRequest = {
+      ...request,
+      requestId: 'terminal-finalization-race',
+    };
+    const launchesBeforeRace = vi.mocked(runTerminals.execute).mock.calls.length;
+    const racingExecution = service.executeRunTerminal(task.id, active.attemptId, racingRequest);
+    const racingOutcome = expect(racingExecution).rejects.toThrow('raced with run finalization');
+    await waitFor(() => expect(runTerminals.execute).toHaveBeenCalledTimes(launchesBeforeRace + 1));
+    const originalProviderComplete = ProviderCompletionService.prototype.complete;
+    let resolveProviderCompletion: (() => void) | undefined;
+    const providerCompletion = new Promise<void>((resolve) => {
+      resolveProviderCompletion = resolve;
+    });
+    const completionSpy = vi
+      .spyOn(ProviderCompletionService.prototype, 'complete')
+      .mockImplementation(async function (input) {
+        const result = await originalProviderComplete.call(this, input);
+        resolveProviderCompletion?.();
+        return result;
+      });
+    try {
+      const stopping = service.stopAgent(task.id, active.attemptId);
+      await providerCompletion;
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(runTerminals.cleanupAttempt).not.toHaveBeenCalled();
+
+      resolveLaunch?.();
+      await racingOutcome;
+      await stopping;
+      expect(runTerminals.cleanupAttempt).toHaveBeenCalledOnce();
+    } finally {
+      completionSpy.mockRestore();
+    }
+  });
+
+  it('does not let a competing terminal claim poison an in-flight finalizer', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const revokeRun = vi.fn(async () => 1);
+    const service = testableService(tmpDir, { revokeRun });
+    const active = await service.startAgent(task.id, 'codex');
+    const provenance = {
+      attemptId: active.attemptId,
+      terminalSource: 'process' as const,
+      providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+    };
+
+    const interruption = service.stopAgent(task.id, active.attemptId);
+    const competitor = service.completeAgent(
+      task.id,
+      { success: true, summary: 'late process result' },
+      provenance
+    );
+
+    await interruption;
+    await expect(competitor).rejects.toMatchObject({ statusCode: 409 });
+    expect(task.attempt?.completionResult).toMatchObject({
+      status: 'interrupted',
+      terminalSource: 'operator-interruption',
+      error: 'Stopped by user',
+    });
+    expect(
+      mockUpdateTask.mock.calls.filter(
+        ([, update]) =>
+          update.attempt?.id === active.attemptId &&
+          update.attempt?.ended &&
+          !update.attempt?.runRetry
+      )
+    ).toHaveLength(1);
+    expect(revokeRun).toHaveBeenCalledWith({
+      taskId: task.id,
+      attemptId: active.attemptId,
+      runLaunchManifestDigest: active.runLaunchManifest.digest,
+      reason: 'run-interrupted',
+    });
+  });
+
+  it('rejects callback transport for a provider with harness-owned process completion', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+
+    await expect(
+      service.completeAgent(
+        task.id,
+        { success: true, summary: 'spoofed callback' },
+        {
+          attemptId: active.attemptId,
+          terminalSource: 'callback',
+          providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+        }
+      )
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    await service.stopAgent(task.id, active.attemptId);
+  });
+
+  it('persists an idempotent OpenClaw callback after server restart', async () => {
+    const completionEvidence = testCompletionEvidence();
+    const taskEnvelopes = new TaskEnvelopeService(completionEvidence);
+    const providerRuntimeManifest = providerRuntimeManifestFixture({
+      provider: 'openclaw',
+      adapter: 'openclaw',
+    });
+    const attemptId = 'attempt_restarted_openclaw';
+    const taskEnvelope = await taskEnvelopes.build({
+      task: { ...task, verificationSteps: [] },
+      attemptId,
+      createdAt: '2026-07-23T17:00:00.000Z',
+      worktreePath: tmpDir,
+      providerRuntimeManifest,
+      commitPolicy: 'allowed',
+    });
+    task = {
+      ...task,
+      status: 'in-progress',
+      revision: undefined,
+      verificationSteps: [],
+      attempt: {
+        id: attemptId,
+        agent: 'veritas',
+        status: 'running',
+        started: '2026-07-23T17:00:00.000Z',
+        provider: 'openclaw',
+        providerRuntimeManifest,
+        taskEnvelope,
+      },
+    };
+    task.attempts = [task.attempt];
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      if (update.expectedRevision !== (task.revision ?? 1)) {
+        throw Object.assign(new Error('stale revision'), { statusCode: 409 });
+      }
+      task = {
+        ...task,
+        ...update,
+        revision: (task.revision ?? 1) + 1,
+      } as Task;
+      return task;
+    });
+    const revokeRun = vi.fn(async () => 1);
+    const runTerminals = testRunTerminals();
+    const service = testableService(
+      tmpDir,
+      { revokeRun },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      runTerminals
+    );
+    const provenance = {
+      attemptId,
+      providerRuntimeManifestDigest: providerRuntimeManifest.digest,
+    };
+    const terminalResult = { success: true, summary: 'Recovered completion callback.' };
+
+    await Promise.all([
+      service.completeAgent(task.id, terminalResult, provenance),
+      service.completeAgent(task.id, terminalResult, provenance),
+    ]);
+
+    expect(task.status).toBe('done');
+    expect(task.attempt).toMatchObject({
+      id: attemptId,
+      status: 'complete',
+      completionResult: {
+        status: 'success',
+        terminalSource: 'callback',
+        summary: 'Recovered completion callback.',
+      },
+    });
+    expect(
+      mockUpdateTask.mock.calls.filter(([, update]) => update.attempt?.id === attemptId)
+    ).toHaveLength(2);
+    expect(task.revision).toBe(2);
+    expect(task.attempts).toHaveLength(1);
+    expect(runTerminals.reconcileAttempt).toHaveBeenCalledWith(
+      taskEnvelope.workspace.workspaceId,
+      task.id,
+      attemptId
+    );
+    expect(runTerminals.cleanupAttempt).toHaveBeenCalledWith(
+      taskEnvelope.workspace.workspaceId,
+      task.id,
+      attemptId
+    );
+    expect(revokeRun).toHaveBeenCalledTimes(2);
+    expect(revokeRun).toHaveBeenCalledWith({
+      taskId: task.id,
+      attemptId,
+      reason: 'run-completed',
+    });
+    await expect(
+      service.completeAgent(task.id, terminalResult, provenance)
+    ).resolves.toBeUndefined();
+    expect(revokeRun).toHaveBeenCalledTimes(3);
+    revokeRun.mockRejectedValueOnce(new Error('transient credential revocation failure'));
+    await expect(service.completeAgent(task.id, terminalResult, provenance)).rejects.toThrow(
+      'transient credential revocation failure'
+    );
+    await expect(
+      service.completeAgent(task.id, terminalResult, provenance)
+    ).resolves.toBeUndefined();
+    expect(revokeRun).toHaveBeenCalledTimes(5);
+
+    const persistedAttempt = task.attempt;
+    const persistedCompletion = persistedAttempt?.completionResult;
+    if (!persistedAttempt || !persistedCompletion) {
+      throw new Error('Expected a persisted completion result');
+    }
+    task = {
+      ...task,
+      attempt: {
+        ...persistedAttempt,
+        completionResult: {
+          ...persistedCompletion,
+          summary: 'tampered persisted completion',
+        },
+      },
+    };
+    await expect(service.completeAgent(task.id, terminalResult, provenance)).rejects.toThrow(
+      /integrity|digest/i
+    );
+
+    const mismatchedRuntime = providerRuntimeManifestFixture({
+      provider: 'openclaw',
+      adapter: 'openclaw',
+      providerVersion: 'openclaw changed-after-restart',
+    });
+    const currentAttempt = task.attempt;
+    if (!currentAttempt) throw new Error('Expected the restarted attempt');
+    task = {
+      ...task,
+      status: 'in-progress',
+      attempt: {
+        ...currentAttempt,
+        status: 'running',
+        completionResult: undefined,
+        providerRuntimeManifest: mismatchedRuntime,
+      },
+    };
+    await expect(
+      service.completeAgent(task.id, terminalResult, {
+        attemptId,
+        providerRuntimeManifestDigest: mismatchedRuntime.digest,
+      })
+    ).rejects.toThrow(/bindings do not agree/);
+
+    const mislabeledAttemptId = 'attempt_mislabeled_provider';
+    const codexRuntime = providerRuntimeManifestFixture({
+      provider: 'codex-cli',
+      adapter: 'codex-cli',
+    });
+    const codexEnvelope = await taskEnvelopes.build({
+      task: { ...task, verificationSteps: [] },
+      attemptId: mislabeledAttemptId,
+      createdAt: '2026-07-23T17:30:00.000Z',
+      worktreePath: tmpDir,
+      providerRuntimeManifest: codexRuntime,
+      commitPolicy: 'allowed',
+    });
+    task = {
+      ...task,
+      attempt: {
+        id: mislabeledAttemptId,
+        agent: 'veritas',
+        status: 'running',
+        started: '2026-07-23T17:30:00.000Z',
+        provider: 'openclaw',
+        providerRuntimeManifest: codexRuntime,
+        taskEnvelope: codexEnvelope,
+      },
+    };
+    await expect(
+      service.completeAgent(task.id, terminalResult, {
+        attemptId: mislabeledAttemptId,
+        providerRuntimeManifestDigest: codexRuntime.digest,
+      })
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      details: {
+        mismatches: expect.arrayContaining(['attempt runtime provider']),
+      },
+    });
+  });
+
+  it('coalesces concurrent stops with the provider close terminalizer', async () => {
+    const child = createControllableChild();
+    child.kill.mockImplementation(() => {
+      child.killed = true;
+      child.emit('close', 143, 'SIGTERM');
+      return true;
+    });
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+
+    const firstStop = service.stopAgent(task.id, active.attemptId);
+    const concurrentStop = service.stopAgent(task.id, active.attemptId);
+    await Promise.all([firstStop, concurrentStop]);
+
+    expect(child.kill).toHaveBeenCalledTimes(1);
+    expect(
+      mockStartStep.mock.calls.filter(
+        ([attemptId, stepType]) => attemptId === active.attemptId && stepType === 'abort'
+      )
+    ).toHaveLength(1);
+    expect(
+      mockUpdateTask.mock.calls.filter(
+        ([, update]) =>
+          update.attempt?.id === active.attemptId &&
+          update.attempt?.ended &&
+          !update.attempt?.runRetry
+      )
+    ).toHaveLength(1);
+    expect(task.attempt?.completionResult).toMatchObject({
+      status: 'interrupted',
+      terminalSource: 'operator-interruption',
+      error: 'Stopped by user',
+    });
+    expect(
+      mockTelemetryEmit.mock.calls.filter(([event]) => event.type === 'run.completed')
+    ).toHaveLength(1);
+    const log = await fs.readFile(path.join(tmpDir, `${task.id}_${active.attemptId}.md`), 'utf-8');
+    expect(log).not.toContain('## Codex Exit');
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+  });
+
+  it('automatically retries only the authoritative commit after a persistence failure', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+    mockUpdateTask.mockRejectedValueOnce(new Error('persistence unavailable'));
+
+    await service.stopAgent(task.id, active.attemptId);
+
+    expect(child.kill).toHaveBeenCalledTimes(1);
+    expect(
+      mockStartStep.mock.calls.filter(
+        ([attemptId, stepType]) => attemptId === active.attemptId && stepType === 'abort'
+      )
+    ).toHaveLength(1);
+    expect(
+      mockUpdateTask.mock.calls.filter(
+        ([, update]) =>
+          update.attempt?.id === active.attemptId &&
+          update.attempt?.ended &&
+          !update.attempt?.runRetry
+      )
+    ).toHaveLength(2);
+    const completionDigests = mockUpdateTask.mock.calls
+      .filter(
+        ([, update]) =>
+          update.attempt?.id === active.attemptId &&
+          update.attempt?.ended &&
+          !update.attempt?.runRetry
+      )
+      .map(([, update]) => update.attempt?.completionResult?.digest);
+    expect(new Set(completionDigests)).toEqual(new Set([task.attempt?.completionResult?.digest]));
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+  });
+
+  it('runs local finalization effects when task persistence writes and then reports an error', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+    let simulatedPostWriteError = false;
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      task = { ...task, ...update } as Task;
+      if (update.attempt?.ended && !simulatedPostWriteError) {
+        simulatedPostWriteError = true;
+        throw new Error('task status telemetry failed after write');
+      }
+      return task;
+    });
+
+    await service.stopAgent(task.id, active.attemptId);
+
+    expect(
+      mockUpdateTask.mock.calls.filter(
+        ([, update]) =>
+          update.attempt?.id === active.attemptId &&
+          update.attempt?.ended &&
+          !update.attempt?.runRetry
+      )
+    ).toHaveLength(1);
+    expect(mockTelemetryEmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'run.completed',
+        taskId: task.id,
+        attemptId: active.attemptId,
+      })
+    );
+    expect(mockCompleteTrace).toHaveBeenCalledWith(active.attemptId, 'failed');
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      'agent_completed',
+      task.id,
+      task.title,
+      expect.objectContaining({ attemptId: active.attemptId }),
+      'codex'
+    );
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+  });
+
+  it('retries a natural process completion after a transient persistence failure', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+    let failedCompletionWrite = false;
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      if (update.attempt?.ended && !failedCompletionWrite) {
+        failedCompletionWrite = true;
+        throw new Error('transient persistence failure');
+      }
+      task = { ...task, ...update } as Task;
+      return task;
+    });
+
+    child.emit('close', 0, null);
+
+    await waitFor(() => expect(task.status).toBe('done'));
+    expect(
+      mockUpdateTask.mock.calls.filter(
+        ([, update]) => update.attempt?.id === active.attemptId && update.attempt?.ended
+      )
+    ).toHaveLength(2);
+    expect(task.attempt?.completionResult).toMatchObject({
+      status: 'success',
+      terminalSource: 'process',
+    });
+  });
+
+  it('uses compare-and-swap and retries against the latest active attempt revision', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+    task = { ...task, revision: 7 };
+    let raced = false;
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      if (update.attempt?.ended) {
+        if (update.expectedRevision !== task.revision) {
+          throw Object.assign(new Error('stale revision'), { statusCode: 409 });
+        }
+        if (!raced) {
+          raced = true;
+          task = { ...task, revision: 8, priority: 'high' };
+          throw Object.assign(new Error('concurrent task mutation'), { statusCode: 409 });
+        }
+      }
+      task = {
+        ...task,
+        ...update,
+        revision: (task.revision ?? 1) + 1,
+      } as Task;
+      return task;
+    });
+
+    await service.stopAgent(task.id, active.attemptId);
+
+    const completionWrites = mockUpdateTask.mock.calls.filter(
+      ([, update]) =>
+        update.attempt?.id === active.attemptId &&
+        update.attempt?.ended &&
+        !update.attempt?.runRetry
+    );
+    expect(completionWrites.map(([, update]) => update.expectedRevision)).toEqual([7, 8]);
+    expect(task.priority).toBe('high');
+    expect(task.revision).toBe(10);
+    expect(task.attempt?.runRetry).toMatchObject({
+      state: 'cancelled',
+      action: 'cancelled',
+    });
+  });
+
+  it('rejects a completion retry when immutable attempt bindings change under the same ID', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+    task = { ...task, revision: 7 };
+    const persistedAttempt = task.attempt;
+    if (!persistedAttempt) throw new Error('Expected an active attempt');
+    let raced = false;
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      if (update.attempt?.ended && !raced) {
+        raced = true;
+        task = {
+          ...task,
+          revision: 8,
+          attempt: {
+            ...persistedAttempt,
+            providerRuntimeManifest: providerRuntimeManifestFixture({
+              provider: 'codex-cli',
+              providerVersion: 'codex-cli changed-under-cas',
+            }),
+          },
+        };
+        throw Object.assign(new Error('concurrent immutable mutation'), { statusCode: 409 });
+      }
+      task = { ...task, ...update } as Task;
+      return task;
+    });
+
+    await expect(service.stopAgent(task.id, active.attemptId)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+
+    expect(task.attempt?.completionResult).toBeUndefined();
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+  });
+
+  it('does not finalize locally when the task is archived during the completion write', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+    mockUpdateTask.mockImplementation(async (_id, update) => {
+      if (update.attempt?.ended) return null;
+      task = { ...task, ...update } as Task;
+      return task;
+    });
+
+    await expect(service.stopAgent(task.id, active.attemptId)).rejects.toThrow(
+      /archived or deleted/
+    );
+
+    expect(task.attempt?.completionResult).toBeUndefined();
+    expect(
+      mockTelemetryEmit.mock.calls.filter(
+        ([event]) => event.type === 'run.completed' && event.attemptId === active.attemptId
+      )
+    ).toHaveLength(0);
+    expect(
+      mockLogActivity.mock.calls.filter(
+        ([type, , , metadata]) =>
+          type === 'agent_completed' && metadata.attemptId === active.attemptId
+      )
+    ).toHaveLength(0);
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+  });
+
+  it.each([
+    {
+      status: 'blocked' as const,
+      taskStatus: 'blocked',
+      error: undefined,
+      blockers: [
+        {
+          code: 'operator-input',
+          summary: 'Operator input required',
+          detail: 'Choose the deployment target.',
+          retryable: true,
+        },
+      ],
+      credentialReason: 'run-failed',
+    },
+    {
+      status: 'failed' as const,
+      taskStatus: 'in-progress',
+      error: 'Provider failed.',
+      blockers: undefined,
+      credentialReason: 'run-failed',
+    },
+    {
+      status: 'interrupted' as const,
+      taskStatus: 'in-progress',
+      error: undefined,
+      blockers: undefined,
+      credentialReason: 'run-interrupted',
+    },
+    {
+      status: 'partial' as const,
+      taskStatus: 'in-progress',
+      error: undefined,
+      blockers: undefined,
+      credentialReason: 'run-failed',
+    },
+  ])('maps $status completion into $taskStatus recovery state', async (fixture) => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const revokeRun = vi.fn(async () => 1);
+    const service = testableService(tmpDir, { revokeRun });
+    const active = await service.startAgent(task.id, 'codex');
+
+    await service.completeAgent(
+      task.id,
+      {
+        status: fixture.status,
+        summary: `Provider reported ${fixture.status}.`,
+        error: fixture.error,
+        blockers: fixture.blockers,
+      },
+      {
+        attemptId: active.attemptId,
+        terminalSource: 'process',
+        providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+      }
+    );
+
+    expect(task.status).toBe(fixture.taskStatus);
+    expect(task.attempt).toMatchObject({
+      id: active.attemptId,
+      status: 'failed',
+      completionResult: {
+        status: fixture.status,
+        terminalSource: 'process',
+      },
+    });
+    expect(revokeRun).toHaveBeenCalledWith({
+      taskId: task.id,
+      attemptId: active.attemptId,
+      runLaunchManifestDigest: active.runLaunchManifest.digest,
+      reason: fixture.credentialReason,
+    });
+  });
+
+  it('does not schedule generic recovery when a durable goal owns continuation', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    mockHandleDurableGoalCompletion.mockResolvedValue({ action: 'dispatched' });
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+
+    await service.completeAgent(
+      task.id,
+      {
+        status: 'partial',
+        summary: 'The durable goal supervisor will continue this objective.',
+      },
+      {
+        attemptId: active.attemptId,
+        terminalSource: 'process',
+        providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+      }
+    );
+
+    expect(mockHandleDurableGoalCompletion).toHaveBeenCalledTimes(1);
+    expect(task.attempt?.runRetry).toBeUndefined();
+  });
+
+  it('does not enforce a budget evaluation that outlives its active run', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex', {
+      budget: {
+        enabled: true,
+        limits: { runtimeSeconds: 10_000 },
+        hardAction: 'cancel',
+      },
+    });
+    let releaseBudgetLookup: (() => void) | undefined;
+    const budgetLookupGate = new Promise<void>((resolve) => {
+      releaseBudgetLookup = resolve;
+    });
+    mockGetTask.mockClear();
+    mockGetTask
+      .mockImplementationOnce(async () => {
+        await budgetLookupGate;
+        return task;
+      })
+      .mockImplementation(async () => task);
+
+    const staleBudgetEvaluation = service.recordBudgetUsage(task.id, active.attemptId, {
+      runtimeSeconds: 20_000,
+    });
+    await waitFor(() => expect(mockGetTask).toHaveBeenCalledTimes(1));
+    await service.stopAgent(task.id, active.attemptId);
+    releaseBudgetLookup?.();
+
+    await expect(staleBudgetEvaluation).rejects.toMatchObject({ statusCode: 409 });
+    const log = await fs.readFile(path.join(tmpDir, `${task.id}_${active.attemptId}.md`), 'utf-8');
+    expect(log).not.toContain('## Budget Enforcement');
+    expect(child.kill).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reapply budget usage when governance trace persistence retries', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex', {
+      budget: {
+        enabled: true,
+        limits: { toolCalls: 2 },
+        hardAction: 'cancel',
+      },
+    });
+    mockGovernanceRecord.mockRejectedValueOnce(new Error('governance trace unavailable'));
+
+    await expect(
+      service.recordBudgetUsage(task.id, active.attemptId, { toolCalls: 2 })
+    ).rejects.toThrow('governance trace unavailable');
+    await expect(service.getAgentStatus(task.id)).resolves.toMatchObject({
+      attemptId: active.attemptId,
+      status: 'running',
+    });
+
+    await service.recordBudgetUsage(task.id, active.attemptId, { toolCalls: 2 });
+
+    expect(task.attempt?.budget?.usage.toolCalls).toBe(2);
+    expect(child.kill).toHaveBeenCalledTimes(1);
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+  });
+
+  it('accepts an exact persisted duplicate but rejects a conflicting completion', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+    const active = await service.startAgent(task.id, 'codex');
+    const provenance = {
+      attemptId: active.attemptId,
+      terminalSource: 'process' as const,
+      providerRuntimeManifestDigest: active.providerRuntimeManifest.digest,
+    };
+    mockTelemetryEmit.mockRejectedValueOnce(new Error('telemetry unavailable'));
+
+    await expect(
+      service.completeAgent(
+        task.id,
+        { success: true, summary: 'committed before telemetry' },
+        provenance
+      )
+    ).resolves.toBeUndefined();
+
+    expect(task.attempt).toMatchObject({ id: active.attemptId, status: 'complete' });
+    await expect(service.getAgentStatus(task.id)).resolves.toBeNull();
+    await expect(
+      service.completeAgent(
+        task.id,
+        { success: true, summary: 'committed before telemetry' },
+        provenance
+      )
+    ).resolves.toBeUndefined();
+    await expect(
+      service.completeAgent(task.id, { success: true, summary: 'must not replay' }, provenance)
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(
+      mockUpdateTask.mock.calls.filter(
+        ([, update]) => update.attempt?.id === active.attemptId && update.attempt?.ended
+      )
+    ).toHaveLength(1);
+    expect(mockCompleteTrace).toHaveBeenCalledWith(active.attemptId, 'completed');
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      'agent_completed',
+      task.id,
+      task.title,
+      expect.objectContaining({ attemptId: active.attemptId, success: true }),
+      'codex'
+    );
+  });
+
+  it('rejects stale completion and budget provenance after a replacement starts', async () => {
+    const firstChild = createControllableChild();
+    const replacementChild = createControllableChild();
+    mockSpawn.mockReturnValueOnce(firstChild).mockReturnValueOnce(replacementChild);
+    const service = testableService(tmpDir);
+
+    const first = await service.startAgent(task.id, 'codex');
+    await service.stopAgent(task.id, first.attemptId);
+    const replacement = await service.startAgent(task.id, 'codex');
+
+    await expect(service.stopAgent(task.id, first.attemptId)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(
+      service.sendMessage(task.id, 'late steering command', {
+        expectedAttemptId: first.attemptId,
+      })
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      service.completeAgent(
+        task.id,
+        { success: true, summary: 'late completion' },
+        {
+          attemptId: first.attemptId,
+          providerRuntimeManifestDigest: first.providerRuntimeManifest.digest,
+        }
+      )
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      service.recordBudgetUsage(task.id, first.attemptId, { totalTokens: 99 })
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.getAgentStatus(task.id)).resolves.toMatchObject({
+      attemptId: replacement.attemptId,
+      status: 'running',
+    });
+
+    await service.stopAgent(task.id, replacement.attemptId);
+  });
+
+  it('blocks explicit dispatch when the selected agent is unhealthy', async () => {
+    mockCheckAgent.mockImplementation(async (agent: AgentConfig) => ({
+      type: agent.type,
+      name: agent.name,
+      enabled: true,
+      configured: true,
+      command: agent.command,
+      executableFound: false,
+      authenticated: null,
+      healthy: false,
+      checkedAt: '2026-06-03T00:00:00.000Z',
+      reason: 'Executable "codex" was not found on PATH',
+    }));
+    const service = testableService(tmpDir);
+
+    await expect(service.startAgent(task.id, 'codex')).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'CONFLICT',
+      details: expect.objectContaining({
+        agent: 'codex',
+        reason: 'Executable "codex" was not found on PATH',
+      }),
+    });
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before attempt persistence when universal admission returns overload', async () => {
+    const admit = vi.fn().mockResolvedValue({
+      schemaVersion: 'admission-decision/v1',
+      outcome: 'retryable-overload',
+      request: {
+        schemaVersion: 'admission-request/v1',
+        idempotencyKey: 'launch:overloaded-task',
+        source: 'direct',
+        taskId: task.id,
+        rootTaskId: task.id,
+        workspaceId: task.project,
+        provider: 'codex-cli',
+        hostId: 'local-process',
+        requested: { runSlots: 1, processSlots: 1, estimatedMemoryMb: 512 },
+        requestedAt: '2026-07-25T10:00:00.000Z',
+      },
+      limitingPolicies: [
+        {
+          id: 'global:global',
+          scope: 'global',
+          scopeId: 'global',
+          limits: { concurrentRuns: 1 },
+        },
+      ],
+      retryAfterMs: 5_000,
+      reason: 'Active reservations currently consume the configured capacity.',
+      decidedAt: '2026-07-25T10:00:00.000Z',
+    });
+    const admission = {
+      admitOrQueue: admit,
+      assertExecutionTreeLaunchAllowed: vi.fn(async () => undefined),
+    } as unknown as AdmissionControlService;
+    const service = testableService(
+      tmpDir,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      testWorkspaceExecutionTrust(),
+      admission
+    );
+
+    await expect(
+      service.startAgent(task.id, 'codex', { commitPolicy: 'forbidden' })
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      details: expect.objectContaining({ code: 'ADMISSION_OVERLOAD' }),
+    });
+    expect(admit).toHaveBeenCalledOnce();
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockUpdateTask).not.toHaveBeenCalled();
+  });
+
+  it('records user stop requests as abort trace steps before completing the attempt', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+
+    const active = await service.startAgent(task.id, 'codex');
+    await service.stopAgent(task.id, active.attemptId);
+
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(mockStartStep).toHaveBeenCalledWith(
+      expect.any(String),
+      'abort',
+      expect.objectContaining({
+        eventType: 'run.aborted',
+        reason: 'Stopped by user',
+        provider: 'codex-cli',
+      })
+    );
+  });
+
+  it('patches a provider thread without dropping the persisted runtime manifest', async () => {
+    const child = createControllableChild();
+    mockSpawn.mockReturnValue(child);
+    const service = testableService(tmpDir);
+
+    await service.startAgent(task.id, 'codex');
+    const currentAttempt = task.attempt;
+    if (!currentAttempt?.providerRuntimeManifest) {
+      throw new Error('Expected the started attempt to persist a provider runtime manifest');
+    }
+    const attemptId = currentAttempt.id;
+    const manifestDigest = currentAttempt.providerRuntimeManifest.digest;
+    await service.recordCodexThread(task, attemptId, 'thread_fixture_123');
+
+    expect(task.attempt).toMatchObject({
+      id: attemptId,
+      threadId: 'thread_fixture_123',
+      providerRuntimeManifest: { digest: manifestDigest },
+    });
+    await service.stopAgent(task.id, attemptId);
+  });
+
+  it('preserves the previous attempt when a new provider process fails to start', async () => {
+    const previousAttempt = {
+      id: 'attempt_previous',
+      agent: 'codex',
+      status: 'complete' as const,
+      provider: 'codex-cli',
+    };
+    task = { ...task, attempt: previousAttempt, attempts: [] } as Task;
+    mockGetTask.mockImplementation(async () => task);
+    mockSpawn.mockImplementation(() => {
+      throw new Error('fixture spawn failure');
+    });
+    const service = testableService(tmpDir);
+
+    await expect(service.startAgent(task.id, 'codex')).rejects.toThrow(
+      'Failed to start agent via Codex CLI: fixture spawn failure'
+    );
+
+    expect(task.attempts).toEqual(
+      expect.arrayContaining([
+        previousAttempt,
+        expect.objectContaining({ status: 'failed', providerRuntimeManifest: expect.any(Object) }),
+      ])
+    );
+  });
+
+  it('requires and records a readiness override for incomplete task starts', async () => {
+    task = {
+      ...task,
+      title: 'Fix',
+      description: 'Too short',
+      subtasks: [],
+      verificationSteps: [],
+    } as Task;
+    mockGetTask.mockImplementation(async () => task);
+
+    const service = testableService(tmpDir);
+
+    await expect(service.startAgent(task.id, 'codex')).rejects.toBeInstanceOf(AgentReadinessError);
+
+    const fixture = await fs.readFile(path.join(fixtureDir, 'success.jsonl'), 'utf-8');
+    mockSpawn.mockReturnValue(createFakeChild(fixture));
+
+    const status = await service.startAgent(task.id, 'codex', {
+      overrideReason: 'Maintainer approved urgent fix',
+    });
+
+    expect(status.status).toBe('running');
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      'agent_event',
+      task.id,
+      task.title,
+      expect.objectContaining({
+        event: 'readiness_override',
+        overrideReason: 'Maintainer approved urgent fix',
+        missingChecks: expect.arrayContaining([
+          expect.objectContaining({ id: 'acceptance' }),
+          expect.objectContaining({ id: 'verification' }),
+        ]),
+      }),
+      'codex'
+    );
+    await waitFor(() => {
+      expect(mockUpdateTask).toHaveBeenCalledWith(
+        task.id,
+        expect.objectContaining({ status: 'done' })
+      );
+    });
+    await waitFor(async () => {
+      expect(await service.getAgentStatus(task.id)).toBeNull();
+    });
+  });
+});

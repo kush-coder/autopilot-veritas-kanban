@@ -1,0 +1,43 @@
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import App from './App';
+import { MantineRoot } from './theme/MantineRoot';
+import { registerPwaServiceWorker } from './lib/pwa';
+import '@mantine/core/styles.css';
+import '@mantine/notifications/styles.css';
+import './globals.css';
+
+const isDesktopClient =
+  typeof window !== 'undefined' &&
+  Boolean((window as Window & { veritasDesktop?: unknown }).veritasDesktop);
+
+if (typeof document !== 'undefined' && isDesktopClient) {
+  document.documentElement.dataset.client = 'desktop';
+}
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60,
+      refetchOnWindowFocus: true,
+    },
+  },
+});
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <MantineRoot>
+        <App />
+      </MantineRoot>
+    </QueryClientProvider>
+  </React.StrictMode>
+);
+
+void registerPwaServiceWorker({
+  enabled: !isDesktopClient && (import.meta.env.PROD || import.meta.env.VITE_ENABLE_PWA === 'true'),
+  unregisterWhenDisabled: isDesktopClient,
+}).catch((error) => {
+  console.warn('[PWA] Service worker registration failed:', error);
+});

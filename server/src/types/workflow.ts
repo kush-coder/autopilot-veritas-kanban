@@ -1,0 +1,316 @@
+/**
+ * Workflow Engine Types — Veritas Kanban v3.0
+ * Phase 1: Core Engine
+ *
+ * References: docs/WORKFLOW-GUIDE.md and docs/API-WORKFLOWS.md
+ */
+
+// ==================== Workflow Definition Types ====================
+
+export interface WorkflowDefinition {
+  id: string;
+  name: string;
+  version: number;
+  description: string;
+  config?: WorkflowConfig;
+  pipeline?: WorkflowPipeline;
+  outputTargets?: WorkflowOutputTarget[];
+  schedule?: WorkflowSchedule;
+  agents: WorkflowAgent[];
+  steps: WorkflowStep[];
+  variables?: Record<string, unknown>;
+  schemas?: Record<string, unknown>;
+  createdBy?: string;
+  updatedBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface WorkflowConfig {
+  timeout?: number; // seconds
+  fresh_session_default?: boolean;
+  progress_file?: string;
+  telemetry_tags?: string[];
+  budget?: import('@veritas-kanban/shared').AgentBudgetPolicy;
+}
+
+export type WorkflowPipelineMode = 'single-agent' | 'orchestrated';
+export type WorkflowPipelineCompletion = 'all-required' | 'any-success' | 'manual-review';
+export type WorkflowSubagentRunStatus =
+  'pending' | 'running' | 'blocked' | 'completed' | 'failed' | 'skipped';
+
+export interface WorkflowSubagentTelemetry {
+  tokenBudget?: number;
+  tokensUsed?: number;
+  timeBudgetMinutes?: number;
+  durationSeconds?: number;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface WorkflowSubagentRole {
+  id: string;
+  label: string;
+  agent: string;
+  scope: string;
+  taskBrief: string;
+  deliverable: string;
+  verification: string[];
+  dependsOn?: string[];
+  required?: boolean;
+  telemetry?: WorkflowSubagentTelemetry;
+}
+
+export interface WorkflowPipeline {
+  mode: WorkflowPipelineMode;
+  parentAgent?: string;
+  completion?: WorkflowPipelineCompletion;
+  handoff?: string;
+  roles?: WorkflowSubagentRole[];
+}
+
+export type WorkflowOutputTargetType =
+  | 'task-update'
+  | 'work-product'
+  | 'completion-packet'
+  | 'notification'
+  | 'dashboard-queue-item'
+  | 'scheduled-snapshot';
+
+export interface WorkflowOutputTarget {
+  type: WorkflowOutputTargetType;
+  label?: string;
+  required?: boolean;
+  path?: string;
+  taskField?: string;
+  channel?: string;
+  deliverableId?: string;
+  retentionDays?: number;
+}
+
+export type WorkflowScheduleMode =
+  'manual' | 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'custom';
+
+export interface WorkflowSchedule {
+  mode: WorkflowScheduleMode;
+  enabled: boolean;
+  cronExpr?: string;
+  timezone?: string;
+  startAt?: string;
+  endAt?: string;
+  snapshotRetention?: number;
+  lastVerifiedAt?: string;
+}
+
+export interface WorkflowAgent {
+  id: string;
+  name: string;
+  role: string; // maps to toolPolicy
+  model?: string; // default model for this agent
+  provider?: 'openclaw' | 'codex-cli' | 'codex-sdk' | 'codex-cloud' | string;
+  command?: string;
+  sandboxPresetId?: string;
+  budget?: import('@veritas-kanban/shared').AgentBudgetPolicy;
+  description: string;
+  tools?: string[]; // Phase 2: Tool restrictions (#110)
+}
+
+export type StepType = 'agent' | 'loop' | 'gate' | 'parallel';
+
+export interface WorkflowStep {
+  id: string;
+  name: string;
+  agent?: string; // agent ID (required for type=agent|loop)
+  type: StepType;
+  /** Optional built-in execution phase. Omitted definitions run in explicit legacy mode. */
+  phase?: import('@veritas-kanban/shared').PhaseName;
+  fresh_session?: boolean; // Legacy: use session config instead
+  session?: StepSessionConfig; // Session configuration (#111)
+  input?: string; // Jinja2 template
+  output?: StepOutput;
+  acceptance_criteria?: string[];
+  on_fail?: FailurePolicy;
+  timeout?: number;
+
+  // Loop-specific config
+  loop?: LoopConfig;
+
+  // Gate-specific config
+  condition?: string; // Jinja2 expression evaluating to boolean
+  on_false?: EscalationPolicy;
+
+  // Parallel-specific config (Phase 4)
+  parallel?: ParallelConfig;
+}
+
+export interface StepOutput {
+  file: string; // Filename in step-outputs/
+  schema?: string; // Schema ID for validation
+}
+
+export interface FailurePolicy {
+  retry?: number;
+  retry_delay_ms?: number; // Phase 2: Delay between retries (#113)
+  retry_step?: string; // Retry a different step ID
+  max_reroutes?: number; // Max cross-step reroutes before on_exhausted fires (#780)
+  escalate_to?: 'human' | `agent:${string}` | 'skip';
+  escalate_message?: string;
+  on_exhausted?: EscalationPolicy;
+}
+
+export interface EscalationPolicy {
+  escalate_to: 'human' | `agent:${string}` | 'skip';
+  escalate_message?: string;
+}
+
+export interface LoopConfig {
+  over: string; // Jinja2 expression returning array
+  item_var?: string; // Variable name for current item (default: "item")
+  index_var?: string; // Variable name for loop index (default: "index")
+  completion: 'all_done' | 'any_done' | 'first_success';
+  fresh_session_per_iteration?: boolean;
+  verify_each?: boolean;
+  verify_step?: string; // Step ID to run after each iteration
+  max_iterations?: number;
+  continue_on_error?: boolean; // If true, failed iterations don't fail the loop (Phase 4)
+}
+
+// ==================== Parallel Step Configuration (Phase 4) ====================
+
+export interface ParallelConfig {
+  steps: ParallelSubStep[]; // Sub-steps to execute in parallel
+  completion: 'all' | 'any' | number; // Wait for all, any, or N sub-steps
+  fail_fast?: boolean; // If true, abort others when one fails (default: true)
+  timeout?: number; // Max time to wait for parallel steps (seconds)
+}
+
+export interface ParallelSubStep {
+  id: string;
+  agent: string;
+  input: string; // Template for sub-step input
+  output?: StepOutput;
+  timeout?: number;
+}
+
+// ==================== Workflow Run Types ====================
+
+export type WorkflowRunStatus = 'pending' | 'running' | 'blocked' | 'completed' | 'failed';
+export type StepRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+export interface WorkflowRun {
+  id: string; // run_<timestamp>_<nanoid>
+  /** Monotonic persistence revision used for compare-and-set workflow mutations. */
+  revision?: number;
+  workflowId: string;
+  workflowVersion: number;
+  taskId?: string; // Optional task association
+  admission?: import('@veritas-kanban/shared').WorkflowRootAdmissionBinding;
+  executionTree?: import('@veritas-kanban/shared').ExecutionTreeIdentity;
+  /** Immutable recurring-work version and claim that owns this run. */
+  automation?: import('@veritas-kanban/shared').WorkflowAutomationBinding;
+  status: WorkflowRunStatus;
+  currentStep?: string; // Current step ID
+  context: Record<string, unknown>; // Shared context across steps
+  budget?: import('@veritas-kanban/shared').AgentBudgetState;
+  startedAt: string;
+  completedAt?: string;
+  lastCheckpoint?: string; // Phase 2: Last state persistence timestamp (#113)
+  error?: string;
+  steps: StepRun[];
+  /** Persisted reroute counter for cross-step retry_step bounds (#780) */
+  retryRouteCount?: number;
+}
+
+export interface StepRun {
+  stepId: string;
+  status: StepRunStatus;
+  agent?: string;
+  sessionKey?: string; // OpenClaw session key
+  startedAt?: string;
+  completedAt?: string;
+  duration?: number; // seconds
+  retries: number;
+  output?: string; // Path to output file
+  error?: string;
+  providerRuntimeManifest?: import('@veritas-kanban/shared').ProviderRuntimeManifest;
+  /** Exact runtime capabilities required by the recorded provider launch. */
+  requiredRuntimeCapabilities?: import('@veritas-kanban/shared').ProviderRuntimeCapabilityId[];
+  runtimeControls?: import('@veritas-kanban/shared').ProviderRuntimeControlSet;
+  /** Exact phase authority resolved before this step launch mutated run state. */
+  phaseAuthority?: import('@veritas-kanban/shared').RunLaunchPhaseAuthority;
+  /** Digest of the immutable workflow step launch snapshot that owns phaseAuthority. */
+  phaseLaunchDigest?: string;
+  /** Durable retry/fallback decision for this workflow step. */
+  runRetry?: import('@veritas-kanban/shared').RunRecoveryRecord;
+  /** Durable admission evidence for the latest executable step attempt. */
+  admission?: import('@veritas-kanban/shared').WorkflowStepAdmissionBinding;
+  executionTree?: import('@veritas-kanban/shared').ExecutionTreeIdentity;
+
+  // Loop-specific state
+  loopState?: {
+    totalIterations: number;
+    currentIteration: number;
+    completedIterations: number;
+    failedIterations: number;
+  };
+}
+
+// ==================== Tool Policy Types ====================
+
+export interface ToolPolicy {
+  role: string;
+  allowed: string[]; // tool names allowed (use '*' for all tools)
+  denied: string[]; // tool names denied (takes precedence over allowed)
+  description: string;
+}
+
+// ==================== Session Management Types ====================
+
+export interface StepSessionConfig {
+  mode: 'fresh' | 'reuse'; // fresh = new session per step, reuse = continue existing session
+  context: 'minimal' | 'full' | 'custom'; // how much context to pass
+  cleanup: 'delete' | 'keep'; // delete session after step completes or keep for debugging
+  timeout: number; // session timeout in seconds
+  includeOutputsFrom?: string[]; // step names for 'custom' context mode
+}
+
+// ==================== Step Execution Types ====================
+
+export interface StepExecutionResult {
+  output: unknown; // Parsed output (for context passing)
+  outputPath: string; // Path to output file
+  budgetUsage?: Partial<import('@veritas-kanban/shared').AgentBudgetUsage>;
+  providerRuntimeManifest?: import('@veritas-kanban/shared').ProviderRuntimeManifest;
+}
+
+// ==================== RBAC & Audit Types ====================
+
+export type WorkflowPermission = 'view' | 'create' | 'edit' | 'delete' | 'execute';
+
+export interface WorkflowACL {
+  workflowId: string;
+  owner: string; // User ID or 'system'
+  editors: string[]; // Users who can edit
+  viewers: string[]; // Users who can view
+  executors: string[]; // Users who can trigger runs
+  isPublic: boolean; // Anyone can view/execute
+}
+
+export interface WorkflowAuditEvent {
+  timestamp: string;
+  userId: string;
+  action: 'create' | 'edit' | 'delete' | 'run';
+  workflowId: string;
+  workflowVersion?: number;
+  changes?: Array<{ field: string; oldValue: unknown; newValue: unknown }>;
+  runId?: string;
+}
+
+// ==================== Validation Error Types ====================
+
+export class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}

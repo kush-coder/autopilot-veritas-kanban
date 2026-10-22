@@ -1,0 +1,421 @@
+import { UiModal as Modal, OverlayFooter } from '@/components/ui/UiOverlay';
+import { UiPill, UiAction, UiIconAction } from '@/components/ui/UiVocabulary';
+import { SettingsGroup } from '@/components/settings/shared/SettingsLayout';
+import { useState } from 'react';
+import { Group, Select, SimpleGrid, Stack, Text, TextInput } from '@mantine/core';
+import {
+  useConfig,
+  useAddRepo,
+  useRemoveRepo,
+  useValidateRepoPath,
+  useSetDefaultAgent,
+} from '@/hooks/useConfig';
+import { useFeatureSettings, useDebouncedFeatureUpdate } from '@/hooks/useFeatureSettings';
+import { Plus, Trash2, Check, X, Loader2, FolderGit2, Bot, Star, User } from 'lucide-react';
+import type { RepoConfig, AgentConfig, ProductModeId } from '@veritas-kanban/shared';
+import { DEFAULT_FEATURE_SETTINGS } from '@veritas-kanban/shared';
+import { cn } from '@/lib/utils';
+import { useTheme } from '@/hooks/useTheme';
+import { PRODUCT_MODE_DEFINITIONS, productModeDefinition } from '@/lib/product-modes';
+import { SettingRow, SettingsHelpText, SettingsPage, SettingsSection } from '../shared';
+
+const PRODUCT_MODE_OPTIONS = PRODUCT_MODE_DEFINITIONS.map((mode) => ({
+  value: mode.id,
+  label: mode.label,
+}));
+
+export function GeneralTab() {
+  const { data: config, isLoading } = useConfig();
+  const [showAddForm, setShowAddForm] = useState(false);
+  const { theme, preference, setTheme } = useTheme();
+  const { settings } = useFeatureSettings();
+  const { debouncedUpdate } = useDebouncedFeatureUpdate();
+  const selectedProductMode =
+    settings.productMode?.selectedMode ?? DEFAULT_FEATURE_SETTINGS.productMode.selectedMode;
+  const activeProductMode = productModeDefinition(selectedProductMode);
+  const [localDisplayName, setLocalDisplayName] = useState(
+    settings.general?.humanDisplayName ?? DEFAULT_FEATURE_SETTINGS.general.humanDisplayName
+  );
+
+  return (
+    <SettingsPage
+      title="General"
+      description="Personalize the app, choose its working mode, and connect the repositories and agents used by default."
+    >
+      {/* Appearance */}
+      <SettingsSection
+        id="general-appearance"
+        title="Appearance"
+        description="Theme preference for this browser or desktop app."
+      >
+        <SettingRow
+          label="Appearance"
+          description={
+            preference === 'system'
+              ? `Following system (${theme})`
+              : `${theme === 'dark' ? 'Dark' : 'Light'} theme active`
+          }
+        >
+          <Select
+            aria-label="Appearance"
+            value={preference}
+            data={[
+              { value: 'system', label: 'Follow System' },
+              { value: 'light', label: 'Light' },
+              { value: 'dark', label: 'Dark' },
+            ]}
+            allowDeselect={false}
+            onChange={(value) => {
+              if (value === 'system' || value === 'light' || value === 'dark') setTheme(value);
+            }}
+          />
+        </SettingRow>
+      </SettingsSection>
+
+      {/* Product Mode */}
+      <SettingsSection
+        id="general-product-mode"
+        title="Product mode"
+        description="Prioritize the surfaces and shortcuts that match the way you work."
+      >
+        <div className="space-y-4">
+          <div
+            data-testid="product-mode-layout"
+            className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"
+          >
+            <div className="min-w-0 flex-1 space-y-1">
+              <Group gap={8}>
+                <UiPill>{activeProductMode.label}</UiPill>
+                <Text size="sm" fw={600}>
+                  Focus preset
+                </Text>
+              </Group>
+              <Text size="sm" c="dimmed">
+                {activeProductMode.description}
+              </Text>
+            </div>
+            <Select
+              label="Product Mode"
+              value={selectedProductMode}
+              data={PRODUCT_MODE_OPTIONS}
+              allowDeselect={false}
+              className="w-full shrink-0 sm:w-[260px]"
+              onChange={(value) => {
+                if (!value) return;
+                debouncedUpdate({
+                  productMode: {
+                    selectedMode: value as ProductModeId,
+                    lastSelectedAt: new Date().toISOString(),
+                  },
+                });
+              }}
+            />
+          </div>
+
+          <SimpleGrid cols={{ base: 1, md: 3 }} spacing="sm">
+            <ModeDetail label="Surfaces" items={activeProductMode.visibleSurfaces} />
+            <ModeDetail label="Task Template" items={[activeProductMode.defaultTaskTemplate]} />
+            <ModeDetail label="Shortcuts" items={activeProductMode.commandShortcuts} />
+          </SimpleGrid>
+        </div>
+      </SettingsSection>
+
+      {/* User Preferences */}
+      <SettingsSection
+        id="general-user-preferences"
+        title="User preferences"
+        description="Identity used in collaborative surfaces."
+      >
+        <div className="space-y-3">
+          <div className="grid gap-2">
+            <TextInput
+              id="human-display-name"
+              label={
+                <Group gap={6}>
+                  <User className="h-4 w-4 text-muted-foreground" />
+                  <span>Display Name (Squad Chat)</span>
+                </Group>
+              }
+              value={localDisplayName}
+              onChange={(e) => {
+                const value = e.target.value;
+                setLocalDisplayName(value);
+                debouncedUpdate({ general: { humanDisplayName: value || 'Human' } });
+              }}
+              placeholder="Human"
+              maw={320}
+            />
+            <SettingsHelpText>
+              How your messages appear in Squad Chat. Shows as "{localDisplayName} (Human)" in the
+              chat.
+            </SettingsHelpText>
+          </div>
+        </div>
+      </SettingsSection>
+
+      {/* Repositories */}
+      <SettingsSection
+        id="general-repositories"
+        title="Git repositories"
+        description="Repositories available for task worktrees and source operations."
+        actions={
+          !showAddForm ? (
+            <UiAction
+              variant="secondary"
+              leftSection={<Plus className="h-4 w-4" />}
+              onClick={() => setShowAddForm(true)}
+            >
+              Add Repo
+            </UiAction>
+          ) : undefined
+        }
+      >
+        {showAddForm && <AddRepoForm onClose={() => setShowAddForm(false)} />}
+        {isLoading ? (
+          <div className="text-sm text-muted-foreground">Loading...</div>
+        ) : config?.repos.length === 0 ? (
+          <SettingsGroup empty className="text-sm text-muted-foreground py-4 text-center">
+            No repositories configured.
+          </SettingsGroup>
+        ) : (
+          <div className="space-y-2">
+            {config?.repos.map((repo) => (
+              <RepoItem key={repo.name} repo={repo} />
+            ))}
+          </div>
+        )}
+      </SettingsSection>
+
+      {/* Default Agent */}
+      <SettingsSection
+        id="general-default-agent"
+        title="Default agent"
+        description="Agent selected when a task does not specify one."
+      >
+        {isLoading ? (
+          <div className="text-sm text-muted-foreground">Loading...</div>
+        ) : (
+          <div className="space-y-2">
+            {config?.agents
+              .filter((a) => a.enabled)
+              .map((agent) => (
+                <AgentDefaultItem
+                  key={agent.type}
+                  agent={agent}
+                  isDefault={config.defaultAgent === agent.type}
+                />
+              ))}
+          </div>
+        )}
+      </SettingsSection>
+    </SettingsPage>
+  );
+}
+
+function ModeDetail({ label, items }: { label: string; items: string[] }) {
+  return (
+    <SettingsGroup>
+      <Text size="xs" c="dimmed" tt="uppercase" fw={700}>
+        {label}
+      </Text>
+      <Group gap={6} mt={8}>
+        {items.slice(0, 4).map((item) => (
+          <UiPill key={item}>{item}</UiPill>
+        ))}
+      </Group>
+    </SettingsGroup>
+  );
+}
+
+function AgentDefaultItem({ agent, isDefault }: { agent: AgentConfig; isDefault: boolean }) {
+  const setDefaultAgent = useSetDefaultAgent();
+  return (
+    <SettingsGroup className="flex items-center justify-between py-2 px-3">
+      <div className="flex items-center gap-3">
+        <Bot className="h-4 w-4 text-muted-foreground" />
+        <span className="font-medium">{agent.name}</span>
+      </div>
+      <UiAction
+        variant="secondary"
+        leftSection={<Star className={cn('h-3 w-3', isDefault && 'fill-current')} />}
+        onClick={() => setDefaultAgent.mutate(agent.type)}
+        disabled={isDefault}
+      >
+        {isDefault ? 'Default' : 'Set Default'}
+      </UiAction>
+    </SettingsGroup>
+  );
+}
+
+function AddRepoForm({ onClose }: { onClose: () => void }) {
+  const [name, setName] = useState('');
+  const [path, setPath] = useState('');
+  const [defaultBranch, setDefaultBranch] = useState('main');
+  const [branches, setBranches] = useState<string[]>([]);
+  const [pathValid, setPathValid] = useState<boolean | null>(null);
+  const addRepo = useAddRepo();
+  const validatePath = useValidateRepoPath();
+
+  const handleValidatePath = async () => {
+    if (!path) return;
+    try {
+      const result = await validatePath.mutateAsync(path);
+      setPathValid(result.valid);
+      setBranches(result.branches);
+      if (result.branches.includes('main')) setDefaultBranch('main');
+      else if (result.branches.includes('master')) setDefaultBranch('master');
+      else if (result.branches.length > 0) setDefaultBranch(result.branches[0]);
+    } catch (err) {
+      console.error('[Settings] Repo path validation failed:', err);
+      setPathValid(false);
+      setBranches([]);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name || !path || !pathValid) return;
+    await addRepo.mutateAsync({ name, path, defaultBranch });
+    onClose();
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="settings-form space-y-4">
+      <div className="flex items-center gap-2 text-sm font-medium">
+        <FolderGit2 className="h-4 w-4" /> Add Repository
+      </div>
+      <div className="grid gap-3">
+        <div className="grid gap-2">
+          <TextInput
+            id="repo-name"
+            label="Name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g., rubicon"
+          />
+        </div>
+        <div className="grid gap-2">
+          <div className="flex items-end gap-2">
+            <TextInput
+              id="repo-path"
+              label="Path"
+              value={path}
+              onChange={(e) => {
+                setPath(e.target.value);
+                setPathValid(null);
+                setBranches([]);
+              }}
+              placeholder="e.g., ~/Projects/rubicon"
+              error={pathValid === false ? validatePath.error?.message || 'Invalid path' : null}
+              className="flex-1"
+            />
+            <UiAction
+              variant="secondary"
+              type="button"
+              onClick={handleValidatePath}
+              disabled={!path || validatePath.isPending}
+              aria-label={
+                validatePath.isPending
+                  ? 'Validating repository path'
+                  : pathValid === true
+                    ? 'Repository path valid'
+                    : pathValid === false
+                      ? 'Repository path invalid'
+                      : 'Validate repository path'
+              }
+            >
+              {validatePath.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : pathValid === true ? (
+                <Check className="h-4 w-4 text-green-500" />
+              ) : pathValid === false ? (
+                <X className="h-4 w-4 text-red-500" />
+              ) : (
+                'Validate'
+              )}
+            </UiAction>
+          </div>
+        </div>
+        {branches.length > 0 && (
+          <div className="grid gap-2">
+            <Select
+              id="default-branch"
+              label="Default Branch"
+              value={defaultBranch}
+              onChange={(value) => value && setDefaultBranch(value)}
+              data={branches.map((branch) => ({ value: branch, label: branch }))}
+              allowDeselect={false}
+            />
+          </div>
+        )}
+      </div>
+      <div className="flex justify-end gap-2">
+        <UiAction variant="secondary" type="button" onClick={onClose}>
+          Cancel
+        </UiAction>
+        <UiAction
+          variant="primary"
+          type="submit"
+          disabled={!name || !path || !pathValid || addRepo.isPending}
+        >
+          {addRepo.isPending ? 'Adding...' : 'Add Repository'}
+        </UiAction>
+      </div>
+    </form>
+  );
+}
+
+function RepoItem({ repo }: { repo: RepoConfig }) {
+  const removeRepo = useRemoveRepo();
+  const [removeOpen, setRemoveOpen] = useState(false);
+
+  const handleRemove = () => {
+    removeRepo.mutate(repo.name);
+    setRemoveOpen(false);
+  };
+
+  return (
+    <SettingsGroup className="flex items-center justify-between py-2 px-3">
+      <div className="flex items-center gap-3">
+        <FolderGit2 className="h-4 w-4 text-muted-foreground" />
+        <div>
+          <div className="font-medium">{repo.name}</div>
+          <div className="text-xs text-muted-foreground">{repo.path}</div>
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <UiPill>{repo.defaultBranch}</UiPill>
+        <UiIconAction
+          variant="destructive"
+          type="button"
+          aria-label={`Remove ${repo.name}`}
+          onClick={() => setRemoveOpen(true)}
+        >
+          <Trash2 className="h-4 w-4" />
+        </UiIconAction>
+        <Modal
+          variant="confirm"
+          compound
+          opened={removeOpen}
+          onClose={() => setRemoveOpen(false)}
+          title="Remove repository?"
+          centered
+        >
+          <Stack gap="1rem" className="vk-overlay-scroll">
+            <Text size="sm" c="dimmed">
+              This will remove "{repo.name}" from your configuration.
+            </Text>
+          </Stack>
+          <OverlayFooter>
+            <UiAction variant="quiet" data-autofocus onClick={() => setRemoveOpen(false)}>
+              Cancel
+            </UiAction>
+            <UiAction variant="destructive" onClick={handleRemove}>
+              Remove
+            </UiAction>
+          </OverlayFooter>
+        </Modal>
+      </div>
+    </SettingsGroup>
+  );
+}

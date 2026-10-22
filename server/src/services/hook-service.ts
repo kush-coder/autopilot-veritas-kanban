@@ -1,0 +1,339 @@
+/**
+ * Task Lifecycle Hook Service
+ *
+ * Fires configured hooks on task state transitions:
+ * - onCreated: Task is created
+ * - onStarted: Task moves to in-progress
+ * - onBlocked: Task moves to blocked
+ * - onCompleted: Task moves to done
+ * - onArchived: Task is archived
+ *
+ * Each hook can trigger:
+ * - Webhook POST to configured URL
+ * - Notification to configured channel
+ * - Activity log entry
+ *
+ * Inspired by BoardKit Orchestrator's hook system.
+ */
+
+import { createLogger } from '../lib/logger.js';
+import type { Task, EnforcementSettings } from '@veritas-kanban/shared';
+import { getChatService } from './chat-service.js';
+import { getNotificationService } from './notification-service.js';
+import { getOutboundIntegrationService } from './outbound-integration-service.js';
+
+const log = createLogger('hooks');
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type HookEvent = 'onCreated' | 'onStarted' | 'onBlocked' | 'onCompleted' | 'onArchived';
+
+export interface HookConfig {
+  enabled?: boolean;
+  webhook?: string;
+  notify?: boolean;
+  logActivity?: boolean;
+}
+
+export interface HooksSettings {
+  enabled?: boolean;
+  onCreated?: HookConfig;
+  onStarted?: HookConfig;
+  onBlocked?: HookConfig;
+  onCompleted?: HookConfig;
+  onArchived?: HookConfig;
+}
+
+export interface HookPayload {
+  event: HookEvent;
+  taskId: string;
+  taskTitle: string;
+  previousStatus?: string;
+  newStatus?: string;
+  project?: string;
+  sprint?: string;
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// Settings Cache
+// ---------------------------------------------------------------------------
+
+let cachedSettings: HooksSettings | undefined;
+let cachedEnforcement: EnforcementSettings | undefined;
+
+/**
+ * Set the hooks configuration. Called by settings service on load/change.
+ */
+export function setHooksSettings(settings: HooksSettings | undefined): void {
+  cachedSettings = settings;
+  log.info({ enabled: settings?.enabled ?? false }, 'Hooks settings updated');
+}
+
+/**
+ * Set enforcement settings. Called by settings service on load/change.
+ */
+export function setEnforcementSettings(settings: EnforcementSettings | undefined): void {
+  cachedEnforcement = settings;
+  log.info(
+    {
+      squadChat: settings?.squadChat ?? true,
+      reviewGate: settings?.reviewGate ?? true,
+      closingComments: settings?.closingComments ?? true,
+      autoTelemetry: settings?.autoTelemetry ?? true,
+      autoTimeTracking: settings?.autoTimeTracking ?? true,
+    },
+    'Enforcement settings updated'
+  );
+}
+
+/**
+ * Get the current hooks configuration.
+ */
+export function getHooksSettings(): HooksSettings | undefined {
+  return cachedSettings;
+}
+
+// ---------------------------------------------------------------------------
+// Hook Execution
+// ---------------------------------------------------------------------------
+
+/**
+ * Fire a lifecycle hook for a task event.
+ * Non-blocking — errors are logged but don't propagate.
+ */
+export async function fireHook(
+  event: HookEvent,
+  task: Pick<Task, 'id' | 'title' | 'status' | 'project' | 'sprint' | 'agent'>,
+  previousStatus?: string
+): Promise<void> {
+  const settings = cachedSettings;
+  const squadChatEnabled = cachedEnforcement?.squadChat === true;
+  const hooksEnabled = settings?.enabled === true;
+
+  // Nothing to do if both lifecycle hooks and squad chat enforcement are disabled.
+  if (!hooksEnabled && !squadChatEnabled) {
+    return;
+  }
+
+  // Get the specific hook config
+  const hookConfig = settings?.[event];
+  const hookEnabled = hooksEnabled && hookConfig?.enabled === true;
+  if (!hookEnabled && !squadChatEnabled) {
+    return;
+  }
+
+  const payload: HookPayload = {
+    event,
+    taskId: task.id,
+    taskTitle: task.title,
+    previousStatus,
+    newStatus: task.status,
+    project: task.project,
+    sprint: task.sprint,
+    timestamp: new Date().toISOString(),
+  };
+
+  log.info({ event, taskId: task.id }, 'Firing hook');
+
+  // Fire webhook if configured
+  if (hookEnabled && hookConfig?.webhook) {
+    fireWebhook(hookConfig.webhook, payload).catch((err) => {
+      log.warn({ event, taskId: task.id, error: err.message }, 'Webhook delivery failed');
+    });
+  }
+
+  // Fire squad chat when the enforcement toggle is enabled. This is intentionally
+  // independent of per-hook settings because enforcement.squadChat is the public
+  // setting documented for lifecycle squad-chat posts.
+  if (squadChatEnabled) {
+    fireSquadChat(event, task, previousStatus).catch((err) => {
+      log.warn({ event, taskId: task.id, error: err.message }, 'Squad chat post failed');
+    });
+  }
+
+  // Fire notification if configured
+  if (hookEnabled && hookConfig?.notify) {
+    fireNotification(event, payload).catch((err) => {
+      log.warn({ event, taskId: task.id, error: err.message }, 'Notification creation failed');
+    });
+  }
+
+  // Activity logging is handled by the existing activity service
+  // The logActivity flag could be used to suppress logging if needed
+}
+
+/**
+ * Post a lifecycle event to squad chat.
+ * Maps hook events to human-readable messages.
+ */
+async function fireSquadChat(
+  event: HookEvent,
+  task: Pick<Task, 'id' | 'title' | 'status' | 'project' | 'sprint' | 'agent'>,
+  _previousStatus?: string
+): Promise<void> {
+  const chatService = getChatService();
+
+  // Map event to human-readable message
+  const messages: Record<HookEvent, string> = {
+    onCreated: `Task created: ${task.title}`,
+    onStarted: `Started working on: ${task.title}`,
+    onBlocked: `Task blocked: ${task.title}`,
+    onCompleted: `Task completed: ${task.title}`,
+    onArchived: `Task archived: ${task.title}`,
+  };
+
+  const message = messages[event];
+  const agent = task.agent || 'veritas';
+  const tags = ['task-lifecycle'];
+
+  // Add project/sprint tags if present
+  if (task.project) tags.push(task.project);
+  if (task.sprint) tags.push(task.sprint);
+
+  // Map hook events to squad chat event types
+  const eventMap: Record<HookEvent, 'agent.status' | undefined> = {
+    onCreated: 'agent.status',
+    onStarted: 'agent.status',
+    onBlocked: 'agent.status',
+    onCompleted: 'agent.status',
+    onArchived: undefined,
+  };
+
+  await chatService.sendSquadMessage({
+    agent: agent.toUpperCase(),
+    message,
+    tags,
+    system: true,
+    event: eventMap[event],
+    taskTitle: task.title,
+  });
+
+  log.debug({ event, taskId: task.id }, 'Squad chat notification sent');
+}
+
+/**
+ * Deliver a webhook payload to the configured URL.
+ * Single retry after 2 seconds on failure.
+ */
+async function fireWebhook(url: string, payload: HookPayload): Promise<void> {
+  const body = JSON.stringify(payload);
+  const outbound = getOutboundIntegrationService();
+
+  const deliver = async (retryOf?: string, attempt = 1) => {
+    return outbound.deliver(
+      {
+        id: `hooks.${payload.event}`,
+        type: 'lifecycle-hook-webhook',
+        displayName: `Lifecycle hook ${payload.event}`,
+        url,
+        owner: { source: 'feature-settings', resourceId: `hooks.${payload.event}` },
+      },
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-VK-Event': payload.event,
+        },
+        body,
+        timeoutMs: 10_000,
+        retryOf,
+        attempt,
+      }
+    );
+  };
+
+  const assertDelivered = (result: Awaited<ReturnType<typeof deliver>>): void => {
+    if (result.ok) return;
+    if (result.status === 'blocked' || result.status === 'skipped') {
+      log.warn({ event: payload.event, status: result.status }, 'Webhook delivery skipped');
+      return;
+    }
+    throw new Error(result.error || `HTTP ${result.responseStatus || 'unknown'}`);
+  };
+
+  let firstAttemptId: string | undefined;
+
+  try {
+    const result = await deliver();
+    firstAttemptId = result.attemptId;
+    assertDelivered(result);
+    if (result.ok) {
+      log.debug({ event: payload.event }, 'Webhook delivered');
+    }
+  } catch (err) {
+    log.warn(
+      { event: payload.event, error: (err as Error).message },
+      'Webhook failed, retrying in 2s'
+    );
+
+    // Single retry after 2 seconds
+    setTimeout(async () => {
+      try {
+        const result = await deliver(firstAttemptId, 2);
+        assertDelivered(result);
+        if (result.ok) {
+          log.debug({ event: payload.event }, 'Webhook retry succeeded');
+        }
+      } catch (retryErr) {
+        log.error(
+          { event: payload.event, error: (retryErr as Error).message },
+          'Webhook retry failed'
+        );
+      }
+    }, 2000);
+  }
+}
+
+/**
+ * Create a notification for a lifecycle hook event.
+ */
+async function fireNotification(event: HookEvent, payload: HookPayload): Promise<void> {
+  const service = getNotificationService();
+
+  const messages: Record<HookEvent, string> = {
+    onCreated: `Task created: ${payload.taskTitle}`,
+    onStarted: `Task started: ${payload.taskTitle}`,
+    onBlocked: `Task blocked: ${payload.taskTitle}`,
+    onCompleted: `Task completed: ${payload.taskTitle}`,
+    onArchived: `Task archived: ${payload.taskTitle}`,
+  };
+
+  await service.createNotification({
+    type: 'lifecycle',
+    title: event,
+    message: messages[event],
+    taskId: payload.taskId,
+    taskTitle: payload.taskTitle,
+    project: payload.project,
+  });
+
+  log.debug({ event, taskId: payload.taskId }, 'Notification created');
+}
+
+// ---------------------------------------------------------------------------
+// Convenience Functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a status change to the appropriate hook event.
+ */
+export function getHookEventForStatusChange(
+  previousStatus: string | undefined,
+  newStatus: string
+): HookEvent | null {
+  // Status transitions that trigger hooks
+  if (newStatus === 'in-progress' && previousStatus !== 'in-progress') {
+    return 'onStarted';
+  }
+  if (newStatus === 'blocked' && previousStatus !== 'blocked') {
+    return 'onBlocked';
+  }
+  if (newStatus === 'done' && previousStatus !== 'done') {
+    return 'onCompleted';
+  }
+  return null;
+}

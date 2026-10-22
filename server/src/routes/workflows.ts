@@ -1,0 +1,838 @@
+/**
+ * Workflow API Routes — CRUD operations on workflows and workflow runs
+ * Phase 1: Core Engine with RBAC and audit logging
+ */
+
+import { Router } from 'express';
+import { z } from 'zod';
+import type { WorkflowDefinition, WorkflowACL, WorkflowAccess } from '@veritas-kanban/shared';
+import { getWorkflowService } from '../services/workflow-service.js';
+import { getWorkflowRunService } from '../services/workflow-run-service.js';
+import { getWorkflowAuthoringService } from '../services/workflow-authoring-service.js';
+import { getSessionTemplateService } from '../services/session-template-service.js';
+import { asyncHandler } from '../middleware/async-handler.js';
+import type { AuthenticatedRequest } from '../middleware/auth.js';
+import { NotFoundError, ValidationError, BadRequestError } from '../middleware/error-handler.js';
+import { checkWorkflowPermission, assertWorkflowPermission } from '../middleware/workflow-auth.js';
+import { diffWorkflows } from '../utils/workflow-diff.js';
+import { actorFromRequest, assertFreshRevision, setRevisionHeaders } from '../utils/concurrency.js';
+import { AgentBudgetPolicySchema } from '../schemas/agent-budget-schemas.js';
+
+const router = Router();
+const workflowService = getWorkflowService();
+const workflowRunService = getWorkflowRunService();
+const workflowAuthoringService = getWorkflowAuthoringService();
+const sessionTemplateService = getSessionTemplateService();
+
+// Helper to extract string param (handles Express types)
+function getStringParam(param: string | string[] | undefined): string {
+  if (Array.isArray(param)) return param[0];
+  return param || '';
+}
+
+// Helper to get user ID from request
+function getUserId(req: AuthenticatedRequest): string {
+  return req.auth?.userId || req.auth?.keyName || 'unknown';
+}
+
+function getRequestPermissions(req: AuthenticatedRequest): string[] | undefined {
+  return req.auth?.permissions;
+}
+
+function requestHasPermission(req: AuthenticatedRequest, permission: string): boolean {
+  const permissions = getRequestPermissions(req);
+  return permissions?.includes('*') === true || permissions?.includes(permission) === true;
+}
+
+// Validation schemas
+const startRunSchema = z.object({
+  taskId: z.string().optional(),
+  context: z.record(z.string(), z.unknown()).optional(),
+  budget: AgentBudgetPolicySchema.optional(),
+});
+
+const resumeRunSchema = z.object({
+  context: z.record(z.string(), z.unknown()).optional(),
+});
+
+const cancelRecoverySchema = z
+  .object({
+    stepId: z.string().trim().min(1).max(160),
+    parentRunId: z.string().trim().min(1).max(320),
+  })
+  .strict();
+
+const authoringContextSchema = z
+  .object({
+    taskId: z.string().optional(),
+    clientMode: z.enum(['local', 'remote', 'cloud']).optional(),
+    availableSecrets: z.array(z.string()).optional(),
+    now: z.string().optional(),
+  })
+  .optional();
+
+const recipeMaterializeSchema = z.object({
+  inputs: z.record(z.string(), z.unknown()).optional(),
+  context: authoringContextSchema,
+});
+
+const authoringInputSchema = z.object({
+  workflow: z.record(z.string(), z.unknown()).optional(),
+  yaml: z.string().optional(),
+  context: authoringContextSchema,
+});
+
+const launchRecommendationsQuerySchema = z.object({
+  workflowId: z.string().optional(),
+  taskId: z.string().optional(),
+  project: z.string().optional(),
+  taskType: z.string().optional(),
+  cwd: z.string().optional(),
+  verificationGates: z.string().optional(),
+});
+
+// Basic input validation - detailed validation happens in WorkflowService
+const workflowCreateSchema = z.object({
+  id: z.string().min(1).max(100),
+  name: z.string().min(1).max(200),
+  version: z.number().int().min(0),
+  description: z.string().max(2000),
+  config: z.unknown().optional(),
+  pipeline: z.record(z.string(), z.unknown()).optional(),
+  outputTargets: z.array(z.record(z.string(), z.unknown())).max(12).optional(),
+  schedule: z.record(z.string(), z.unknown()).optional(),
+  agents: z.array(z.unknown()).min(1).max(20),
+  steps: z.array(z.unknown()).min(1).max(50),
+  variables: z.record(z.string(), z.unknown()).optional(),
+  schemas: z.record(z.string(), z.unknown()).optional(),
+  createdBy: z.string().optional(),
+  updatedBy: z.string().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
+});
+
+// ==================== Workflow CRUD Routes ====================
+
+/**
+ * GET /api/workflows — List all workflows (filtered by user permissions)
+ * Returns metadata only for efficiency
+ */
+router.get(
+  '/',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const userId = getUserId(req);
+    const allWorkflows = await workflowService.listWorkflowsMetadata();
+
+    // Filter by permissions
+    const visibleWorkflows = [];
+    for (const workflow of allWorkflows) {
+      const hasPermission = await checkWorkflowPermission(workflow.id, userId, 'view');
+      if (hasPermission) {
+        visibleWorkflows.push(workflow);
+      }
+    }
+
+    res.json(visibleWorkflows);
+  })
+);
+
+// ==================== Workflow Authoring Routes ====================
+
+/**
+ * GET /api/workflows/recipes — List reusable workflow recipes
+ */
+router.get(
+  '/recipes',
+  asyncHandler(async (_req: AuthenticatedRequest, res) => {
+    res.json(workflowAuthoringService.listRecipes());
+  })
+);
+
+/**
+ * POST /api/workflows/recipes/:recipeId/materialize — Build a workflow from a recipe
+ */
+router.post(
+  '/recipes/:recipeId/materialize',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const recipeId = getStringParam(req.params.recipeId);
+    const { inputs, context } = recipeMaterializeSchema.parse(req.body);
+    const materialized = await workflowAuthoringService.materializeRecipe(recipeId, inputs ?? {}, {
+      ...context,
+      permissions: getRequestPermissions(req),
+    });
+    if (!materialized) {
+      throw new NotFoundError(`Workflow recipe ${recipeId} not found`);
+    }
+    res.json(materialized);
+  })
+);
+
+/**
+ * POST /api/workflows/authoring/lint — Validate unsaved workflow YAML or JSON
+ */
+router.post(
+  '/authoring/lint',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const input = authoringInputSchema.parse(req.body);
+    const result = await workflowAuthoringService.lint({
+      workflow: input.workflow as unknown as WorkflowDefinition | undefined,
+      yaml: input.yaml,
+      context: {
+        ...input.context,
+        permissions: getRequestPermissions(req),
+      },
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * POST /api/workflows/authoring/dry-run — Dry-run unsaved workflow YAML or JSON
+ */
+router.post(
+  '/authoring/dry-run',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const input = authoringInputSchema.parse(req.body);
+    const result = await workflowAuthoringService.dryRun({
+      workflow: input.workflow as unknown as WorkflowDefinition | undefined,
+      yaml: input.yaml,
+      context: {
+        ...input.context,
+        permissions: getRequestPermissions(req),
+      },
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * POST /api/workflows/authoring/yaml — Render canonical YAML for a visual definition
+ */
+router.post(
+  '/authoring/yaml',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const input = authoringInputSchema.parse(req.body);
+    if (!input.workflow) {
+      throw new BadRequestError('workflow is required');
+    }
+    res.json({
+      yaml: workflowAuthoringService.toYaml(input.workflow as unknown as WorkflowDefinition),
+    });
+  })
+);
+
+/**
+ * GET /api/workflows/launch-recommendations - Advisory launch recommendations from prior runs
+ */
+router.get(
+  '/launch-recommendations',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const userId = getUserId(req);
+    const query = launchRecommendationsQuerySchema.parse(req.query);
+
+    if (query.workflowId) {
+      await assertWorkflowPermission(query.workflowId, userId, 'view');
+    }
+
+    const result = await sessionTemplateService.getLaunchRecommendations({
+      workflowId: query.workflowId,
+      taskId: query.taskId,
+      project: query.project,
+      taskType: query.taskType,
+      cwd: query.cwd,
+      verificationGates: query.verificationGates
+        ?.split(',')
+        .map((item) => item.trim())
+        .filter(Boolean),
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * GET /api/workflows/:id/access — Resolve workflow-specific actions and provenance
+ */
+router.get(
+  '/:id/access',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const workflowId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+    const workflow = await workflowService.loadWorkflow(workflowId);
+    if (!workflow) {
+      throw new NotFoundError(`Workflow ${workflowId} not found`);
+    }
+
+    await assertWorkflowPermission(workflowId, userId, 'view');
+
+    const acl = await workflowService.loadACL(workflowId);
+    const [aclCanEdit, aclCanExecute] = await Promise.all([
+      checkWorkflowPermission(workflowId, userId, 'edit'),
+      checkWorkflowPermission(workflowId, userId, 'execute'),
+    ]);
+    const canWriteWorkflows = requestHasPermission(req, 'workflow:write');
+    const canExecuteWorkflows = requestHasPermission(req, 'workflow:execute');
+    const canEdit = canWriteWorkflows && aclCanEdit;
+    const canExecute = canExecuteWorkflows && aclCanExecute;
+    const builtIn = !acl || acl.owner === 'system';
+    const owned = acl?.owner === userId;
+    const access: WorkflowAccess = {
+      workflowId,
+      canView: true,
+      canEdit,
+      canExecute,
+      canDuplicate: canWriteWorkflows,
+      readOnlyReason: canEdit
+        ? undefined
+        : !canWriteWorkflows
+          ? 'Workflow write permission is required to edit or duplicate this workflow.'
+          : builtIn
+            ? 'Built-in workflows are read-only. Duplicate this workflow to customize it.'
+            : 'You can view this workflow, but its owner has not granted edit access.',
+      provenance: {
+        kind: builtIn ? 'built-in' : owned ? 'user-owned' : 'shared',
+        owner: acl?.owner ?? 'system',
+        createdBy: workflow.createdBy,
+        updatedBy: workflow.updatedBy,
+        createdAt: workflow.createdAt,
+        updatedAt: workflow.updatedAt,
+      },
+    };
+
+    res.json(access);
+  })
+);
+
+/**
+ * GET /api/workflows/:id — Get a specific workflow
+ */
+router.get(
+  '/:id',
+  asyncHandler(async (req: AuthenticatedRequest, res, next) => {
+    // Skip if this is a /runs/* sub-route (Express matches /:id before /runs/*)
+    if (req.params.id === 'runs') return next();
+
+    const workflowId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+
+    const workflow = await workflowService.loadWorkflow(workflowId);
+    if (!workflow) {
+      throw new NotFoundError(`Workflow ${workflowId} not found`);
+    }
+
+    // Check view permission
+    await assertWorkflowPermission(workflowId, userId, 'view');
+
+    setRevisionHeaders(res, 'workflow', workflow.id, workflow.version);
+    res.json(workflow);
+  })
+);
+
+/**
+ * POST /api/workflows/:id/dry-run — Dry-run a saved workflow definition
+ */
+router.post(
+  '/:id/dry-run',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const workflowId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+    const input = z.object({ context: authoringContextSchema }).parse(req.body);
+
+    await assertWorkflowPermission(workflowId, userId, 'execute');
+    const workflow = await workflowService.loadWorkflow(workflowId);
+    if (!workflow) {
+      throw new NotFoundError(`Workflow ${workflowId} not found`);
+    }
+
+    const result = await workflowAuthoringService.dryRun({
+      workflow,
+      context: {
+        ...input.context,
+        permissions: getRequestPermissions(req),
+      },
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * POST /api/workflows — Create a new workflow
+ */
+router.post(
+  '/',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const userId = getUserId(req);
+    const actor = actorFromRequest(req);
+    const now = new Date().toISOString();
+
+    // Validate input
+    const workflow = workflowCreateSchema.parse(req.body) as WorkflowDefinition;
+    workflow.createdBy = workflow.createdBy ?? actor;
+    workflow.updatedBy = actor;
+    workflow.createdAt = workflow.createdAt ?? now;
+    workflow.updatedAt = now;
+
+    // Save workflow
+    await workflowService.saveWorkflow(workflow);
+
+    // Create ACL entry (owner = current user)
+    const acl: WorkflowACL = {
+      workflowId: workflow.id,
+      owner: userId,
+      editors: [],
+      viewers: [],
+      executors: [],
+      isPublic: false,
+    };
+    await workflowService.saveACL(acl);
+
+    // Audit log
+    await workflowService.auditChange({
+      timestamp: new Date().toISOString(),
+      userId,
+      action: 'create',
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+    });
+
+    setRevisionHeaders(res, 'workflow', workflow.id, workflow.version);
+    res.status(201).json({ success: true, workflowId: workflow.id });
+  })
+);
+
+/**
+ * PUT /api/workflows/:id — Update a workflow
+ */
+router.put(
+  '/:id',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const urlWorkflowId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+    const actor = actorFromRequest(req);
+    const now = new Date().toISOString();
+
+    // Validate input
+    const workflow = workflowCreateSchema.parse(req.body) as WorkflowDefinition;
+
+    // Enforce URL ID takes precedence over body ID
+    if (workflow.id !== urlWorkflowId) {
+      throw new BadRequestError(
+        `Workflow ID mismatch: URL specifies '${urlWorkflowId}' but body contains '${workflow.id}'`
+      );
+    }
+
+    // Check edit permission
+    await assertWorkflowPermission(urlWorkflowId, userId, 'edit');
+
+    // Load previous version for versioning and change tracking
+    const previousVersion = await workflowService.loadWorkflow(workflow.id);
+    if (!previousVersion) {
+      throw new NotFoundError(`Workflow ${workflow.id} not found`);
+    }
+    assertFreshRevision(req, 'workflow', workflow.id, previousVersion, previousVersion);
+
+    workflow.version = (previousVersion?.version || 0) + 1;
+    workflow.createdBy = previousVersion.createdBy;
+    workflow.createdAt = previousVersion.createdAt;
+    workflow.updatedBy = actor;
+    workflow.updatedAt = now;
+
+    // Save workflow
+    await workflowService.saveWorkflow(workflow);
+
+    // Audit log with changes
+    await workflowService.auditChange({
+      timestamp: new Date().toISOString(),
+      userId,
+      action: 'edit',
+      workflowId: workflow.id,
+      workflowVersion: workflow.version,
+      changes: diffWorkflows(previousVersion, workflow),
+    });
+
+    setRevisionHeaders(res, 'workflow', workflow.id, workflow.version);
+    res.json({ success: true, version: workflow.version });
+  })
+);
+
+/**
+ * DELETE /api/workflows/:id — Delete a workflow
+ */
+router.delete(
+  '/:id',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const workflowId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+
+    // Check delete permission (owner only)
+    await assertWorkflowPermission(workflowId, userId, 'delete');
+
+    // Delete workflow
+    await workflowService.deleteWorkflow(workflowId);
+
+    // Audit log
+    await workflowService.auditChange({
+      timestamp: new Date().toISOString(),
+      userId,
+      action: 'delete',
+      workflowId,
+    });
+
+    res.status(204).send();
+  })
+);
+
+// ==================== Workflow Run Routes ====================
+
+/**
+ * POST /api/workflows/:id/runs — Start a workflow run
+ */
+router.post(
+  '/:id/runs',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const workflowId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+
+    // Check execute permission
+    await assertWorkflowPermission(workflowId, userId, 'execute');
+
+    // Validate input
+    const { taskId, context, budget } = startRunSchema.parse(req.body);
+    const workflow = await workflowService.loadWorkflow(workflowId);
+    if (!workflow) {
+      throw new NotFoundError(`Workflow ${workflowId} not found`);
+    }
+
+    const dryRun = await workflowAuthoringService.dryRun({
+      workflow,
+      context: {
+        taskId,
+        clientMode:
+          context?.clientMode === 'remote' || context?.clientMode === 'cloud'
+            ? context.clientMode
+            : 'local',
+        permissions: getRequestPermissions(req),
+      },
+    });
+    const skillBlocker = dryRun.messages.find(
+      (item) => item.category === 'skill' && item.severity === 'error'
+    );
+    if (skillBlocker) {
+      throw new ValidationError(skillBlocker.message, [
+        {
+          code: 'WORKFLOW_SKILL_AUDIT_BLOCKED',
+          message: skillBlocker.remediation,
+          path: [skillBlocker.path],
+        },
+      ]);
+    }
+
+    // Start run
+    const run = await workflowRunService.startRun(
+      workflowId,
+      taskId,
+      {
+        ...context,
+        skillAudit: dryRun.skillAudit,
+      },
+      budget
+    );
+
+    // Audit log
+    await workflowService.auditChange({
+      timestamp: new Date().toISOString(),
+      userId,
+      action: 'run',
+      workflowId,
+      workflowVersion: run.workflowVersion,
+      runId: run.id,
+    });
+
+    res.status(201).json(run);
+  })
+);
+
+/**
+ * GET /api/workflow-runs/active — Get currently running workflow runs
+ * IMPORTANT: This route MUST come before /runs/:id to avoid path conflicts
+ */
+router.get(
+  '/runs/active',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const userId = getUserId(req);
+
+    const runs = await workflowRunService.listRunsMetadata({
+      status: 'running',
+    });
+
+    // Filter by workflow view permissions
+    const visibleRuns = [];
+    for (const run of runs) {
+      const hasPermission = await checkWorkflowPermission(run.workflowId, userId, 'view');
+      if (hasPermission) {
+        visibleRuns.push(run);
+      }
+    }
+
+    res.json(visibleRuns);
+  })
+);
+
+/**
+ * GET /api/workflow-runs/stats — Get aggregated workflow run statistics
+ * IMPORTANT: This route MUST come before /runs/:id to avoid path conflicts
+ */
+router.get(
+  '/runs/stats',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const userId = getUserId(req);
+    const periodParam = typeof req.query.period === 'string' ? req.query.period : '7d';
+
+    // Validate period
+    if (!['24h', '7d', '30d'].includes(periodParam)) {
+      throw new ValidationError(`Invalid period: ${periodParam}. Allowed values: 24h, 7d, 30d`);
+    }
+
+    const period = periodParam as '24h' | '7d' | '30d';
+
+    // Get stats from service layer (handles permission filtering internally)
+    const stats = await workflowRunService.getStats(period, userId);
+
+    res.json(stats);
+  })
+);
+
+/**
+ * GET /api/workflow-runs — List workflow runs (filtered by permissions)
+ * Returns metadata only for efficiency
+ */
+router.get(
+  '/runs',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const userId = getUserId(req);
+
+    const filters = {
+      taskId: typeof req.query.taskId === 'string' ? req.query.taskId : undefined,
+      workflowId: typeof req.query.workflowId === 'string' ? req.query.workflowId : undefined,
+      status: typeof req.query.status === 'string' ? req.query.status : undefined,
+    };
+
+    const runs = await workflowRunService.listRunsMetadata(filters);
+
+    // Filter by workflow view permissions
+    const visibleRuns = [];
+    for (const run of runs) {
+      const hasPermission = await checkWorkflowPermission(run.workflowId, userId, 'view');
+      if (hasPermission) {
+        visibleRuns.push(run);
+      }
+    }
+
+    res.json(visibleRuns);
+  })
+);
+
+/**
+ * GET /api/workflow-runs/:id — Get a specific workflow run
+ */
+router.get(
+  '/runs/:id',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const runId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+
+    const run = await workflowRunService.getRun(runId);
+    if (!run) {
+      throw new NotFoundError(`Workflow run ${runId} not found`);
+    }
+
+    // Check view permission on the workflow
+    await assertWorkflowPermission(run.workflowId, userId, 'view');
+
+    res.json(run);
+  })
+);
+
+/**
+ * POST /api/workflow-runs/:id/resume — Resume a blocked workflow run
+ */
+router.post(
+  '/runs/:id/resume',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const runId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+
+    const run = await workflowRunService.getRun(runId);
+    if (!run) {
+      throw new NotFoundError(`Workflow run ${runId} not found`);
+    }
+
+    // Check execute permission on the workflow
+    await assertWorkflowPermission(run.workflowId, userId, 'execute');
+
+    if (run.status !== 'blocked') {
+      throw new ValidationError(`Run ${runId} is not blocked (current status: ${run.status})`);
+    }
+
+    // Validate input
+    const { context } = resumeRunSchema.parse(req.body || {});
+
+    // Resume run
+    const resumed = await workflowRunService.resumeRun(runId, context);
+
+    res.json(resumed);
+  })
+);
+
+/**
+ * POST /api/workflows/runs/:id/recovery/cancel — Cancel an exact pending step recovery.
+ */
+router.post(
+  '/runs/:id/recovery/cancel',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const runId = getStringParam(req.params.id);
+    const userId = getUserId(req);
+    const run = await workflowRunService.getRun(runId);
+    if (!run) {
+      throw new NotFoundError(`Workflow run ${runId} not found`);
+    }
+    await assertWorkflowPermission(run.workflowId, userId, 'execute');
+    const { stepId, parentRunId } = cancelRecoverySchema.parse(req.body || {});
+    const cancelled = await workflowRunService.cancelPendingRecovery(
+      runId,
+      stepId,
+      parentRunId,
+      userId
+    );
+    res.json(cancelled);
+  })
+);
+
+/**
+ * POST /api/workflow-runs/:runId/steps/:stepId/approve — Approve a gate step
+ * Phase 4: Gate approval endpoint — fixed for human-gate blocking (#778)
+ */
+router.post(
+  '/runs/:runId/steps/:stepId/approve',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const runId = getStringParam(req.params.runId);
+    const stepId = getStringParam(req.params.stepId);
+    const userId = getUserId(req);
+
+    const run = await workflowRunService.getRun(runId);
+    if (!run) {
+      throw new NotFoundError(`Workflow run ${runId} not found`);
+    }
+
+    // Check execute permission on the workflow
+    await assertWorkflowPermission(run.workflowId, userId, 'execute');
+
+    if (run.status !== 'blocked') {
+      throw new ValidationError(
+        `Run ${runId} is not blocked (current status: ${run.status}). Only blocked runs can be approved.`
+      );
+    }
+
+    // Security: Verify this is actually a gate step with human escalation
+    const workflow = await workflowService.loadWorkflow(run.workflowId);
+    if (!workflow) {
+      throw new NotFoundError(`Workflow ${run.workflowId} not found`);
+    }
+
+    const stepDef = workflow.steps.find((s) => s.id === stepId);
+    if (!stepDef || stepDef.type !== 'gate') {
+      throw new ValidationError(
+        `Step ${stepId} is not a gate step (type: ${stepDef?.type || 'unknown'})`
+      );
+    }
+
+    if (stepDef.on_false?.escalate_to !== 'human') {
+      throw new ValidationError(`Gate step ${stepId} does not have a human escalation policy`);
+    }
+
+    // Validate optional resume context
+    const { context } = resumeRunSchema.parse(req.body || {});
+
+    const resumed = await workflowRunService.approveGateStep(runId, stepId, userId, context);
+
+    res.json(resumed);
+  })
+);
+
+/**
+ * POST /api/workflow-runs/:runId/steps/:stepId/reject — Reject a gate step
+ * Phase 4: Gate rejection endpoint — fixed to persist state (#778)
+ */
+router.post(
+  '/runs/:runId/steps/:stepId/reject',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const runId = getStringParam(req.params.runId);
+    const stepId = getStringParam(req.params.stepId);
+    const userId = getUserId(req);
+
+    const run = await workflowRunService.getRun(runId);
+    if (!run) {
+      throw new NotFoundError(`Workflow run ${runId} not found`);
+    }
+
+    // Check execute permission on the workflow
+    await assertWorkflowPermission(run.workflowId, userId, 'execute');
+
+    if (run.status !== 'blocked') {
+      throw new ValidationError(
+        `Run ${runId} is not blocked (current status: ${run.status}). Only blocked runs can be rejected.`
+      );
+    }
+
+    // Security: Verify this is actually a gate step with human escalation
+    const workflow = await workflowService.loadWorkflow(run.workflowId);
+    if (!workflow) {
+      throw new NotFoundError(`Workflow ${run.workflowId} not found`);
+    }
+
+    const stepDef = workflow.steps.find((s) => s.id === stepId);
+    if (!stepDef || stepDef.type !== 'gate') {
+      throw new ValidationError(
+        `Step ${stepId} is not a gate step (type: ${stepDef?.type || 'unknown'})`
+      );
+    }
+
+    if (stepDef.on_false?.escalate_to !== 'human') {
+      throw new ValidationError(`Gate step ${stepId} does not have a human escalation policy`);
+    }
+
+    const rejected = await workflowRunService.rejectGateStep(runId, stepId, userId);
+
+    res.json(rejected);
+  })
+);
+
+/**
+ * GET /api/workflow-runs/:runId/steps/:stepId/status — Get detailed step status
+ * Phase 4: Step status endpoint (useful for parallel sub-steps)
+ */
+router.get(
+  '/runs/:runId/steps/:stepId/status',
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const runId = getStringParam(req.params.runId);
+    const stepId = getStringParam(req.params.stepId);
+    const userId = getUserId(req);
+
+    const run = await workflowRunService.getRun(runId);
+    if (!run) {
+      throw new NotFoundError(`Workflow run ${runId} not found`);
+    }
+
+    // Check view permission on the workflow
+    await assertWorkflowPermission(run.workflowId, userId, 'view');
+
+    // Find the step
+    const stepRun = run.steps.find((s) => s.stepId === stepId);
+    if (!stepRun) {
+      throw new NotFoundError(`Step ${stepId} not found in run ${runId}`);
+    }
+
+    res.json(stepRun);
+  })
+);
+
+export { router as workflowRoutes };

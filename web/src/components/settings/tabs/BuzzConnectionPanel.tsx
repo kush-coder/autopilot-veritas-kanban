@@ -1,0 +1,513 @@
+import { UiPill, semanticToneForLegacyColor, UiAction } from '@/components/ui/UiVocabulary';
+import { SettingsGroup } from '@/components/settings/shared/SettingsLayout';
+import { Code, Group, SimpleGrid, Stack, Text, TextInput } from '@mantine/core';
+import { useEffect, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  api,
+  type BuzzChannelMapping,
+  type CommunicationAdapterInput,
+  type CommunicationAdapterRecord,
+} from '@/lib/api';
+import { SectionHeader, ToggleRow } from '../shared';
+
+const BUZZ_ADAPTER_ID = 'buzz-default';
+
+interface BuzzFormState {
+  enabled: boolean;
+  relayHttpUrl: string;
+  relayWebSocketUrl: string;
+  expectedCommunity: string;
+  publicKey: string;
+  credentialRef: string;
+  authTagRef: string;
+  commandExecutable: string;
+  commandArgs: string[];
+  allowLocalhost: boolean;
+  allowPrivateNetwork: boolean;
+  channelId: string;
+}
+
+function adapterToForm(
+  adapter?: CommunicationAdapterRecord,
+  mapping?: BuzzChannelMapping
+): BuzzFormState {
+  return {
+    enabled: adapter?.enabled ?? false,
+    relayHttpUrl: adapter?.relayHttpUrl ?? '',
+    relayWebSocketUrl: adapter?.relayWebSocketUrl ?? '',
+    expectedCommunity: adapter?.expectedCommunity ?? '',
+    publicKey: adapter?.publicKey ?? '',
+    credentialRef: adapter?.credentialRef ?? 'env:BUZZ_PRIVATE_KEY',
+    authTagRef: adapter?.authTagRef ?? '',
+    commandExecutable: adapter?.command?.executable ?? '',
+    commandArgs: adapter?.command?.args ?? [],
+    allowLocalhost: adapter?.allowLocalhost ?? false,
+    allowPrivateNetwork: adapter?.allowPrivateNetwork ?? false,
+    channelId: mapping?.channelId ?? '',
+  };
+}
+
+function formToInput(form: BuzzFormState): CommunicationAdapterInput {
+  return {
+    kind: 'buzz',
+    enabled: form.enabled,
+    displayName: 'Buzz',
+    relayHttpUrl: form.relayHttpUrl,
+    relayWebSocketUrl: form.relayWebSocketUrl || null,
+    expectedCommunity: form.expectedCommunity || null,
+    publicKey: form.publicKey,
+    credentialRef: form.credentialRef,
+    authTagRef: form.authTagRef || null,
+    command: form.commandExecutable
+      ? {
+          executable: form.commandExecutable,
+          args: form.commandArgs.length ? form.commandArgs : undefined,
+        }
+      : null,
+    allowLocalhost: form.allowLocalhost,
+    allowPrivateNetwork: form.allowPrivateNetwork,
+  };
+}
+
+function healthColor(status?: string): string {
+  if (status === 'healthy') return 'green';
+  if (status === 'degraded' || status === 'warning') return 'yellow';
+  if (!status || status === 'disabled') return 'gray';
+  return 'red';
+}
+
+function verificationColor(state?: string): string {
+  if (state === 'verified') return 'green';
+  if (state === 'not_enforced') return 'blue';
+  if (state === 'failed') return 'red';
+  return 'gray';
+}
+
+export function BuzzConnectionPanel() {
+  const queryClient = useQueryClient();
+  const { data: adapters = [] } = useQuery({
+    queryKey: ['integrations', 'communication', 'adapters'],
+    queryFn: api.integrations.communicationAdapters,
+    staleTime: 30_000,
+    retry: false,
+  });
+  const adapter = adapters.find((candidate) => candidate.id === BUZZ_ADAPTER_ID);
+  const { data: mappings = [] } = useQuery({
+    queryKey: ['integrations', 'communication', 'buzz-mappings', BUZZ_ADAPTER_ID],
+    queryFn: () => api.integrations.buzzChannelMappings(BUZZ_ADAPTER_ID),
+    enabled: Boolean(adapter),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const activeMapping = mappings.find((mapping) => mapping.enabled) ?? mappings[0];
+  const { data: deliveries = [] } = useQuery({
+    queryKey: ['integrations', 'communication', 'deliveries', BUZZ_ADAPTER_ID, 8],
+    queryFn: () => api.integrations.communicationDeliveries(8, BUZZ_ADAPTER_ID),
+    enabled: Boolean(adapter),
+    staleTime: 10_000,
+    retry: false,
+  });
+  const { data: health } = useQuery({
+    queryKey: ['integrations', 'communication', 'health', BUZZ_ADAPTER_ID],
+    queryFn: () => api.integrations.communicationHealth(BUZZ_ADAPTER_ID),
+    enabled: Boolean(adapter),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const effectiveHealth = health ?? adapter?.lastHealth;
+  const compatibility = effectiveHealth?.buzz ?? adapter?.compatibility;
+  const [form, setForm] = useState<BuzzFormState>(() => adapterToForm(adapter, activeMapping));
+  const [dirty, setDirty] = useState(false);
+
+  useEffect(() => {
+    if (!dirty) setForm(adapterToForm(adapter, activeMapping));
+  }, [activeMapping, adapter, dirty]);
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ['integrations', 'communication'] });
+  };
+  const save = useMutation({
+    mutationFn: async () => {
+      const configured = await api.integrations.configureCommunicationAdapter(
+        BUZZ_ADAPTER_ID,
+        formToInput(form)
+      );
+      const channelId = form.channelId.trim();
+      let disabledPrevious = false;
+      if (
+        activeMapping?.enabled &&
+        activeMapping.channelId.toLowerCase() !== channelId.toLowerCase()
+      ) {
+        await api.integrations.disableBuzzChannelMapping(BUZZ_ADAPTER_ID, activeMapping.channelId);
+        disabledPrevious = true;
+      }
+      try {
+        if (channelId) {
+          await api.integrations.configureBuzzChannelMapping(
+            BUZZ_ADAPTER_ID,
+            channelId,
+            { kind: 'squad' },
+            form.enabled
+          );
+        }
+      } catch (error) {
+        if (disabledPrevious && activeMapping) {
+          await api.integrations
+            .configureBuzzChannelMapping(
+              BUZZ_ADAPTER_ID,
+              activeMapping.channelId,
+              activeMapping.target,
+              true
+            )
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+      return configured;
+    },
+    onSuccess: () => {
+      setDirty(false);
+      invalidate();
+    },
+  });
+  const test = useMutation({
+    mutationFn: () => api.integrations.testCommunicationAdapter(BUZZ_ADAPTER_ID),
+    onSuccess: invalidate,
+  });
+  const disconnect = useMutation({
+    mutationFn: () => api.integrations.disconnectCommunicationAdapter(BUZZ_ADAPTER_ID),
+    onSuccess: () => {
+      setDirty(false);
+      invalidate();
+    },
+  });
+
+  const update = <K extends keyof BuzzFormState>(key: K, value: BuzzFormState[K]) => {
+    setDirty(true);
+    setForm((current) => ({ ...current, [key]: value }));
+  };
+  const error = save.error || test.error || disconnect.error;
+  const verificationSteps = [
+    ['Relay', compatibility?.checks.relayIdentity],
+    ['Community binding', compatibility?.checks.communityBinding],
+    ['Configured identity', compatibility?.checks.configuredIdentity],
+    ['Authentication', compatibility?.checks.authentication],
+    ['Membership', compatibility?.checks.membership],
+    [
+      'Read paths',
+      compatibility?.checks.channelRead === 'verified' &&
+      compatibility?.checks.messageRead === 'verified'
+        ? 'verified'
+        : compatibility?.checks.channelRead === 'failed' ||
+            compatibility?.checks.messageRead === 'failed'
+          ? 'failed'
+          : 'unverified',
+    ],
+  ] as const;
+
+  return (
+    <div className="space-y-4">
+      <SectionHeader title="Buzz Connection" />
+      <p className="text-sm text-muted-foreground -mt-2">
+        Verify Buzz relay identity, NIP-98 authentication, membership, and read capability without
+        sending a message
+      </p>
+      <SettingsGroup>
+        <Stack gap="sm">
+          <Group justify="space-between" gap="sm" align="flex-start">
+            <div>
+              <Text size="sm" fw={600}>
+                Read-only compatibility
+              </Text>
+              <Text size="xs" c="dimmed">
+                {effectiveHealth?.detail ??
+                  'Save a reference-only connection to enable compatibility diagnostics.'}
+              </Text>
+            </div>
+            <UiPill
+              kind="status"
+              tone={semanticToneForLegacyColor(healthColor(effectiveHealth?.status))}
+            >
+              {effectiveHealth?.status ?? (adapter ? 'not checked' : 'not configured')}
+            </UiPill>
+          </Group>
+
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="xs">
+            <TextInput
+              label="Relay HTTP URL"
+              value={form.relayHttpUrl}
+              onChange={(event) => update('relayHttpUrl', event.target.value)}
+              placeholder="https://community.example.com"
+              type="url"
+              required
+              size="xs"
+            />
+            <TextInput
+              label="Relay WebSocket URL"
+              value={form.relayWebSocketUrl}
+              onChange={(event) => update('relayWebSocketUrl', event.target.value)}
+              placeholder="Derived from the HTTP URL when omitted"
+              type="url"
+              size="xs"
+            />
+            <TextInput
+              label="Expected community"
+              value={form.expectedCommunity}
+              onChange={(event) => update('expectedCommunity', event.target.value)}
+              placeholder="community.example.com"
+              size="xs"
+            />
+            <TextInput
+              label="Squad Chat channel mapping"
+              value={form.channelId}
+              onChange={(event) => update('channelId', event.target.value)}
+              placeholder="Buzz channel UUID"
+              description="Maps this Buzz channel to the local Squad Chat surface."
+              required={form.enabled}
+              size="xs"
+            />
+            <TextInput
+              label="Public key"
+              value={form.publicKey}
+              onChange={(event) => update('publicKey', event.target.value)}
+              placeholder="64-character Nostr public key hex"
+              required
+              size="xs"
+            />
+            <TextInput
+              label="Signing key reference"
+              value={form.credentialRef}
+              onChange={(event) => update('credentialRef', event.target.value)}
+              placeholder="env:BUZZ_PRIVATE_KEY"
+              description="Environment reference only. The private key is never stored here."
+              required
+              size="xs"
+            />
+            <TextInput
+              label="NIP-OA auth tag reference"
+              value={form.authTagRef}
+              onChange={(event) => update('authTagRef', event.target.value)}
+              placeholder="env:BUZZ_AUTH_TAG"
+              description="Optional environment reference for delegated agent membership."
+              size="xs"
+            />
+            <TextInput
+              label="Buzz command"
+              value={form.commandExecutable}
+              onChange={(event) => update('commandExecutable', event.target.value)}
+              placeholder="Optional executable path"
+              description="Optional version diagnostic. Veritas never invokes a shell."
+              size="xs"
+            />
+          </SimpleGrid>
+
+          <ToggleRow
+            label="Enable Buzz adapter"
+            description="Enable compatibility checks, signed outbound delivery, and the supervised inbound subscription."
+            checked={form.enabled}
+            onCheckedChange={(value) => update('enabled', value)}
+          />
+          <ToggleRow
+            label="Allow localhost relay"
+            description="Explicitly permit loopback endpoints for local Buzz development."
+            checked={form.allowLocalhost}
+            onCheckedChange={(value) => update('allowLocalhost', value)}
+          />
+          <ToggleRow
+            label="Allow private-network relay"
+            description="Explicitly permit RFC1918 or IPv6 ULA destinations. Link-local and metadata ranges remain blocked."
+            checked={form.allowPrivateNetwork}
+            onCheckedChange={(value) => update('allowPrivateNetwork', value)}
+          />
+
+          <SettingsGroup>
+            <Text size="xs" fw={600} mb={6}>
+              Compatibility chain
+            </Text>
+            <SimpleGrid
+              cols={{ base: 2, sm: 6 }}
+              spacing={4}
+              aria-label="Buzz compatibility verification chain"
+            >
+              {verificationSteps.map(([label, state]) => (
+                <SettingsGroup key={label}>
+                  <Text size="xs" fw={600}>
+                    {label}
+                  </Text>
+                  <UiPill
+                    kind="status"
+                    tone={semanticToneForLegacyColor(verificationColor(state))}
+                    mt={3}
+                  >
+                    {state ?? 'unverified'}
+                  </UiPill>
+                </SettingsGroup>
+              ))}
+            </SimpleGrid>
+          </SettingsGroup>
+
+          <SettingsGroup>
+            <Text size="xs" fw={600} mb={6}>
+              Runtime and delivery
+            </Text>
+            <SimpleGrid cols={{ base: 1, sm: 2 }} spacing={4}>
+              <Text size="xs">
+                Relay:{' '}
+                <Code>
+                  {effectiveHealth?.buzzRuntime?.relayConnected ? 'connected' : 'disconnected'}
+                </Code>
+              </Text>
+              <Text size="xs">
+                Subscription:{' '}
+                <Code>
+                  {effectiveHealth?.buzzRuntime?.subscriptionActive ? 'active' : 'inactive'}
+                </Code>
+              </Text>
+              <Text size="xs">
+                Mapped channels:{' '}
+                <Code>{effectiveHealth?.buzzRuntime?.mappedChannels ?? mappings.length}</Code>
+              </Text>
+              <Text size="xs">
+                Cursor lag:{' '}
+                <Code>
+                  {effectiveHealth?.buzzRuntime?.cursorLagSeconds === undefined
+                    ? 'not established'
+                    : `${effectiveHealth.buzzRuntime.cursorLagSeconds}s`}
+                </Code>
+              </Text>
+              <Text size="xs">
+                Last event:{' '}
+                <Code>
+                  {effectiveHealth?.buzzRuntime?.lastEventAt
+                    ? new Date(effectiveHealth.buzzRuntime.lastEventAt).toLocaleString()
+                    : 'not recorded'}
+                </Code>
+              </Text>
+              <Text size="xs">
+                Last send:{' '}
+                <Code>{effectiveHealth?.buzzRuntime?.lastSendStatus ?? 'not recorded'}</Code>
+              </Text>
+            </SimpleGrid>
+            {deliveries.length > 0 && (
+              <Stack gap={3} mt="xs" aria-label="Recent Buzz deliveries">
+                {deliveries.slice(0, 5).map((delivery) => (
+                  <Group key={delivery.id} justify="space-between" gap="xs" wrap="nowrap">
+                    <Text size="xs" truncate>
+                      {delivery.operation}: {delivery.detail ?? delivery.error ?? 'recorded'}
+                    </Text>
+                    <UiPill
+                      kind="status"
+                      tone={semanticToneForLegacyColor(
+                        delivery.status === 'success'
+                          ? 'green'
+                          : delivery.status === 'delivery_unknown'
+                            ? 'yellow'
+                            : delivery.status === 'failed' || delivery.status === 'blocked'
+                              ? 'red'
+                              : 'gray'
+                      )}
+                    >
+                      {delivery.status}
+                    </UiPill>
+                  </Group>
+                ))}
+              </Stack>
+            )}
+          </SettingsGroup>
+
+          <SettingsGroup>
+            <SimpleGrid cols={{ base: 1, sm: 2 }} spacing={4}>
+              <Text size="xs">
+                Signing reference:{' '}
+                <Code>{adapter?.credentialRef ? 'configured' : 'not configured'}</Code>
+              </Text>
+              <Text size="xs">
+                Auth-tag reference:{' '}
+                <Code>{adapter?.authTagConfigured ? 'configured' : 'not configured'}</Code>
+              </Text>
+              <Text size="xs">
+                Community:{' '}
+                <Code>
+                  {compatibility?.expectedCommunity ?? adapter?.expectedCommunity ?? 'not set'} →{' '}
+                  {compatibility?.observedCommunity ?? 'not observed'}
+                </Code>
+              </Text>
+              <Text size="xs">
+                Public-key fingerprint:{' '}
+                <Code>
+                  {compatibility?.publicKeyFingerprint ?? adapter?.publicKeyFingerprint ?? 'n/a'}
+                </Code>
+              </Text>
+              <Text size="xs">
+                Tested contract:{' '}
+                <Code>
+                  {compatibility
+                    ? `Buzz ${compatibility.testedRelease}, probe ${compatibility.probeRevision}`
+                    : 'not checked'}
+                </Code>
+              </Text>
+              <Text size="xs">
+                Last check:{' '}
+                <Code>
+                  {effectiveHealth?.checkedAt
+                    ? new Date(effectiveHealth.checkedAt).toLocaleString()
+                    : 'not checked'}
+                </Code>
+              </Text>
+            </SimpleGrid>
+            {effectiveHealth?.reasonCode && effectiveHealth.reasonCode !== 'ok' && (
+              <Text size="xs" c="red" mt="xs">
+                {effectiveHealth.reasonCode}:{' '}
+                {effectiveHealth.remediation ?? effectiveHealth.detail}
+              </Text>
+            )}
+            {compatibility?.commands.length ? (
+              <Text size="xs" c="dimmed" mt="xs">
+                Commands:{' '}
+                {compatibility.commands
+                  .map(
+                    (command) =>
+                      `${command.command}=${command.available ? command.version : 'not found'}`
+                  )
+                  .join(', ')}
+              </Text>
+            ) : null}
+          </SettingsGroup>
+
+          <Group justify="flex-end" gap="xs">
+            <UiAction
+              variant="secondary"
+              type="button"
+              onClick={() => test.mutate()}
+              disabled={!adapter || test.isPending || save.isPending}
+            >
+              Test Connection
+            </UiAction>
+            <UiAction
+              variant="destructive"
+              type="button"
+              onClick={() => disconnect.mutate()}
+              disabled={!adapter || disconnect.isPending}
+            >
+              Disable
+            </UiAction>
+            <UiAction
+              variant="primary"
+              type="button"
+              onClick={() => save.mutate()}
+              disabled={save.isPending}
+            >
+              Save Buzz
+            </UiAction>
+          </Group>
+          {error && (
+            <Text size="xs" c="red">
+              {error.message}
+            </Text>
+          )}
+        </Stack>
+      </SettingsGroup>
+    </div>
+  );
+}

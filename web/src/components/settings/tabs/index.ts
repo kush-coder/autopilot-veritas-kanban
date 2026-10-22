@@ -1,0 +1,13 @@
+export { GeneralTab } from './GeneralTab';
+export { BoardTab } from './BoardTab';
+export { TasksTab } from './TasksTab';
+export { AgentsTab } from './AgentsTab';
+export { DataTab } from './DataTab';
+export { NotificationsTab } from './NotificationsTab';
+export { MultiUserTab } from './MultiUserTab';
+export { ManageTab } from './ManageTab';
+export { MaintenanceTab } from './MaintenanceTab';
+export { EnforcementTab } from './EnforcementTab';
+export { ReflectionTab } from './ReflectionTab';
+export { SharedResourcesTab } from './SharedResourcesTab';
+export { DocFreshnessTab } from './DocFreshnessTab';

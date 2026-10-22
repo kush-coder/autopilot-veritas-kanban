@@ -1,0 +1,52 @@
+# CLI snapshot uses an intentionally synthetic API key in serialized output.
+cli/src/__tests__/snapshot.test.ts:generic-api-key:220
+
+# API documentation contains non-functional response examples.
+docs/API-WORKFLOWS.md:generic-api-key:1460
+
+# Operator documentation uses placeholders in curl authentication examples.
+docs/DEPLOYMENT.md:curl-auth-header:926
+docs/TROUBLESHOOTING.md:curl-auth-header:230
+docs/TROUBLESHOOTING.md:curl-auth-header:258
+docs/TROUBLESHOOTING.md:curl-auth-header:261
+docs/features/prd-driven-development.md:curl-auth-header:95
+docs/features/prd-driven-development.md:curl-auth-header:775
+docs/guides/SELF_HOST.md:curl-auth-header:742
+docs/security.md:curl-auth-header:51
+docs/security.md:curl-auth-header:58
+
+# Demo seeding passes the operator-provided key variable to curl.
+seed-demo-data.sh:curl-auth-header:45
+
+# Environment template documents shell-variable authentication examples.
+server/.env.example:curl-auth-header:127
+server/.env.example:curl-auth-header:130
+
+# Compatibility test verifies redaction of a deliberately synthetic value.
+server/src/__tests__/buzz-compatibility-service.test.ts:generic-api-key:477
+
+# Governance trace test verifies Stripe-shaped token redaction.
+server/src/__tests__/governance-trace-service.test.ts:stripe-access-token:22
+
+# Log redaction tests require JWT- and Stripe-shaped synthetic fixtures.
+server/src/__tests__/log-redaction.test.ts:jwt:17
+server/src/__tests__/log-redaction.test.ts:stripe-access-token:30
+server/src/__tests__/log-redaction.test.ts:stripe-access-token:31
+
+# Completion service test verifies JWT-shaped output redaction.
+server/src/__tests__/provider-completion-service.test.ts:jwt:314
+
+# Local admission tests use synthetic idempotency keys, not credentials.
+server/src/__tests__/routes/agents-local-capability.test.ts:generic-api-key:606
+server/src/__tests__/routes/agents-local-capability.test.ts:generic-api-key:619
+
+# Authentication route tests require a synthetic JWT signing value.
+server/src/__tests__/routes/auth.test.ts:generic-api-key:29
+server/src/__tests__/routes/auth.test.ts:generic-api-key:31
+server/src/__tests__/routes/auth.test.ts:generic-api-key:80
+
+# Skill capability test verifies Stripe-shaped token redaction.
+server/src/__tests__/skill-capability-service.test.ts:stripe-access-token:63
+
+# Multi-user UI test renders a non-secret token prefix fixture.
+web/src/__tests__/multi-user-tab.test.tsx:generic-api-key:123

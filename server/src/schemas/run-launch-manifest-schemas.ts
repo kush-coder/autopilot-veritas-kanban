@@ -1,0 +1,618 @@
+import { z } from 'zod';
+import {
+  HARNESS_SUPPORT_TIERS,
+  PHASE_AUTHORITY_SOURCE_KINDS,
+  RUN_LAUNCH_CREDENTIAL_PLAN_SCHEMA_VERSION,
+  RUN_LAUNCH_MANIFEST_SCHEMA_VERSION,
+  type RunLaunchManifest,
+} from '@veritas-kanban/shared';
+import { AgentBudgetPolicySchema } from './agent-budget-schemas.js';
+import { phaseCapabilityEvidenceSchema } from './phase-capability-schemas.js';
+import { calculateRunLaunchManifestDigest } from '../utils/run-launch-manifest-digest.js';
+import { digestRunLaunchValue } from '../utils/run-launch-manifest-digest.js';
+import { containsUnredactedProviderRuntimeSecret } from '../utils/provider-runtime-manifest-sanitize.js';
+
+const digestSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+const identifierSchema = z.string().trim().min(1).max(160);
+const safeTextSchema = z.string().trim().min(1).max(1000);
+const stringListSchema = z.array(identifierSchema).max(128);
+const resourceReferenceListSchema = z.array(z.string().trim().min(1).max(600)).max(128);
+const environmentKeySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(120)
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*$/);
+const enforcementSchema = z.enum(['enforced', 'not-required', 'unavailable']);
+
+const manifestReferenceSchema = z
+  .object({
+    schemaVersion: identifierSchema,
+    digest: digestSchema,
+  })
+  .strict();
+
+export const RunLaunchManifestSchema = z
+  .object({
+    schemaVersion: z.literal(RUN_LAUNCH_MANIFEST_SCHEMA_VERSION),
+    digest: digestSchema,
+    createdAt: z.iso.datetime(),
+    taskId: identifierSchema,
+    attemptId: identifierSchema,
+    taskEnvelope: manifestReferenceSchema.extend({ materialDigest: digestSchema }).strict(),
+    providerRuntime: manifestReferenceSchema
+      .extend({
+        materialDigest: digestSchema,
+        probeRevision: z.number().int().positive(),
+        provider: identifierSchema,
+        adapter: identifierSchema,
+        protocolVersion: identifierSchema,
+        providerVersion: z.string().trim().min(1).max(200),
+        providerBuild: z.string().trim().min(1).max(300).optional(),
+      })
+      .strict(),
+    providerRequirements: z
+      .object({
+        required: stringListSchema,
+        capabilities: z
+          .array(
+            z
+              .object({
+                id: identifierSchema,
+                state: z.enum(['supported', 'advisory', 'unsupported', 'unknown']),
+                satisfied: z.boolean(),
+                advisory: z.boolean(),
+                reason: safeTextSchema,
+              })
+              .strict()
+          )
+          .max(128),
+      })
+      .strict(),
+    harnessSupport: z
+      .object({
+        profileId: identifierSchema,
+        adapterId: identifierSchema.optional(),
+        transport: z.enum([
+          'process-jsonl',
+          'process-text',
+          'sdk',
+          'http-tools',
+          'acp',
+          'app-server',
+          'unsupported',
+        ]),
+        supportTier: z.enum(HARNESS_SUPPORT_TIERS),
+      })
+      .strict(),
+    routing: z
+      .object({
+        requestedAgent: identifierSchema,
+        selectedAgent: identifierSchema,
+        selectedHost: identifierSchema,
+        reason: safeTextSchema,
+        fallbackAgent: identifierSchema.nullable(),
+        fallbackAllowed: z.boolean(),
+        fallbackOnFailure: z.boolean().optional(),
+        maxRetries: z.number().int().min(0).max(3).optional(),
+      })
+      .strict(),
+    profile: z
+      .object({
+        id: identifierSchema,
+        version: identifierSchema,
+        role: identifierSchema,
+      })
+      .strict()
+      .optional(),
+    phase: z
+      .object({
+        evidence: phaseCapabilityEvidenceSchema,
+        sourceReferences: z
+          .array(
+            z
+              .object({
+                sourceId: identifierSchema,
+                kind: z.enum(PHASE_AUTHORITY_SOURCE_KINDS),
+                originScope: z.enum([
+                  'run',
+                  'parent',
+                  'task-envelope',
+                  'agent-profile',
+                  'workflow',
+                  'template',
+                  'provider',
+                  'workspace',
+                  'system-default',
+                ]),
+                sourceDigest: digestSchema,
+                parentAttemptId: identifierSchema.optional(),
+                parentManifestDigest: digestSchema.optional(),
+                parentEvidenceDigest: digestSchema.optional(),
+              })
+              .strict()
+          )
+          .length(PHASE_AUTHORITY_SOURCE_KINDS.length),
+      })
+      .strict()
+      .optional(),
+    readiness: z
+      .object({
+        ready: z.boolean(),
+        overridden: z.boolean(),
+        passed: z.number().int().nonnegative(),
+        total: z.number().int().nonnegative(),
+        missingRequired: stringListSchema,
+        warnings: stringListSchema,
+        overrideReasonDigest: digestSchema.optional(),
+      })
+      .strict(),
+    instructions: z
+      .array(
+        z
+          .object({
+            id: identifierSchema,
+            kind: z.enum(['task', 'profile', 'template', 'repository', 'system', 'other']),
+            digest: digestSchema,
+            materialDigest: digestSchema,
+            byteLength: z.number().int().min(0).max(5_000_000),
+            origin: identifierSchema,
+            precedence: z.number().int().min(0).max(10_000),
+          })
+          .strict()
+      )
+      .max(128),
+    workspace: z
+      .object({
+        worktreeId: identifierSchema,
+        worktreeManifestId: identifierSchema.optional(),
+        ownershipLeaseId: identifierSchema.optional(),
+        ownershipAttemptId: identifierSchema.optional(),
+        repo: identifierSchema,
+        branch: identifierSchema,
+        baseBranch: identifierSchema,
+        resolvedBaseCommit: z.string().regex(/^[a-f0-9]{40,64}$/),
+        baseResolutionSource: z.enum([
+          'remote',
+          'local-stale',
+          'legacy-adopted',
+          'legacy-launch-head',
+        ]),
+      })
+      .strict()
+      .optional(),
+    runtime: z
+      .object({
+        model: z.string().trim().min(1).max(200).optional(),
+        command: z.string().trim().min(1).max(500),
+        args: z.array(z.string().max(1000)).max(128),
+        workingDirectory: z.enum(['task-worktree', 'workspace', 'provider-managed']),
+        worktree: z.enum(['required', 'supported', 'provider-managed']),
+        environmentKeys: z.array(environmentKeySchema).max(128),
+        credentialReferences: z.array(z.string().trim().min(1).max(300)).max(128),
+      })
+      .strict(),
+    credentials: z
+      .object({
+        schemaVersion: z.literal(RUN_LAUNCH_CREDENTIAL_PLAN_SCHEMA_VERSION),
+        digest: digestSchema,
+        mode: z.enum(['none', 'brokered', 'env-passthrough']),
+        brokerState: z.enum(['not-required', 'supported', 'blocked']),
+        providerRuntimeManifestDigest: digestSchema,
+        providerRuntimeProbeRevision: z.number().int().positive(),
+        references: z
+          .array(
+            z
+              .object({
+                reference: z.string().trim().min(1).max(300),
+                classification: z.enum([
+                  'harness-boot-authentication',
+                  'task-integration',
+                  'compatibility-passthrough',
+                ]),
+                delivery: z.enum([
+                  'provider-native-environment',
+                  'brokered-boundary',
+                  'raw-environment',
+                  'blocked',
+                ]),
+                boundary: z.enum([
+                  'provider-process',
+                  'tool-control-plane',
+                  'egress-gateway',
+                  'unavailable',
+                ]),
+                risk: z.enum(['provider-required', 'brokered', 'high-risk', 'blocked']),
+              })
+              .strict()
+          )
+          .max(256),
+      })
+      .strict()
+      .optional(),
+    tools: z
+      .object({
+        allowed: stringListSchema,
+        denied: stringListSchema,
+        policyIds: stringListSchema,
+        mcpServers: stringListSchema,
+        catalogDigest: z
+          .string()
+          .regex(/^sha256:[a-f0-9]{64}$/)
+          .optional(),
+        enforcement: enforcementSchema,
+      })
+      .strict(),
+    permissions: z
+      .object({
+        level: z.enum(['intern', 'specialist', 'lead']),
+        required: stringListSchema,
+        enforcement: enforcementSchema,
+      })
+      .strict(),
+    resources: z
+      .object({
+        skills: resourceReferenceListSchema,
+        shared: resourceReferenceListSchema,
+        enforcement: enforcementSchema,
+      })
+      .strict(),
+    requiredHealthChecks: stringListSchema,
+    sandbox: z
+      .object({
+        presetId: identifierSchema,
+        enforcement: z.enum(['required', 'advisory']),
+        decision: z.enum(['allow', 'warn', 'block']),
+        effective: z
+          .object({
+            sandboxMode: z.enum(['read-only', 'workspace-write', 'danger-full-access']),
+            networkAccessEnabled: z.boolean(),
+            environmentKeys: z.array(environmentKeySchema).max(128),
+            credentialReferences: z.array(z.string().trim().min(1).max(300)).max(128),
+          })
+          .strict(),
+        unsupportedRules: z
+          .array(
+            z
+              .object({
+                id: identifierSchema,
+                capability: identifierSchema,
+                status: z.enum(['supported', 'unsupported', 'advisory']),
+              })
+              .strict()
+          )
+          .max(128),
+        warnings: z.array(safeTextSchema).max(128),
+        filesystem: z
+          .object({
+            schemaVersion: z.literal('filesystem-sandbox-evidence/v1'),
+            providerRuntimeManifestDigest: digestSchema,
+            backend: z.enum(['codex-sandbox', 'provider-native', 'none']),
+            state: z.enum(['enforced', 'native', 'advisory', 'unavailable']),
+            platformBackend: z.enum([
+              'seatbelt',
+              'landlock-bubblewrap',
+              'restricted-token',
+              'provider-native',
+              'none',
+            ]),
+            capabilityVersion: identifierSchema,
+            backendVersion: safeTextSchema.optional(),
+            backendExecutableDigest: digestSchema.optional(),
+            policyHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+            roots: z
+              .array(
+                z
+                  .object({
+                    id: identifierSchema,
+                    access: z.enum(['read', 'write', 'deny', 'protected']),
+                    scope: z.enum([
+                      'platform-runtime',
+                      'protected-metadata',
+                      'workspace',
+                      'home',
+                      'absolute',
+                      'run-temp',
+                      'run-cache',
+                      'run-artifact',
+                    ]),
+                    pathDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+                  })
+                  .strict()
+              )
+              .max(512),
+            protectedPaths: z
+              .array(z.enum(['.agents', '.codex', '.git', '.veritas-kanban']))
+              .max(4),
+            dotfileMasking: z.boolean(),
+            descendantsEnforced: z.boolean(),
+            cleanupOwner: z.enum(['run-supervisor', 'provider-native', 'none']),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict(),
+    budget: AgentBudgetPolicySchema,
+    workspaceTrust: z.union([
+      z
+        .object({
+          schemaVersion: z.literal('workspace-execution-trust/v1'),
+          status: z.enum(['trusted', 'restricted', 'untrusted', 'not-required']),
+          source: safeTextSchema,
+          policyVersion: z.number().int().positive().max(10_000),
+          identityDigest: digestSchema,
+          inventoryDigest: digestSchema,
+          inventoryEntryCount: z.number().int().nonnegative().max(2_000),
+          containsExecutableConfiguration: z.boolean(),
+          requestedCapabilities: z.array(identifierSchema).max(256),
+          decisionId: identifierSchema.optional(),
+          decisionMode: z.enum(['trusted', 'restricted', 'denied', 'revoked']).optional(),
+          decisionExpiresAt: z.string().datetime({ offset: true }).optional(),
+          inventory: z
+            .array(
+              z
+                .object({
+                  id: identifierSchema,
+                  pathDigest: digestSchema,
+                  kind: z.enum([
+                    'agent-instruction',
+                    'provider-instruction',
+                    'provider-configuration',
+                    'tool-server-configuration',
+                    'runtime-hook',
+                    'language-server-configuration',
+                    'workflow-configuration',
+                    'extension-configuration',
+                    'agent-definition',
+                    'skill-definition',
+                    'project-trust-policy',
+                    'unknown-executable',
+                  ]),
+                  posture: z.enum(['declarative-only', 'model-influencing', 'executable']),
+                  sourceFingerprint: digestSchema,
+                  requestedCapabilities: z.array(identifierSchema).max(64),
+                })
+                .strict()
+            )
+            .max(2_000),
+        })
+        .strict(),
+      z
+        .object({
+          status: z.enum(['trusted', 'untrusted', 'not-required']),
+          source: safeTextSchema,
+        })
+        .strict(),
+    ]),
+    origins: z
+      .array(
+        z
+          .object({
+            field: identifierSchema,
+            scope: z.enum([
+              'run',
+              'parent',
+              'task-envelope',
+              'agent-profile',
+              'workflow',
+              'template',
+              'provider',
+              'workspace',
+              'system-default',
+            ]),
+            source: identifierSchema,
+            precedence: z.number().int().min(0).max(10_000),
+          })
+          .strict()
+      )
+      .max(256),
+    enforcement: z
+      .object({
+        enforceable: z.boolean(),
+        blockers: z
+          .array(
+            z
+              .object({
+                code: identifierSchema,
+                field: identifierSchema,
+                detail: safeTextSchema,
+                remediation: safeTextSchema,
+              })
+              .strict()
+          )
+          .max(128),
+        warnings: z.array(safeTextSchema).max(128),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((manifest, context) => {
+    if (manifest.phase) {
+      const { digest, ...phasePayload } = manifest.phase.evidence;
+      if (digest !== digestRunLaunchValue(phasePayload)) {
+        context.addIssue({
+          code: 'custom',
+          path: ['phase', 'evidence', 'digest'],
+          message: 'Phase evidence digest does not match its canonical payload',
+        });
+      }
+      const sourceKinds = manifest.phase.sourceReferences.map((reference) => reference.kind);
+      if (
+        new Set(sourceKinds).size !== PHASE_AUTHORITY_SOURCE_KINDS.length ||
+        PHASE_AUTHORITY_SOURCE_KINDS.some((kind) => !sourceKinds.includes(kind))
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['phase', 'sourceReferences'],
+          message: 'Phase evidence requires exactly one reference for every authority source kind',
+        });
+      }
+      for (const [index, reference] of manifest.phase.sourceReferences.entries()) {
+        const hasParentLink = Boolean(
+          reference.parentAttemptId ||
+          reference.parentManifestDigest ||
+          reference.parentEvidenceDigest
+        );
+        if ((reference.kind === 'parent' && reference.originScope === 'parent') !== hasParentLink) {
+          context.addIssue({
+            code: 'custom',
+            path: ['phase', 'sourceReferences', index],
+            message: 'Parent phase references must carry one complete parent origin link',
+          });
+        }
+        if (
+          reference.kind === 'parent' &&
+          reference.originScope === 'parent' &&
+          (!reference.parentAttemptId || !reference.parentManifestDigest)
+        ) {
+          context.addIssue({
+            code: 'custom',
+            path: ['phase', 'sourceReferences', index],
+            message:
+              'Parent phase references require the attempt, manifest, and applicable evidence digests',
+          });
+        }
+      }
+    }
+    if (manifest.credentials) {
+      const { digest, ...payload } = manifest.credentials;
+      if (digest !== digestRunLaunchValue(payload)) {
+        context.addIssue({
+          code: 'custom',
+          path: ['credentials', 'digest'],
+          message: 'Credential plan digest does not match its canonical payload',
+        });
+      }
+      if (
+        manifest.credentials.providerRuntimeManifestDigest !== manifest.providerRuntime.digest ||
+        manifest.credentials.providerRuntimeProbeRevision !== manifest.providerRuntime.probeRevision
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['credentials', 'providerRuntimeManifestDigest'],
+          message: 'Credential plan provider evidence does not match the launch manifest',
+        });
+      }
+    }
+    const filesystem = manifest.sandbox.filesystem;
+    if (
+      filesystem &&
+      filesystem.providerRuntimeManifestDigest !== manifest.providerRuntime.digest
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sandbox', 'filesystem', 'providerRuntimeManifestDigest'],
+        message: 'Filesystem sandbox evidence does not match the provider runtime manifest',
+      });
+    }
+    if (
+      filesystem?.backend === 'codex-sandbox' &&
+      (filesystem.state !== 'enforced' ||
+        filesystem.platformBackend === 'provider-native' ||
+        filesystem.platformBackend === 'none' ||
+        filesystem.cleanupOwner !== 'run-supervisor' ||
+        !filesystem.backendExecutableDigest ||
+        !filesystem.descendantsEnforced)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sandbox', 'filesystem'],
+        message: 'Host-wrapper filesystem evidence has an inconsistent enforcement posture',
+      });
+    }
+    if (
+      filesystem?.backend === 'provider-native' &&
+      (filesystem.state !== 'native' ||
+        filesystem.platformBackend !== 'provider-native' ||
+        !['provider-native', 'run-supervisor'].includes(filesystem.cleanupOwner) ||
+        filesystem.backendExecutableDigest ||
+        !filesystem.descendantsEnforced)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sandbox', 'filesystem'],
+        message: 'Provider-native filesystem evidence has an inconsistent enforcement posture',
+      });
+    }
+    if (
+      filesystem?.backend === 'provider-native' &&
+      filesystem.cleanupOwner === 'run-supervisor' &&
+      (!filesystem.roots.some((root) => root.scope === 'run-temp' && root.access === 'write') ||
+        !filesystem.roots.some((root) => root.scope === 'run-cache' && root.access === 'write'))
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sandbox', 'filesystem', 'roots'],
+        message:
+          'Supervisor-owned provider-native cleanup requires run temp and cache root evidence',
+      });
+    }
+    if (
+      filesystem?.backend === 'none' &&
+      (filesystem.state === 'enforced' ||
+        filesystem.state === 'native' ||
+        filesystem.platformBackend !== 'none' ||
+        filesystem.cleanupOwner !== 'none' ||
+        filesystem.backendExecutableDigest ||
+        filesystem.descendantsEnforced ||
+        filesystem.protectedPaths.length > 0)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['sandbox', 'filesystem'],
+        message: 'Unavailable filesystem evidence cannot claim an enforced boundary',
+      });
+    }
+    if (manifest.enforcement.enforceable !== (manifest.enforcement.blockers.length === 0)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['enforcement', 'enforceable'],
+        message: 'Launch manifest enforceable state must match the blocker set',
+      });
+    }
+    if (manifest.readiness.overridden !== Boolean(manifest.readiness.overrideReasonDigest)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['readiness', 'overridden'],
+        message: 'Readiness override state must match the override reason fingerprint',
+      });
+    }
+    if (manifest.digest !== calculateRunLaunchManifestDigest(manifest)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['digest'],
+        message: 'Run launch manifest digest does not match its canonical payload',
+      });
+    }
+    for (const [path, value] of collectStringLeaves(manifest)) {
+      if (containsUnredactedProviderRuntimeSecret(value)) {
+        context.addIssue({
+          code: 'custom',
+          path,
+          message: 'Run launch manifest evidence must redact credentials and secrets',
+        });
+      }
+    }
+  });
+
+export function parseRunLaunchManifest(input: unknown): RunLaunchManifest {
+  return RunLaunchManifestSchema.parse(input) as RunLaunchManifest;
+}
+
+function collectStringLeaves(
+  value: unknown,
+  path: Array<string | number> = []
+): Array<[Array<string | number>, string]> {
+  if (typeof value === 'string') {
+    return [[path, value]];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry, index) => collectStringLeaves(entry, [...path, index]));
+  }
+  if (!value || typeof value !== 'object') {
+    return [];
+  }
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, entry]) =>
+    collectStringLeaves(entry, [...path, key])
+  );
+}

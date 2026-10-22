@@ -1,0 +1,862 @@
+import {
+  useMoveTask,
+  useBoardTasks,
+  useBoardSearch,
+  useTask,
+  useTasksByStatus,
+} from '@/hooks/useTasks';
+import { useBoardDragDrop } from '@/hooks/useBoardDragDrop';
+import { KanbanColumn } from './KanbanColumn';
+import { BoardLoadingSkeleton } from './BoardLoadingSkeleton';
+import {
+  DEFAULT_FEATURE_SETTINGS,
+  type BoardSavedView,
+  type BoardColumnConfig,
+  type TaskStatus,
+  type Task,
+  normalizeBoardColumns,
+} from '@veritas-kanban/shared';
+import { useFeatureSettings, useUpdateFeatureSettings } from '@/hooks/useFeatureSettings';
+import { DndContext, DragOverlay } from '@dnd-kit/core';
+import { useMediaQuery } from '@mantine/hooks';
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
+import { TaskCard } from '@/components/task/TaskCard';
+import { useKeyboard } from '@/hooks/useKeyboard';
+import {
+  FilterBar,
+  type FilterState,
+  filterTasks,
+  filtersToSearchParams,
+  searchParamsToFilters,
+} from './FilterBar';
+import { BulkActionsBar } from './BulkActionsBar';
+import { useBulkActions } from '@/hooks/useBulkActions';
+import {
+  areBoardViewFiltersEqual,
+  createBoardSavedView,
+  deleteBoardSavedView,
+  findBoardSavedViewByFilters,
+  hasBoardFilterSearchParams,
+  renameBoardSavedView,
+  updateBoardSavedViewFilters,
+} from '@/lib/board-saved-views';
+import { AlertTriangle, CheckSquare, RefreshCw, Wrench } from 'lucide-react';
+import { Button } from '@mantine/core';
+import { ArchiveSuggestionBanner } from './ArchiveSuggestionBanner';
+import FeatureErrorBoundary from '@/components/shared/FeatureErrorBoundary';
+import { LazyOnVisible } from '@/components/shared/LazyOnVisible';
+import { useLiveAnnouncer } from '@/components/shared/LiveAnnouncer';
+import { useView } from '@/contexts/ViewContext';
+import { useIdentity } from '@/hooks/useIdentity';
+import { useNetworkStatus } from '@/hooks/useNetworkStatus';
+import type { TaskDetailNavigationTarget } from '@/components/task/TaskDetailPanel';
+import { useDesktopShell } from '@/components/layout/DesktopShellContext';
+import { cn } from '@/lib/utils';
+
+const TASK_DETAIL_HISTORY_KEY = 'veritasTaskDetail';
+
+function taskIdFromHistory(): string | null {
+  const state = window.history.state;
+  if (!state || typeof state !== 'object') return null;
+  const taskId = (state as Record<string, unknown>)[TASK_DETAIL_HISTORY_KEY];
+  return typeof taskId === 'string' ? taskId : null;
+}
+
+function currentViewHasOrigin(): boolean {
+  const navigation = window.history.state?.veritasKanbanNavigation;
+  return Boolean(
+    navigation &&
+    typeof navigation === 'object' &&
+    typeof (navigation as Record<string, unknown>).originView === 'string'
+  );
+}
+
+function markTaskInHistory(taskId: string, replaceCurrent = false) {
+  const nextState = {
+    ...(window.history.state && typeof window.history.state === 'object'
+      ? window.history.state
+      : {}),
+    [TASK_DETAIL_HISTORY_KEY]: taskId,
+  };
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (replaceCurrent || taskIdFromHistory()) {
+    window.history.replaceState(nextState, '', currentUrl);
+  } else {
+    window.history.pushState(nextState, '', currentUrl);
+  }
+}
+
+// Lazy-load Dashboard so board startup does not include dashboard-heavy code paths.
+const Dashboard = lazy(() =>
+  import('@/components/dashboard/Dashboard').then((mod) => ({
+    default: mod.Dashboard,
+  }))
+);
+
+const TaskDetailPanel = lazy(() =>
+  import('@/components/task/TaskDetailPanel').then((mod) => ({
+    default: mod.TaskDetailPanel,
+  }))
+);
+
+const BoardSidebar = lazy(() =>
+  import('./BoardSidebar').then((mod) => ({
+    default: mod.BoardSidebar,
+  }))
+);
+
+const EMPTY_SAVED_VIEWS: BoardSavedView[] = [];
+
+export function KanbanBoard() {
+  const { data: tasks, isLoading, error, refetch, isFetching } = useBoardTasks();
+  const { settings: featureSettings, isPlaceholderData } = useFeatureSettings();
+  const updateFeatureSettings = useUpdateFeatureSettings();
+  const boardSettings = featureSettings.board ?? DEFAULT_FEATURE_SETTINGS.board;
+  const columns = useMemo<BoardColumnConfig[]>(
+    () => normalizeBoardColumns(boardSettings.columns),
+    [boardSettings.columns]
+  );
+  const statusOptions = useMemo(
+    () => columns.map((column) => ({ value: column.id, label: column.title })),
+    [columns]
+  );
+  const savedViews = boardSettings.savedViews ?? EMPTY_SAVED_VIEWS;
+  const defaultSavedViewId = boardSettings.defaultSavedViewId ?? null;
+  const { announce } = useLiveAnnouncer();
+  const { hasPermission } = useIdentity();
+  const { isOnline } = useNetworkStatus();
+  const { isDesktopClient, rightRailOpen } = useDesktopShell();
+  const canWriteTasks = hasPermission('task:write');
+  const isMobileLayout = useMediaQuery('(max-width: 767px)', false);
+  const canDragTasks =
+    boardSettings.enableDragAndDrop && canWriteTasks && isOnline && !isMobileLayout;
+  const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailPanelMounted, setDetailPanelMounted] = useState(false);
+  const [detailNavigationTarget, setDetailNavigationTarget] =
+    useState<TaskDetailNavigationTarget | null>(null);
+  const defaultSavedViewAppliedRef = useRef(false);
+  const pendingMoveTaskIdsRef = useRef(new Set<string>());
+  const detailFocusReturnRef = useRef<HTMLElement | null>(null);
+  const detailFocusTaskIdRef = useRef<string | null>(null);
+  const wasDetailOpenRef = useRef(false);
+
+  // Initialize filters from URL
+  const [filters, setFilters] = useState<FilterState>(() => {
+    if (typeof window !== 'undefined') {
+      return searchParamsToFilters(new URLSearchParams(window.location.search));
+    }
+    return { search: '', project: null, type: null, agent: null };
+  });
+  const [selectedSavedViewId, setSelectedSavedViewId] = useState<string | null>(null);
+  const searchMatches = useBoardSearch(filters.search);
+  const detailQuery = useTask(selectedTask?.id ?? '');
+
+  const { selectedTaskId, setTasks, setOnOpenTask, setOnMoveTask } = useKeyboard();
+  const { isSelecting, toggleSelecting } = useBulkActions();
+  const { pendingTaskId, pendingTaskTarget, clearPendingTask, returnFromTask } = useView();
+
+  const matchingSavedView = useMemo(
+    () => findBoardSavedViewByFilters(savedViews, filters),
+    [filters, savedViews]
+  );
+  const selectedSavedView = useMemo(
+    () => savedViews.find((view) => view.id === selectedSavedViewId) ?? null,
+    [savedViews, selectedSavedViewId]
+  );
+  const activeSavedView = selectedSavedView ?? matchingSavedView ?? null;
+  const hasUnsavedSavedViewChanges = Boolean(
+    selectedSavedView && !areBoardViewFiltersEqual(selectedSavedView.filters, filters)
+  );
+
+  const persistBoardSavedViews = useCallback(
+    (nextSavedViews: BoardSavedView[], nextDefaultSavedViewId = defaultSavedViewId) => {
+      updateFeatureSettings.mutate({
+        board: {
+          savedViews: nextSavedViews,
+          defaultSavedViewId: nextDefaultSavedViewId,
+        },
+      });
+    },
+    [defaultSavedViewId, updateFeatureSettings]
+  );
+
+  const handleFiltersChange = useCallback(
+    (nextFilters: FilterState) => {
+      setFilters(nextFilters);
+      const nextMatchingView = findBoardSavedViewByFilters(savedViews, nextFilters);
+      if (nextMatchingView) {
+        setSelectedSavedViewId(nextMatchingView.id);
+      }
+    },
+    [savedViews]
+  );
+
+  const handleApplySavedView = useCallback(
+    (viewId: string) => {
+      const view = savedViews.find((savedView) => savedView.id === viewId);
+      if (!view) return;
+      setSelectedSavedViewId(view.id);
+      setFilters({
+        search: view.filters.search,
+        project: view.filters.project,
+        type: view.filters.type,
+        agent: view.filters.agent,
+      });
+    },
+    [savedViews]
+  );
+
+  const handleSaveSavedView = useCallback(
+    (name: string) => {
+      const view = createBoardSavedView({
+        name,
+        filters,
+        existingIds: savedViews.map((savedView) => savedView.id),
+      });
+      persistBoardSavedViews([...savedViews, view]);
+      setSelectedSavedViewId(view.id);
+    },
+    [filters, persistBoardSavedViews, savedViews]
+  );
+
+  const handleUpdateSavedView = useCallback(
+    (viewId: string) => {
+      persistBoardSavedViews(updateBoardSavedViewFilters(savedViews, viewId, filters));
+      setSelectedSavedViewId(viewId);
+    },
+    [filters, persistBoardSavedViews, savedViews]
+  );
+
+  const handleRenameSavedView = useCallback(
+    (viewId: string, name: string) => {
+      persistBoardSavedViews(renameBoardSavedView(savedViews, viewId, name));
+      setSelectedSavedViewId(viewId);
+    },
+    [persistBoardSavedViews, savedViews]
+  );
+
+  const handleDeleteSavedView = useCallback(
+    (viewId: string) => {
+      const result = deleteBoardSavedView(savedViews, defaultSavedViewId, viewId);
+      persistBoardSavedViews(result.savedViews, result.defaultSavedViewId);
+      if (selectedSavedViewId === viewId) {
+        setSelectedSavedViewId(null);
+      }
+    },
+    [defaultSavedViewId, persistBoardSavedViews, savedViews, selectedSavedViewId]
+  );
+
+  const handleSetDefaultSavedView = useCallback(
+    (viewId: string | null) => {
+      persistBoardSavedViews(savedViews, viewId);
+    },
+    [persistBoardSavedViews, savedViews]
+  );
+
+  useEffect(() => {
+    if (selectedSavedViewId && !savedViews.some((view) => view.id === selectedSavedViewId)) {
+      setSelectedSavedViewId(null);
+    }
+  }, [savedViews, selectedSavedViewId]);
+
+  // Handle navigation from other views (e.g., Activity page clicking on a task)
+  useEffect(() => {
+    if (!pendingTaskId) return;
+
+    const openPendingTask = async () => {
+      // Try local task list first
+      const localTask = tasks?.find((t) => t.id === pendingTaskId);
+      if (localTask) {
+        markTaskInHistory(localTask.id, currentViewHasOrigin());
+        setDetailPanelMounted(true);
+        setDetailNavigationTarget(pendingTaskTarget);
+        setSelectedTask(localTask);
+        setDetailOpen(true);
+        clearPendingTask();
+        return;
+      }
+
+      // Fallback: fetch from API (task may be archived or filtered out)
+      try {
+        const { api } = await import('@/lib/api');
+        const fetchedTask = await api.tasks.get(pendingTaskId);
+        if (fetchedTask) {
+          markTaskInHistory(fetchedTask.id, currentViewHasOrigin());
+          setDetailPanelMounted(true);
+          setDetailNavigationTarget(pendingTaskTarget);
+          setSelectedTask(fetchedTask);
+          setDetailOpen(true);
+          clearPendingTask();
+          return;
+        }
+      } catch {
+        // Return to the originating view when the task no longer exists.
+      }
+      clearPendingTask();
+      returnFromTask();
+    };
+
+    openPendingTask();
+  }, [pendingTaskId, pendingTaskTarget, tasks, clearPendingTask, returnFromTask]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (!detailOpen || taskIdFromHistory() === selectedTask?.id) return;
+      setDetailOpen(false);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [detailOpen, selectedTask?.id]);
+
+  // Retain the closing task for its exit transition, but cancel that cleanup
+  // when a task is reopened before the transition finishes.
+  useEffect(() => {
+    if (detailOpen || !selectedTask) return;
+    const timer = window.setTimeout(() => setSelectedTask(null), 200);
+    return () => window.clearTimeout(timer);
+  }, [detailOpen, selectedTask]);
+
+  // Apply the configured default saved view only when the current URL has no board filters.
+  useEffect(() => {
+    if (defaultSavedViewAppliedRef.current || isPlaceholderData) return;
+    if (typeof window === 'undefined') {
+      defaultSavedViewAppliedRef.current = true;
+      return;
+    }
+
+    if (hasBoardFilterSearchParams(new URLSearchParams(window.location.search))) {
+      defaultSavedViewAppliedRef.current = true;
+      return;
+    }
+
+    if (!defaultSavedViewId) {
+      defaultSavedViewAppliedRef.current = true;
+      return;
+    }
+
+    const defaultView = savedViews.find((view) => view.id === defaultSavedViewId);
+    if (!defaultView) {
+      defaultSavedViewAppliedRef.current = true;
+      return;
+    }
+
+    setSelectedSavedViewId(defaultView.id);
+    setFilters({
+      search: defaultView.filters.search,
+      project: defaultView.filters.project,
+      type: defaultView.filters.type,
+      agent: defaultView.filters.agent,
+    });
+    defaultSavedViewAppliedRef.current = true;
+  }, [defaultSavedViewId, isPlaceholderData, savedViews]);
+
+  // Sync filters to URL
+  useEffect(() => {
+    const params = filtersToSearchParams(filters);
+    const newUrl = params.toString()
+      ? `${window.location.pathname}?${params.toString()}`
+      : window.location.pathname;
+    window.history.replaceState({}, '', newUrl);
+  }, [filters]);
+
+  // Filter tasks
+  const filteredTasks = useMemo(() => {
+    const matches = filters.search ? new Set(searchMatches.data ?? []) : null;
+    return tasks
+      ? filterTasks(tasks, { ...filters, search: '' }).filter(
+          (task) => !matches || matches.has(task.id)
+        )
+      : [];
+  }, [tasks, filters, searchMatches.data]);
+
+  const taskIndex = useMemo(() => new Map((tasks ?? []).map((task) => [task.id, task])), [tasks]);
+
+  // Group filtered tasks by status
+  const tasksByStatus = useTasksByStatus(filteredTasks, columns);
+  const allTasksByStatus = useTasksByStatus(tasks ?? [], columns);
+  const boardColumnGridStyle = isMobileLayout
+    ? undefined
+    : {
+        gridTemplateColumns: isDesktopClient
+          ? `repeat(${Math.max(columns.length, 1)}, minmax(0, 1fr))`
+          : 'repeat(auto-fit, minmax(220px, 1fr))',
+      };
+  const boardColumnGridClassName = cn(
+    'grid grid-cols-1 gap-4',
+    !isDesktopClient && 'md:grid-cols-2'
+  );
+
+  // Register filtered tasks with keyboard context
+  useEffect(() => {
+    setTasks(filteredTasks);
+  }, [filteredTasks, setTasks]);
+
+  // Handler for opening a task
+  const handleTaskClick = useCallback((task: Task, target?: TaskDetailNavigationTarget) => {
+    const activeElement = document.activeElement;
+    detailFocusReturnRef.current =
+      activeElement instanceof HTMLElement && activeElement !== document.body
+        ? activeElement
+        : null;
+    detailFocusTaskIdRef.current = task.id;
+    markTaskInHistory(task.id);
+    setDetailPanelMounted(true);
+    setDetailNavigationTarget(target ?? null);
+    setSelectedTask(task);
+    setDetailOpen(true);
+  }, []);
+
+  useEffect(() => {
+    const wasOpen = wasDetailOpenRef.current;
+    wasDetailOpenRef.current = detailOpen;
+    if (!wasOpen || detailOpen) return;
+
+    const returnTarget = detailFocusReturnRef.current;
+    const taskId = detailFocusTaskIdRef.current;
+    const timer = window.setTimeout(() => {
+      const fallbackTarget = Array.from(
+        document.querySelectorAll<HTMLElement>('[data-task-id]')
+      ).find((element) => element.dataset.taskId === taskId);
+      const focusTarget = returnTarget?.isConnected ? returnTarget : fallbackTarget;
+      focusTarget?.focus({ preventScroll: true });
+      detailFocusReturnRef.current = null;
+      detailFocusTaskIdRef.current = null;
+    }, 220);
+
+    return () => window.clearTimeout(timer);
+  }, [detailOpen]);
+
+  const handleTaskIdClick = useCallback(
+    async (taskId: string, target?: TaskDetailNavigationTarget) => {
+      const localTask = tasks?.find((t) => t.id === taskId);
+      if (localTask) {
+        handleTaskClick(localTask, target);
+        return;
+      }
+
+      try {
+        const { api } = await import('@/lib/api');
+        const fetchedTask = await api.tasks.get(taskId);
+        if (fetchedTask) {
+          handleTaskClick(fetchedTask, target);
+        }
+      } catch {
+        // Task no longer exists — ignore silently
+      }
+    },
+    [handleTaskClick, tasks]
+  );
+
+  // Listen for open-task events from dashboard drill-downs
+  useEffect(() => {
+    const handler = async (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      const taskId = detail?.taskId;
+      if (!taskId) return;
+      const target: TaskDetailNavigationTarget = {
+        tab: detail?.tab,
+        timelineAttemptId: detail?.timelineAttemptId,
+      };
+
+      // Try local task list first
+      const localTask = tasks?.find((t) => t.id === taskId);
+      if (localTask) {
+        setDetailPanelMounted(true);
+        setDetailNavigationTarget(target);
+        setSelectedTask(localTask);
+        setDetailOpen(true);
+        return;
+      }
+
+      // Fallback: fetch from API (task may be archived or filtered out)
+      try {
+        const { api } = await import('@/lib/api');
+        const fetchedTask = await api.tasks.get(taskId);
+        if (fetchedTask) {
+          setDetailPanelMounted(true);
+          setDetailNavigationTarget(target);
+          setSelectedTask(fetchedTask);
+          setDetailOpen(true);
+        }
+      } catch {
+        // Task no longer exists — ignore silently
+      }
+    };
+    window.addEventListener('open-task', handler);
+    return () => window.removeEventListener('open-task', handler);
+  }, [tasks]);
+
+  const moveTask = useMoveTask();
+
+  const commitBoardMove = useCallback(
+    async (
+      taskId: string,
+      input: Parameters<ReturnType<typeof useMoveTask>['mutateAsync']>[0]['input']
+    ) => {
+      if (!canWriteTasks || !isOnline) throw new Error('Task movement is unavailable');
+      if (pendingMoveTaskIdsRef.current.has(taskId)) {
+        throw new Error('This task already has a move in progress');
+      }
+      pendingMoveTaskIdsRef.current.add(taskId);
+      try {
+        return await moveTask.mutateAsync({ id: taskId, input });
+      } finally {
+        pendingMoveTaskIdsRef.current.delete(taskId);
+      }
+    },
+    [canWriteTasks, isOnline, moveTask]
+  );
+
+  // Handler for moving a task (with screen reader announcement)
+  const handleMoveTask = useCallback(
+    (taskId: string, status: TaskStatus) => {
+      const task = filteredTasks.find((t) => t.id === taskId);
+      const columnName = columns.find((c) => c.id === status)?.title || status;
+      if (!canWriteTasks) {
+        announce(`Task ${task?.title || taskId} cannot be moved with the current permissions`);
+        return;
+      }
+      if (!isOnline) {
+        announce(`Task ${task?.title || taskId} cannot be moved while this client is offline`);
+        return;
+      }
+      if (!task || task.status === status) return;
+      const destinationIndex = (allTasksByStatus[status] ?? []).filter(
+        (destinationTask) => destinationTask.id !== taskId
+      ).length;
+      void commitBoardMove(taskId, {
+        operationId: crypto.randomUUID(),
+        sourceStatus: task.status,
+        sourcePosition:
+          typeof task.position === 'number' && Number.isFinite(task.position)
+            ? task.position
+            : null,
+        destinationStatus: status,
+        destinationIndex,
+      })
+        .then((result) => {
+          const committedIndex = result.orderedTaskIds.indexOf(result.task.id);
+          announce(
+            `Task ${result.task.title} moved to ${columnName}, position ${committedIndex + 1} of ${result.orderedTaskIds.length}`
+          );
+        })
+        .catch(() => announce(`Move failed. ${task.title} stayed in its current column`));
+    },
+    [allTasksByStatus, announce, canWriteTasks, columns, commitBoardMove, filteredTasks, isOnline]
+  );
+
+  // Board-owned callbacks must not outlive this view.
+  useEffect(() => {
+    setOnOpenTask(handleTaskClick);
+    setOnMoveTask(handleMoveTask);
+    return () => {
+      setOnOpenTask(null);
+      setOnMoveTask(null);
+    };
+  }, [handleTaskClick, handleMoveTask, setOnOpenTask, setOnMoveTask]);
+
+  useEffect(() => () => setTasks([]), [setTasks]);
+
+  // Drag and drop logic
+  const {
+    activeTask,
+    isDragActive,
+    isMovePending,
+    liveTasksByStatus,
+    sensors,
+    collisionDetection,
+    announcements,
+    screenReaderInstructions,
+    handleDragStart,
+    handleDragOver,
+    handleDragEnd,
+    handleDragCancel,
+  } = useBoardDragDrop({
+    tasks: filteredTasks,
+    tasksByStatus,
+    allTasksByStatus,
+    columns,
+    onMove: commitBoardMove,
+    announce,
+  });
+
+  const handleDetailClose = (open: boolean) => {
+    if (!open && selectedTask?.id && taskIdFromHistory() === selectedTask.id) {
+      window.history.back();
+      return;
+    }
+    setDetailOpen(open);
+    if (!open) {
+      returnFromTask();
+    }
+  };
+
+  // Keep selected task in sync with updated data
+  const currentSelectedTask =
+    detailQuery.data ?? (selectedTask && !('boardSummary' in selectedTask) ? selectedTask : null);
+
+  if (isLoading) {
+    return <BoardLoadingSkeleton columns={columns} />;
+  }
+
+  if (error) {
+    return (
+      <div className="flex min-h-[24rem] items-center justify-center px-4" role="alert">
+        <div className="w-full max-w-md rounded-lg border border-destructive/30 bg-destructive/5 p-6 text-center shadow-sm">
+          <AlertTriangle className="mx-auto h-8 w-8 text-destructive" aria-hidden="true" />
+          <div className="mt-3 text-base font-semibold text-destructive">Task sync unavailable</div>
+          <div className="mt-2 text-sm text-muted-foreground">
+            {error.message || 'The local task service did not respond.'}
+          </div>
+          <div className="mt-5 flex flex-col justify-center gap-2 sm:flex-row">
+            <Button
+              variant="filled"
+              color="red"
+              size="sm"
+              loading={isFetching}
+              leftSection={<RefreshCw className="h-4 w-4" aria-hidden="true" />}
+              onClick={() => void refetch()}
+            >
+              Retry
+            </Button>
+            <Button
+              variant="light"
+              color="gray"
+              size="sm"
+              leftSection={<Wrench className="h-4 w-4" aria-hidden="true" />}
+              onClick={() => window.dispatchEvent(new CustomEvent('veritas:open-diagnostics'))}
+            >
+              Diagnostics
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+        <FilterBar
+          tasks={tasks || []}
+          filters={filters}
+          onFiltersChange={handleFiltersChange}
+          savedViews={savedViews}
+          selectedSavedViewId={activeSavedView?.id ?? null}
+          defaultSavedViewId={defaultSavedViewId}
+          hasUnsavedSavedViewChanges={hasUnsavedSavedViewChanges}
+          isSavingSavedView={updateFeatureSettings.isPending}
+          onApplySavedView={handleApplySavedView}
+          onClearSelectedSavedView={() => setSelectedSavedViewId(null)}
+          onSaveSavedView={handleSaveSavedView}
+          onUpdateSavedView={handleUpdateSavedView}
+          onRenameSavedView={handleRenameSavedView}
+          onDeleteSavedView={handleDeleteSavedView}
+          onSetDefaultSavedView={handleSetDefaultSavedView}
+        />
+        {!isSelecting && (
+          <Button
+            variant="subtle"
+            size="sm"
+            onClick={toggleSelecting}
+            disabled={!canWriteTasks}
+            title={canWriteTasks ? 'Select tasks' : 'Task write permission required'}
+            className="min-h-8 shrink-0 self-start text-muted-foreground sm:self-auto"
+            leftSection={<CheckSquare className="h-4 w-4" aria-hidden="true" />}
+          >
+            Select
+          </Button>
+        )}
+      </div>
+
+      {filters.search && searchMatches.isFetching && (
+        <p role="status" className="px-2 text-sm text-muted-foreground">
+          Searching tasks…
+        </p>
+      )}
+      {filters.search && searchMatches.error && (
+        <div role="alert" className="px-2 text-sm">
+          Search could not be completed.{' '}
+          <Button variant="subtle" onClick={() => void searchMatches.refetch()}>
+            Retry search
+          </Button>
+        </div>
+      )}
+      <BulkActionsBar tasks={filteredTasks} />
+
+      {boardSettings.showArchiveSuggestions && <ArchiveSuggestionBanner />}
+
+      <FeatureErrorBoundary fallbackTitle="Board failed to render">
+        <div
+          className={cn(
+            'grid grid-cols-1 items-start gap-4',
+            !isDesktopClient && 'xl:grid-cols-5',
+            isDesktopClient && rightRailOpen && 'desktop-board-with-right-rail'
+          )}
+        >
+          <section
+            id="mobile-board-columns"
+            className={cn('min-w-0', !isDesktopClient && 'xl:col-span-4')}
+            aria-label={`Kanban board, ${filteredTasks.length} tasks`}
+          >
+            {canDragTasks ? (
+              <DndContext
+                sensors={sensors}
+                collisionDetection={collisionDetection}
+                accessibility={{ announcements, screenReaderInstructions, restoreFocus: false }}
+                onDragStart={handleDragStart}
+                onDragOver={handleDragOver}
+                onDragEnd={handleDragEnd}
+                onDragCancel={handleDragCancel}
+              >
+                <div
+                  className={boardColumnGridClassName}
+                  style={boardColumnGridStyle}
+                  role="group"
+                  aria-label="Kanban columns"
+                >
+                  {columns.map((column) => (
+                    <KanbanColumn
+                      key={column.id}
+                      id={column.id}
+                      title={column.title}
+                      tasks={liveTasksByStatus[column.id] ?? []}
+                      allTasks={filteredTasks}
+                      taskIndex={taskIndex}
+                      onTaskClick={handleTaskClick}
+                      onTaskStatusChange={handleMoveTask}
+                      selectedTaskId={
+                        selectedTaskId && taskIndex.get(selectedTaskId)?.status === column.id
+                          ? selectedTaskId
+                          : null
+                      }
+                      canChangeStatus={canWriteTasks && isOnline}
+                      dragEnabled={canDragTasks && !isMovePending}
+                      isDragActive={isDragActive}
+                      statusOptions={statusOptions}
+                    />
+                  ))}
+                </div>
+
+                <DragOverlay dropAnimation={null}>
+                  {activeTask ? (
+                    <div
+                      data-board-drag-overlay
+                      className="pointer-events-none h-full w-full rounded-md bg-card text-card-foreground shadow-2xl ring-1 ring-border"
+                      style={{ contain: 'layout paint' }}
+                    >
+                      <TaskCard task={activeTask} dragEnabled={false} isDragActive />
+                    </div>
+                  ) : null}
+                </DragOverlay>
+              </DndContext>
+            ) : (
+              <div
+                className={boardColumnGridClassName}
+                style={boardColumnGridStyle}
+                role="group"
+                aria-label="Kanban columns"
+              >
+                {columns.map((column) => (
+                  <KanbanColumn
+                    key={column.id}
+                    id={column.id}
+                    title={column.title}
+                    tasks={tasksByStatus[column.id] ?? []}
+                    allTasks={filteredTasks}
+                    taskIndex={taskIndex}
+                    onTaskClick={handleTaskClick}
+                    onTaskStatusChange={handleMoveTask}
+                    selectedTaskId={
+                      selectedTaskId && taskIndex.get(selectedTaskId)?.status === column.id
+                        ? selectedTaskId
+                        : null
+                    }
+                    canChangeStatus={canWriteTasks && isOnline}
+                    dragEnabled={false}
+                    showStatusControls={isMobileLayout}
+                    statusOptions={statusOptions}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          <aside
+            id="board-right-sidebar"
+            className="min-w-0"
+            aria-label="Board right sidebar"
+            hidden={isDesktopClient && !rightRailOpen}
+          >
+            {(!isDesktopClient || rightRailOpen) && (
+              <Suspense
+                fallback={
+                  <div className="min-h-24 rounded-md border border-dashed border-border/70" />
+                }
+              >
+                <BoardSidebar
+                  onTaskClick={(taskId) => {
+                    void handleTaskIdClick(taskId);
+                  }}
+                />
+              </Suspense>
+            )}
+          </aside>
+        </div>
+
+        {boardSettings.showDashboard && (
+          <section aria-label="Board dashboard">
+            <LazyOnVisible
+              className="mt-6 border-t pt-4"
+              fallback={<DashboardLoadingFallback />}
+              minHeight={192}
+              rootMargin="0px 0px"
+            >
+              <Suspense fallback={<DashboardLoadingFallback />}>
+                <Dashboard
+                  onTaskClick={(taskId, target) => {
+                    void handleTaskIdClick(taskId, target);
+                  }}
+                />
+              </Suspense>
+            </LazyOnVisible>
+          </section>
+        )}
+      </FeatureErrorBoundary>
+
+      {detailOpen && !currentSelectedTask && (
+        <div
+          role="status"
+          className="fixed bottom-4 right-4 z-50 rounded border bg-background p-4 shadow"
+        >
+          {detailQuery.error ? 'Task details could not be loaded.' : 'Loading task details…'}
+          {detailQuery.error && <Button onClick={() => void detailQuery.refetch()}>Retry</Button>}
+          <Button onClick={() => handleDetailClose(false)}>Close</Button>
+        </div>
+      )}
+      {detailPanelMounted && (
+        <Suspense fallback={null}>
+          <TaskDetailPanel
+            task={currentSelectedTask}
+            open={detailOpen}
+            onOpenChange={handleDetailClose}
+            readOnly={!canWriteTasks}
+            navigationTarget={detailNavigationTarget}
+          />
+        </Suspense>
+      )}
+    </>
+  );
+}
+
+function DashboardLoadingFallback() {
+  return (
+    <div
+      className="flex min-h-48 items-center justify-center py-8 text-muted-foreground"
+      role="status"
+    >
+      Loading dashboard…
+    </div>
+  );
+}

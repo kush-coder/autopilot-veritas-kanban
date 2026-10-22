@@ -1,0 +1,760 @@
+/**
+ * Agent Registry Service
+ *
+ * Manages agent registration, heartbeat tracking, and capability discovery.
+ * Agents register themselves with name, model, capabilities, and metadata.
+ * The registry tracks liveness via heartbeats and exposes discovery APIs.
+ *
+ * Storage: File-based JSON in .veritas-kanban/agent-registry.json
+ */
+
+import path from 'path';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  mkdir,
+  writeFile,
+  rename,
+} from '../storage/fs-helpers.js';
+import { createLogger } from '../lib/logger.js';
+import { getLegacyRuntimeDirs, getRuntimeDir } from '../utils/paths.js';
+import type { ProviderRuntimeManifest } from '@veritas-kanban/shared';
+import { parseProviderRuntimeManifest } from '../schemas/provider-runtime-manifest-schemas.js';
+
+const log = createLogger('agent-registry');
+
+// ─── Types ───────────────────────────────────────────────────────
+
+export interface AgentCapability {
+  /** Capability name (e.g., "code", "research", "deploy", "review") */
+  name: string;
+  /** Optional description */
+  description?: string;
+}
+
+export interface RegisteredAgent {
+  /** Unique agent identifier (e.g., "veritas", "codex-1", "sonnet-research") */
+  id: string;
+  /** Human-readable display name */
+  name: string;
+  /** Model identifier (e.g., "claude-opus-4-6", "gpt-5.2-codex") */
+  model?: string;
+  /** Provider (e.g., "anthropic", "openai-codex") */
+  provider?: string;
+  /** Agent capabilities */
+  capabilities: AgentCapability[];
+  /** Agent version or build info */
+  version?: string;
+  /** Freeform metadata */
+  metadata?: Record<string, unknown>;
+  /** Validated provider runtime evidence used for capability decisions. */
+  providerRuntimeManifest?: ProviderRuntimeManifest;
+  /** Current status */
+  status: 'online' | 'busy' | 'idle' | 'offline';
+  /** ISO timestamp of registration */
+  registeredAt: string;
+  /** ISO timestamp of last heartbeat */
+  lastHeartbeat: string;
+  /** Current task ID (if working on something) */
+  currentTaskId?: string;
+  /** Current task title */
+  currentTaskTitle?: string;
+  /** Session key (for OpenClaw/orchestrator integration) */
+  sessionKey?: string;
+}
+
+export interface AgentRegistration {
+  id: string;
+  name: string;
+  model?: string;
+  provider?: string;
+  capabilities?: AgentCapability[];
+  version?: string;
+  metadata?: Record<string, unknown>;
+  providerRuntimeManifest?: ProviderRuntimeManifest;
+  sessionKey?: string;
+}
+
+export interface AgentHeartbeat {
+  status?: 'online' | 'busy' | 'idle';
+  currentTaskId?: string;
+  currentTaskTitle?: string;
+  metadata?: Record<string, unknown>;
+  providerRuntimeManifest?: ProviderRuntimeManifest;
+}
+
+export interface AgentRegistryData {
+  agents: Record<string, RegisteredAgent>;
+  lastUpdated: string;
+}
+
+export interface TaskSyncUpdate {
+  agentRef: string;
+  taskId: string;
+  taskTitle?: string;
+  taskStatus: string;
+}
+
+export interface TaskSyncContext {
+  source: 'task-service' | 'task-reconciler';
+  /** Unforgeable capability token — must be obtained via createTaskSyncToken() */
+  readonly __capabilityToken?: symbol;
+}
+
+/**
+ * Module-scoped unforgeable capability symbol.
+ * Only code that imports createTaskSyncToken from this module can produce valid tokens.
+ */
+const SYNC_CAPABILITY_KEY = Symbol('agent-registry-sync-capability');
+
+/**
+ * Create an unforgeable TaskSyncContext. Only this module exports this factory,
+ * so external/untrusted code cannot construct a valid context.
+ */
+export function createTaskSyncToken(source: 'task-service' | 'task-reconciler'): TaskSyncContext {
+  return Object.freeze({ source, __capabilityToken: SYNC_CAPABILITY_KEY });
+}
+
+/**
+ * Validate that a context carries the unforgeable capability token.
+ */
+export function isValidSyncToken(context: TaskSyncContext): boolean {
+  return context.__capabilityToken === SYNC_CAPABILITY_KEY;
+}
+
+export interface TaskSyncSnapshot {
+  id: string;
+  title?: string;
+  status: string;
+  agent?: string;
+}
+
+// ─── Configuration ───────────────────────────────────────────────
+
+/** How long before an agent is considered offline (no heartbeat) */
+export const AGENT_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+export function registeredAgentIsLive(agent: RegisteredAgent, now = Date.now()): boolean {
+  if (agent.status === 'offline') return false;
+  const lastHeartbeat = Date.parse(agent.lastHeartbeat);
+  return Number.isFinite(lastHeartbeat) && now - lastHeartbeat <= AGENT_HEARTBEAT_TIMEOUT_MS;
+}
+
+/** How often to check for stale agents */
+const STALE_CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
+
+/** Prevent rapid busy<->idle oscillation on quick status churn */
+const DEFAULT_TASK_SYNC_FLAP_GUARD_MS = 10 * 1000; // 10 seconds
+
+function getTaskSyncFlapGuardMs(): number {
+  const raw = process.env.VERITAS_TASK_SYNC_FLAP_GUARD_MS;
+  if (!raw) return DEFAULT_TASK_SYNC_FLAP_GUARD_MS;
+
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    log.warn(
+      { value: raw, env: 'VERITAS_TASK_SYNC_FLAP_GUARD_MS' },
+      'Invalid flap guard override; using default'
+    );
+    return DEFAULT_TASK_SYNC_FLAP_GUARD_MS;
+  }
+
+  return parsed;
+}
+
+/** Defensive cap to avoid pathological reconciliation payload sizes */
+const MAX_RECONCILE_BATCH = 10_000;
+
+/** Basic ref validation for task-agent sync paths */
+const AGENT_REF_REGEX = /^[a-zA-Z0-9._: -]{1,100}$/;
+
+// ─── Service ─────────────────────────────────────────────────────
+
+class AgentRegistryService {
+  private agents: Map<string, RegisteredAgent> = new Map();
+  private dataDir: string;
+  private filePath: string;
+  private legacyFilePaths: string[];
+  private staleCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private lastBusyAtByAgent: Map<string, number> = new Map();
+  private taskSyncFlapGuardMs: number;
+
+  // ── Debounced-persist state (issue #783) ──────────────────────────────────
+  /** Timer handle for the coalesced write; cleared on flush/dispose. */
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Promise chain that all async writes are serialized through.
+   * New writes are appended to this chain so overlapping writes never
+   * race over the same *.tmp path (fixes cross-write race noted in code review).
+   */
+  private persistChain: Promise<void> = Promise.resolve();
+  /** Debounce window: heartbeats within this window share a single write. */
+  private static readonly PERSIST_DEBOUNCE_MS = 2_000;
+
+  constructor() {
+    this.dataDir = getRuntimeDir();
+    this.filePath = path.join(this.dataDir, 'agent-registry.json');
+    this.legacyFilePaths = getLegacyRuntimeDirs().map((dir) =>
+      path.join(dir, 'agent-registry.json')
+    );
+    this.taskSyncFlapGuardMs = getTaskSyncFlapGuardMs();
+    this.migrateLegacyRegistry();
+    this.load();
+    this.startStaleCheck();
+  }
+
+  /**
+   * Register or update an agent in the registry.
+   */
+  register(registration: AgentRegistration): RegisteredAgent {
+    const existing = this.agents.get(registration.id);
+    const now = new Date().toISOString();
+    const runtimeIdentityChanged = existing
+      ? registrationChangesRuntimeIdentity(registration, existing)
+      : false;
+
+    const agent: RegisteredAgent = {
+      id: registration.id,
+      name: registration.name,
+      model: registration.model ?? existing?.model,
+      provider: registration.provider ?? existing?.provider,
+      capabilities: registration.capabilities ?? existing?.capabilities ?? [],
+      version: registration.version ?? existing?.version,
+      metadata: registration.metadata ?? existing?.metadata,
+      providerRuntimeManifest:
+        registration.providerRuntimeManifest !== undefined
+          ? immutableManifest(parseProviderRuntimeManifest(registration.providerRuntimeManifest))
+          : runtimeIdentityChanged
+            ? undefined
+            : existing?.providerRuntimeManifest,
+      sessionKey: registration.sessionKey ?? existing?.sessionKey,
+      status: 'online',
+      registeredAt: existing?.registeredAt ?? now,
+      lastHeartbeat: now,
+      currentTaskId: existing?.currentTaskId,
+      currentTaskTitle: existing?.currentTaskTitle,
+    };
+
+    this.agents.set(registration.id, agent);
+    this.persist();
+
+    log.info(
+      { agentId: agent.id, model: agent.model, capabilities: agent.capabilities.length },
+      `Agent registered: ${agent.name}`
+    );
+
+    return agent;
+  }
+
+  /**
+   * Process a heartbeat from an agent.
+   */
+  heartbeat(agentId: string, update?: AgentHeartbeat): RegisteredAgent | null {
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      return null;
+    }
+
+    agent.lastHeartbeat = new Date().toISOString();
+    if (update?.status) agent.status = update.status;
+    if (update?.currentTaskId !== undefined)
+      agent.currentTaskId = update.currentTaskId || undefined;
+    if (update?.currentTaskTitle !== undefined)
+      agent.currentTaskTitle = update.currentTaskTitle || undefined;
+    if (update?.metadata) agent.metadata = { ...agent.metadata, ...update.metadata };
+    if (update?.providerRuntimeManifest !== undefined) {
+      agent.providerRuntimeManifest = immutableManifest(
+        parseProviderRuntimeManifest(update.providerRuntimeManifest)
+      );
+    }
+
+    this.agents.set(agentId, agent);
+    this.persist();
+
+    return agent;
+  }
+
+  /**
+   * Apply task lifecycle state to agent registry state.
+   *
+   * Precedence contract:
+   * - Task transition to in-progress is authoritative for busy + currentTask assignment.
+   * - Terminal transitions (todo/blocked/done/cancelled) move agent to idle + clear task,
+   *   but only when the agent is still attached to the same task (prevents clobbering
+   *   if agent moved on to a different task).
+   */
+  syncFromTask(update: TaskSyncUpdate, context: TaskSyncContext): RegisteredAgent | null {
+    if (!this.isAuthorizedSyncContext(context)) {
+      throw new Error('Unauthorized task sync context');
+    }
+
+    if (!this.isValidAgentRef(update.agentRef)) {
+      log.warn({ agentRef: update.agentRef }, 'Rejected malformed agentRef in syncFromTask');
+      return null;
+    }
+
+    const agent = this.findByRef(update.agentRef);
+    if (!agent) return null;
+
+    const previousStatus = agent.status;
+    const previousTaskId = agent.currentTaskId;
+
+    if (update.taskStatus === 'in-progress') {
+      agent.status = 'busy';
+      agent.currentTaskId = update.taskId;
+      agent.currentTaskTitle = update.taskTitle;
+      this.lastBusyAtByAgent.set(agent.id, Date.now());
+    } else {
+      // Only clear if registry still points to this task (avoid stale overwrites)
+      if (agent.currentTaskId && agent.currentTaskId !== update.taskId) {
+        return agent;
+      }
+
+      // Flap guard: ignore immediate busy->idle transitions for same task
+      const lastBusyAt = this.lastBusyAtByAgent.get(agent.id);
+      if (lastBusyAt && Date.now() - lastBusyAt < this.taskSyncFlapGuardMs) {
+        return agent;
+      }
+
+      agent.status = 'idle';
+      agent.currentTaskId = undefined;
+      agent.currentTaskTitle = undefined;
+    }
+
+    const changed = previousStatus !== agent.status || previousTaskId !== agent.currentTaskId;
+    if (changed) {
+      this.agents.set(agent.id, agent);
+      this.persist();
+    }
+
+    return agent;
+  }
+
+  /**
+   * Reconcile registry status from the current task snapshot.
+   *
+   * Drift correction:
+   * - If an agent has an in-progress task assigned, force busy + task linkage.
+   * - If an agent is busy on a task that is now terminal, clear it (subject to flap guard).
+   */
+  reconcileFromTasks(tasks: TaskSyncSnapshot[], context: TaskSyncContext): number {
+    if (!this.isAuthorizedSyncContext(context)) {
+      throw new Error('Unauthorized task reconcile context');
+    }
+
+    if (tasks.length > MAX_RECONCILE_BATCH) {
+      throw new Error(`Reconciliation batch too large: ${tasks.length} > ${MAX_RECONCILE_BATCH}`);
+    }
+
+    const byAgentRef = new Map<string, TaskSyncSnapshot>();
+
+    for (const task of tasks) {
+      if (!task.agent) continue;
+      if (!this.isValidAgentRef(task.agent)) {
+        log.warn(
+          { agentRef: task.agent, taskId: task.id },
+          'Skipping malformed agentRef in reconcileFromTasks'
+        );
+        continue;
+      }
+      const key = task.agent.trim().toLowerCase();
+      const existing = byAgentRef.get(key);
+
+      // Authoritative precedence: in-progress wins
+      if (!existing || task.status === 'in-progress') {
+        byAgentRef.set(key, task);
+      }
+    }
+
+    let changed = 0;
+
+    for (const agent of this.agents.values()) {
+      const mapped =
+        byAgentRef.get(agent.id.trim().toLowerCase()) ??
+        byAgentRef.get(agent.name.trim().toLowerCase());
+
+      if (mapped?.status === 'in-progress') {
+        const prevStatus = agent.status;
+        const prevTaskId = agent.currentTaskId;
+        const updated = this.syncFromTask(
+          {
+            agentRef: agent.id,
+            taskId: mapped.id,
+            taskTitle: mapped.title,
+            taskStatus: 'in-progress',
+          },
+          context
+        );
+        if (updated && (updated.currentTaskId !== prevTaskId || updated.status !== prevStatus)) {
+          changed++;
+        }
+        continue;
+      }
+
+      if (agent.status === 'busy' && agent.currentTaskId) {
+        const task = tasks.find((t) => t.id === agent.currentTaskId);
+        if (task && task.status !== 'in-progress') {
+          const prevStatus = agent.status;
+          const prevTaskId = agent.currentTaskId;
+          const updated = this.syncFromTask(
+            {
+              agentRef: agent.id,
+              taskId: task.id,
+              taskStatus: task.status,
+            },
+            context
+          );
+          if (updated && (updated.status !== prevStatus || updated.currentTaskId !== prevTaskId)) {
+            changed++;
+          }
+        }
+      }
+    }
+
+    return changed;
+  }
+
+  /**
+   * Deregister an agent.
+   */
+  deregister(agentId: string): boolean {
+    const existed = this.agents.delete(agentId);
+    this.lastBusyAtByAgent.delete(agentId);
+    if (existed) {
+      this.persist();
+      log.info({ agentId }, 'Agent deregistered');
+    }
+    return existed;
+  }
+
+  /**
+   * Get a specific agent by ID.
+   */
+  get(agentId: string): RegisteredAgent | null {
+    return this.agents.get(agentId) ?? null;
+  }
+
+  /**
+   * List all registered agents, optionally filtered.
+   */
+  list(filters?: { status?: string; capability?: string }): RegisteredAgent[] {
+    let agents = Array.from(this.agents.values());
+
+    if (filters?.status) {
+      agents = agents.filter((a) => a.status === filters.status);
+    }
+
+    if (filters?.capability) {
+      const cap = filters.capability.toLowerCase();
+      agents = agents.filter((a) => a.capabilities.some((c) => c.name.toLowerCase() === cap));
+    }
+
+    return agents;
+  }
+
+  /**
+   * Find agents that have a specific capability.
+   */
+  findByCapability(capability: string): RegisteredAgent[] {
+    const cap = capability.toLowerCase();
+    return Array.from(this.agents.values()).filter(
+      (a) => a.status !== 'offline' && a.capabilities.some((c) => c.name.toLowerCase() === cap)
+    );
+  }
+
+  /**
+   * Get registry statistics.
+   */
+  stats(): {
+    total: number;
+    online: number;
+    busy: number;
+    idle: number;
+    offline: number;
+    capabilities: string[];
+  } {
+    const agents = Array.from(this.agents.values());
+    const allCaps = new Set<string>();
+    for (const agent of agents) {
+      for (const cap of agent.capabilities) {
+        allCaps.add(cap.name);
+      }
+    }
+
+    return {
+      total: agents.length,
+      online: agents.filter((a) => a.status === 'online').length,
+      busy: agents.filter((a) => a.status === 'busy').length,
+      idle: agents.filter((a) => a.status === 'idle').length,
+      offline: agents.filter((a) => a.status === 'offline').length,
+      capabilities: Array.from(allCaps).sort(),
+    };
+  }
+
+  private isAuthorizedSyncContext(context: TaskSyncContext): boolean {
+    // Primary check: unforgeable capability token (new secure path)
+    if (isValidSyncToken(context)) return true;
+    // Reject: string-only contexts are no longer accepted
+    return false;
+  }
+
+  private isValidAgentRef(agentRef: string): boolean {
+    const normalized = agentRef.trim();
+    return AGENT_REF_REGEX.test(normalized);
+  }
+
+  /**
+   * Validate that an agent ref exists in the registry.
+   * Used by task-service to reject invalid agent assignments on create/update.
+   * Returns true if the ref matches a registered agent (by id or name).
+   */
+  validateAgentRef(agentRef: string): { valid: boolean; reason?: string } {
+    if (!agentRef) return { valid: true }; // no agent assigned is fine
+
+    if (!this.isValidAgentRef(agentRef)) {
+      return { valid: false, reason: `Malformed agent ref: ${agentRef}` };
+    }
+
+    const agent = this.findByRef(agentRef);
+    if (!agent) {
+      return { valid: false, reason: `Unknown agent ref: ${agentRef} — not found in registry` };
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Resolve an agent by id first, then by case-insensitive name.
+   */
+  private findByRef(agentRef: string): RegisteredAgent | null {
+    const byId = this.agents.get(agentRef);
+    if (byId) return byId;
+
+    const normalized = agentRef.trim().toLowerCase();
+    for (const agent of this.agents.values()) {
+      if (agent.name.trim().toLowerCase() === normalized) {
+        return agent;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Mark stale agents as offline.
+   */
+  private checkStaleAgents(): void {
+    const now = Date.now();
+    let changed = false;
+
+    for (const agent of this.agents.values()) {
+      if (agent.status === 'offline') continue;
+
+      if (!registeredAgentIsLive(agent, now)) {
+        agent.status = 'offline';
+        changed = true;
+        log.info(
+          { agentId: agent.id, lastHeartbeat: agent.lastHeartbeat },
+          `Agent marked offline (heartbeat timeout): ${agent.id}`
+        );
+      }
+    }
+
+    if (changed) {
+      this.persist();
+    }
+  }
+
+  private startStaleCheck(): void {
+    this.staleCheckInterval = setInterval(() => this.checkStaleAgents(), STALE_CHECK_INTERVAL_MS);
+  }
+
+  private migrateLegacyRegistry(): void {
+    for (const legacyFilePath of this.legacyFilePaths) {
+      if (!existsSync(legacyFilePath) || existsSync(this.filePath)) continue;
+      try {
+        const dir = path.dirname(this.filePath);
+        if (!existsSync(dir)) {
+          mkdirSync(dir, { recursive: true });
+        }
+
+        const data = readFileSync(legacyFilePath, 'utf-8');
+        writeFileSync(this.filePath, data, 'utf-8');
+        log.info(
+          { from: legacyFilePath, to: this.filePath },
+          'Migrated agent registry data to the runtime directory'
+        );
+      } catch (err) {
+        log.warn({ err }, 'Failed to migrate legacy agent registry data');
+      }
+    }
+  }
+
+  /**
+   * Load registry from disk.
+   */
+  private load(): void {
+    try {
+      if (existsSync(this.filePath)) {
+        const raw = readFileSync(this.filePath, 'utf-8');
+        const data = JSON.parse(raw) as AgentRegistryData;
+        if (data.agents) {
+          for (const [id, agent] of Object.entries(data.agents)) {
+            const parsedManifest = agent.providerRuntimeManifest
+              ? safePersistedManifest(agent.providerRuntimeManifest, id)
+              : undefined;
+            this.agents.set(id, {
+              ...agent,
+              providerRuntimeManifest: parsedManifest,
+            });
+          }
+          log.info({ count: this.agents.size }, 'Agent registry loaded from disk');
+        }
+      }
+    } catch (err) {
+      log.warn({ err }, 'Could not load agent registry, starting fresh');
+    }
+  }
+
+  /**
+   * Schedule a coalesced async persist within PERSIST_DEBOUNCE_MS.
+   * Multiple calls within the window share a single write (issue #783).
+   */
+  private persist(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+    }
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.enqueueWrite();
+    }, AgentRegistryService.PERSIST_DEBOUNCE_MS);
+  }
+
+  /**
+   * Append one write to the serialized promise chain.
+   * All writes go through this chain, so concurrent writes never race
+   * over the same *.tmp path.
+   */
+  private enqueueWrite(): void {
+    this.persistChain = this.persistChain
+      .then(() => this.writeToDisk())
+      .catch((err) => {
+        log.warn({ err }, 'Failed to persist agent registry (chain)');
+      });
+  }
+
+  /**
+   * Flush any pending write immediately (call during shutdown).
+   * Awaitable so callers can ensure durability before process exit.
+   */
+  async flushPersist(): Promise<void> {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+      this.enqueueWrite();
+    }
+    await this.persistChain;
+  }
+
+  /**
+   * Atomically write the registry to disk (write tmp → rename).
+   * Does not block the event loop.
+   */
+  private async writeToDisk(): Promise<void> {
+    try {
+      const dir = path.dirname(this.filePath);
+      await mkdir(dir, { recursive: true });
+
+      const data: AgentRegistryData = {
+        agents: Object.fromEntries(this.agents),
+        lastUpdated: new Date().toISOString(),
+      };
+
+      const tmp = `${this.filePath}.tmp`;
+      await writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8');
+      await rename(tmp, this.filePath);
+    } catch (err) {
+      log.warn({ err }, 'Failed to persist agent registry');
+    }
+  }
+
+  /**
+   * Clean up resources. Awaits the full write chain before returning.
+   */
+  async dispose(): Promise<void> {
+    if (this.staleCheckInterval) {
+      clearInterval(this.staleCheckInterval);
+      this.staleCheckInterval = null;
+    }
+    await this.flushPersist();
+  }
+}
+
+function safePersistedManifest(
+  manifest: unknown,
+  agentId: string
+): ProviderRuntimeManifest | undefined {
+  try {
+    return immutableManifest(parseProviderRuntimeManifest(manifest));
+  } catch (error) {
+    log.warn(
+      { agentId, error },
+      'Ignored invalid persisted provider runtime manifest; capability routing will fail closed'
+    );
+    return undefined;
+  }
+}
+
+function registrationChangesRuntimeIdentity(
+  registration: AgentRegistration,
+  existing: RegisteredAgent
+): boolean {
+  return (
+    suppliedValueChanged(registration.provider, existing.provider, true) ||
+    suppliedValueChanged(registration.model, existing.model, true) ||
+    suppliedValueChanged(registration.version, existing.version, false)
+  );
+}
+
+function suppliedValueChanged(
+  next: string | undefined,
+  current: string | undefined,
+  caseInsensitive: boolean
+): boolean {
+  if (next === undefined) return false;
+  const normalizedNext = next.trim();
+  const normalizedCurrent = current?.trim() ?? '';
+  return caseInsensitive
+    ? normalizedNext.toLowerCase() !== normalizedCurrent.toLowerCase()
+    : normalizedNext !== normalizedCurrent;
+}
+
+function immutableManifest(manifest: ProviderRuntimeManifest): ProviderRuntimeManifest {
+  return deepFreeze(structuredClone(manifest));
+}
+
+function deepFreeze<T>(value: T): T {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  return value;
+}
+
+// Singleton
+let instance: AgentRegistryService | null = null;
+
+export function getAgentRegistryService(): AgentRegistryService {
+  if (!instance) {
+    instance = new AgentRegistryService();
+  }
+  return instance;
+}
+
+export async function disposeAgentRegistryService(): Promise<void> {
+  if (instance) {
+    await instance.dispose();
+    instance = null;
+  }
+}

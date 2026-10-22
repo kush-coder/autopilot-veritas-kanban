@@ -1,0 +1,270 @@
+// Telemetry Types
+
+import type { TaskStatus, AgentType } from './task.types.js';
+import type { HarnessSupportFailureClass, HarnessSupportTier } from './provider-runtime.types.js';
+import type { AdmissionLaunchSource } from './admission-control.types.js';
+import type { ExecutionTreeBreakerEvidence } from './execution-tree-budget.types.js';
+import type { ExecutableAgentProvider } from './config.types.js';
+import type { RunEgressDecisionReason, RunEgressProtocol } from './sandbox-policy.types.js';
+import type { DependencyCircuitState } from './dependency-circuit.types.js';
+
+export type TelemetryEventType =
+  | 'task.created'
+  | 'task.status_changed'
+  | 'task.archived'
+  | 'task.restored'
+  | 'run.started'
+  | 'run.completed'
+  | 'run.error'
+  | 'run.tokens'
+  | 'network.egress'
+  | 'admission.tree_control';
+
+/** Base telemetry event - all events extend this */
+export interface TelemetryEvent {
+  id: string;
+  type: TelemetryEventType;
+  timestamp: string;
+  taskId?: string;
+  project?: string;
+}
+
+/** Task lifecycle events */
+export interface TaskTelemetryEvent extends TelemetryEvent {
+  type: 'task.created' | 'task.status_changed' | 'task.archived' | 'task.restored';
+  taskId: string;
+  status?: TaskStatus;
+  previousStatus?: TaskStatus;
+  operationId?: string;
+}
+
+/** Agent run started event */
+export interface RunStartedEvent extends TelemetryEvent {
+  type: 'run.started';
+  taskId: string;
+  agent: string;
+  model?: string;
+  sessionKey?: string;
+  attemptId?: string;
+  admissionSource?: AdmissionLaunchSource;
+  admissionOutcome?: 'admitted' | 'queued-dispatch';
+  harnessSupport?: HarnessSupportTelemetry;
+  dependencyCircuits?: DependencyCircuitTelemetry;
+}
+
+/** Agent run completed event */
+export interface RunCompletedEvent extends TelemetryEvent {
+  type: 'run.completed';
+  taskId: string;
+  agent: string;
+  success: boolean;
+  durationMs?: number;
+  error?: string;
+  exitCode?: number;
+  attemptId?: string;
+  harnessSupport?: HarnessSupportTelemetry;
+  dependencyCircuits?: DependencyCircuitTelemetry;
+}
+
+export interface DependencyCircuitTelemetry {
+  provider: DependencyCircuitState;
+  agentHost: DependencyCircuitState;
+  openCount: number;
+  halfOpenCount: number;
+}
+
+/** Agent run error event */
+export interface RunErrorEvent extends TelemetryEvent {
+  type: 'run.error';
+  taskId: string;
+  agent: string;
+  error: string;
+  stackTrace?: string;
+  attemptId?: string;
+  harnessSupport?: HarnessSupportTelemetry;
+  dependencyCircuits?: DependencyCircuitTelemetry;
+}
+
+export interface HarnessSupportTelemetry {
+  profileId: string;
+  compatibilityDigest?: string;
+  adapterId?: string;
+  providerVersion?: string;
+  providerBuild?: string;
+  manifestDigest?: string;
+  supportTier: HarnessSupportTier;
+  failureClass: HarnessSupportFailureClass;
+}
+
+/** Legacy combined run event (for backward compatibility) */
+export interface RunTelemetryEvent extends TelemetryEvent {
+  type: 'run.started' | 'run.completed' | 'run.error';
+  taskId: string;
+  attemptId?: string;
+  agent: string;
+  durationMs?: number;
+  exitCode?: number;
+  success?: boolean;
+  error?: string;
+  model?: string;
+  sessionKey?: string;
+  stackTrace?: string;
+  admissionSource?: AdmissionLaunchSource;
+  admissionOutcome?: 'admitted' | 'queued-dispatch';
+  harnessSupport?: HarnessSupportTelemetry;
+  dependencyCircuits?: DependencyCircuitTelemetry;
+}
+
+/** Token usage events */
+export interface TokenTelemetryEvent extends TelemetryEvent {
+  type: 'run.tokens';
+  taskId: string;
+  agent: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens?: number;
+  totalTokens?: number;
+  cost?: number;
+  model?: string;
+  attemptId?: string;
+}
+
+export interface AdmissionTreeControlTelemetryEvent extends TelemetryEvent {
+  type: 'admission.tree_control';
+  action: 'paused' | 'resumed' | 'cancelled';
+  trigger: 'operator' | 'fan-out-breaker';
+  rootObjectiveKey: string;
+  signals: string[];
+  observed?: ExecutionTreeBreakerEvidence['observed'];
+  queueEntriesCancelled?: number;
+  interruptedAttempts?: number;
+  unresolvedAttempts?: number;
+}
+
+/** Metadata-only run-scoped network policy decision. */
+export interface NetworkEgressTelemetryEvent extends TelemetryEvent {
+  type: 'network.egress';
+  taskId: string;
+  attemptId: string;
+  agent: string;
+  provider: ExecutableAgentProvider;
+  gatewayId: string;
+  runKey: string;
+  policyHash: string;
+  protocol: RunEgressProtocol;
+  hostKey: string;
+  port: number;
+  method?: string;
+  decision: 'allow' | 'block';
+  reason: RunEgressDecisionReason;
+  policyReason?: RunEgressDecisionReason;
+  blockedAddressClass?: 'private' | 'loopback' | 'link-local' | 'metadata';
+  approvalEligible: boolean;
+  approvalId?: string;
+}
+
+/** Union type for all telemetry events */
+export type AnyTelemetryEvent =
+  | TaskTelemetryEvent
+  | RunTelemetryEvent
+  | RunStartedEvent
+  | RunCompletedEvent
+  | RunErrorEvent
+  | TokenTelemetryEvent
+  | NetworkEgressTelemetryEvent
+  | AdmissionTreeControlTelemetryEvent;
+
+/** Telemetry configuration */
+export interface TelemetryConfig {
+  enabled: boolean;
+  retention: number; // Days to retain events
+  traces?: boolean; // Optional trace collection (future)
+}
+
+/** Low-level trace step types captured during an agent attempt. */
+export type AgentRunTraceStepType =
+  'init' | 'execute' | 'stream' | 'retry' | 'abort' | 'finalize' | 'complete' | 'error';
+
+/** Additional run context persisted with each trace for replay/audit surfaces. */
+export interface AgentRunTraceMetadata {
+  clientSource?: string;
+  mode?: string | null;
+  capabilitySet?: string[];
+  workspaceId?: string;
+  sessionKey?: string;
+  runKey?: string;
+  policyProfile?: string;
+  provider?: string;
+  model?: string;
+  taskType?: string;
+  repo?: string;
+  branch?: string;
+  baseBranch?: string;
+  worktreePath?: string;
+  providerRuntimeManifest?: import('./provider-runtime.types.js').ProviderRuntimeManifest;
+}
+
+/** A single sequenced step inside an agent run trace. */
+export interface AgentRunTraceStep {
+  type: AgentRunTraceStepType;
+  sequence?: number;
+  startedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  metadata?: Record<string, unknown>;
+}
+
+/** Stored or active trace for one agent attempt. */
+export interface AgentRunTrace {
+  traceId: string; // Same as attemptId
+  taskId: string;
+  agent: AgentType;
+  project?: string;
+  startedAt: string;
+  endedAt?: string;
+  totalDurationMs?: number;
+  steps: AgentRunTraceStep[];
+  status: 'running' | 'completed' | 'failed' | 'error';
+  metadata?: AgentRunTraceMetadata;
+}
+
+/** Timeline event categories exposed to the task run replay UI. */
+export type AgentRunTimelineEventType =
+  'prompt' | 'command' | 'file' | 'policy' | 'approval' | 'error' | 'usage' | 'tool' | 'result';
+
+export type AgentRunTimelineEventSource = 'live' | 'stored' | 'derived';
+
+export interface AgentRunTimelineEvent {
+  id: string;
+  sequence: number;
+  type: AgentRunTimelineEventType;
+  source: AgentRunTimelineEventSource;
+  timestamp: string;
+  title: string;
+  detail?: string;
+  durationMs?: number;
+  metadata?: Record<string, unknown>;
+  link?: {
+    label: string;
+    href: string;
+    target?:
+      | 'agent'
+      | 'artifact-preview'
+      | 'changes'
+      | 'details'
+      | 'review'
+      | 'work-products'
+      | 'workflow'
+      | 'external';
+  };
+}
+
+/** Query options for fetching events */
+export interface TelemetryQueryOptions {
+  type?: TelemetryEventType | TelemetryEventType[];
+  since?: string; // ISO timestamp
+  until?: string; // ISO timestamp
+  taskId?: string;
+  project?: string;
+  limit?: number;
+}

@@ -1,0 +1,675 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+import { GitSection } from '@/components/task/GitSection';
+import { RunModeGateSection } from '@/components/task/RunModeGateSection';
+import { RunWorkflowPanel } from '@/components/task/RunWorkflowPanel';
+import { WorkflowSection } from '@/components/task/WorkflowSection';
+import { WorktreeStatus } from '@/components/task/git/WorktreeStatus';
+import { createMockTask, renderWithProviders } from './test-utils';
+
+const mocks = vi.hoisted(() => ({
+  useConfig: vi.fn(),
+  useRepoBranches: vi.fn(),
+  hasPermission: vi.fn(),
+  useWorktreeStatus: vi.fn(),
+  useGitHubStatus: vi.fn(),
+  useConflictStatus: vi.fn(),
+  createWorktreeMutate: vi.fn(),
+  adoptWorktreeMutate: vi.fn(),
+  deleteWorktreeMutate: vi.fn(),
+  rebaseWorktreeMutate: vi.fn(),
+  mergeWorktreeMutate: vi.fn(),
+  createPRMutateAsync: vi.fn(),
+  toast: vi.fn(),
+  useActiveRuns: vi.fn(),
+  useRecentRuns: vi.fn(),
+}));
+
+vi.mock('@/hooks/useConfig', () => ({
+  useConfig: mocks.useConfig,
+  useRepoBranches: mocks.useRepoBranches,
+}));
+
+vi.mock('@/hooks/useIdentity', () => ({
+  useIdentity: () => ({
+    hasPermission: mocks.hasPermission,
+  }),
+}));
+
+vi.mock('@/hooks/useWorktree', () => ({
+  useWorktreeStatus: mocks.useWorktreeStatus,
+  useCreateWorktree: () => ({
+    mutate: mocks.createWorktreeMutate,
+    isPending: false,
+    error: null,
+  }),
+  useAdoptWorktree: () => ({
+    mutate: mocks.adoptWorktreeMutate,
+    isPending: false,
+    error: null,
+  }),
+  useDeleteWorktree: () => ({
+    mutateAsync: mocks.deleteWorktreeMutate,
+    isPending: false,
+  }),
+  useRebaseWorktree: () => ({
+    mutate: mocks.rebaseWorktreeMutate,
+    isPending: false,
+  }),
+  useMergeWorktree: () => ({
+    mutateAsync: mocks.mergeWorktreeMutate,
+    isPending: false,
+  }),
+}));
+
+vi.mock('@/hooks/useGitHub', () => ({
+  useGitHubStatus: mocks.useGitHubStatus,
+  useCreatePR: () => ({
+    mutateAsync: mocks.createPRMutateAsync,
+    isPending: false,
+    error: null,
+  }),
+}));
+
+vi.mock('@/hooks/useConflicts', () => ({
+  useConflictStatus: mocks.useConflictStatus,
+}));
+
+vi.mock('@/hooks/useToast', () => ({
+  useToast: () => ({ toast: mocks.toast }),
+}));
+
+vi.mock('@/hooks/useWorkflowStats', () => ({
+  useActiveRuns: mocks.useActiveRuns,
+  useRecentRuns: mocks.useRecentRuns,
+}));
+
+vi.mock('@/components/task/ConflictResolver', () => ({
+  ConflictResolver: ({ open }: { open: boolean }) => (open ? <div>Conflict resolver</div> : null),
+}));
+
+function createJsonResponse(data: unknown, ok = true) {
+  return {
+    ok,
+    status: ok ? 200 : 500,
+    json: vi.fn().mockResolvedValue({ data }),
+    text: vi.fn().mockResolvedValue(ok ? '' : 'Request failed'),
+  };
+}
+
+describe('task detail Git and workflow Mantine migration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.history.replaceState({}, '', '/');
+    window.HTMLElement.prototype.scrollIntoView = vi.fn();
+    mocks.useConfig.mockReturnValue({
+      data: {
+        repos: [
+          {
+            name: 'veritas',
+            path: '/repo/veritas',
+            defaultBranch: 'main',
+          },
+        ],
+      },
+      isLoading: false,
+    });
+    mocks.useRepoBranches.mockReturnValue({ data: ['main', 'develop'], isLoading: false });
+    mocks.hasPermission.mockReturnValue(true);
+    mocks.useWorktreeStatus.mockReturnValue({
+      data: {
+        path: '/tmp/veritas-worktree',
+        branch: 'feature/mantine-git',
+        baseBranch: 'main',
+        baseCommit: 'a'.repeat(40),
+        baseSource: 'remote',
+        manifestId: 'worktree-mantine',
+        remoteState: { stale: false, fetchedAt: '2026-07-23T20:00:00.000Z' },
+        aheadBehind: { ahead: 2, behind: 1 },
+        hasChanges: false,
+        changedFiles: 0,
+        cleanupPreview: {
+          eligible: false,
+          requiresOverride: true,
+          blockedReasons: [
+            {
+              code: 'unmerged',
+              message: 'The worktree HEAD is not merged into the remote base.',
+              overrideable: true,
+            },
+          ],
+        },
+      },
+      isLoading: false,
+      error: null,
+    });
+    mocks.useGitHubStatus.mockReturnValue({ data: { authenticated: true } });
+    mocks.useConflictStatus.mockReturnValue({
+      data: { hasConflicts: false, conflictingFiles: [], rebaseInProgress: false },
+    });
+    mocks.createPRMutateAsync.mockResolvedValue({ url: 'https://github.com/example/pr/1' });
+    mocks.useActiveRuns.mockReturnValue({ data: [] });
+    mocks.useRecentRuns.mockReturnValue({ data: [] });
+    vi.stubGlobal('open', vi.fn());
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('renders Git selection through direct Mantine controls and keeps task Git updates wired', async () => {
+    const user = userEvent.setup();
+    const onGitChange = vi.fn();
+    const task = createMockTask({
+      id: 'task-git-selection',
+      title: 'Migrate Git controls',
+      git: {
+        repo: 'veritas',
+        baseBranch: 'main',
+        branch: 'feature/mantine-git',
+      },
+    });
+
+    const { baseElement, container } = renderWithProviders(
+      <GitSection task={task} onGitChange={onGitChange} />
+    );
+
+    expect(container.querySelector('.mantine-Select-root')).toBeDefined();
+    expect(container.querySelector('.mantine-TextInput-root')).toBeDefined();
+    expect(container.querySelector('.mantine-Button-root')).toBeDefined();
+    expect(baseElement.querySelector('[data-slot="select-trigger"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="input"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="button"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="label"]')).toBeNull();
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Feature Branch' }), {
+      target: { value: 'feature/updated-git-controls' },
+    });
+    await user.click(screen.getByRole('button', { name: 'Clear' }));
+
+    expect(onGitChange).toHaveBeenCalledWith({
+      repo: 'veritas',
+      baseBranch: 'main',
+      branch: 'feature/updated-git-controls',
+    });
+    expect(onGitChange).toHaveBeenCalledWith(undefined);
+  });
+
+  it('renders worktree status and PR creation through direct Mantine buttons and modals', async () => {
+    const user = userEvent.setup();
+    const task = createMockTask({
+      id: 'task-worktree',
+      git: {
+        repo: 'veritas',
+        baseBranch: 'main',
+        branch: 'feature/mantine-git',
+        worktreePath: '/tmp/veritas-worktree',
+        worktreeManifestId: 'worktree-mantine',
+        worktreeLeaseId: 'lease-mantine',
+      },
+    });
+
+    const { baseElement, container } = renderWithProviders(<WorktreeStatus task={task} />);
+
+    expect(screen.getByText('Worktree active')).toBeDefined();
+    expect(container.querySelector('.mantine-Badge-root')).toBeDefined();
+    expect(container.querySelector('.mantine-Button-root')).toBeDefined();
+    expect(container.querySelector('.mantine-Code-root')).toBeDefined();
+    expect(screen.getByText(/Base a{12} from remote; manifest worktree-mantine/)).toBeDefined();
+    expect(baseElement.querySelector('[data-slot="alert-dialog-content"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="button"]')).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Create PR' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Create Pull Request' });
+    expect(baseElement.querySelector('.mantine-Modal-content')).toBeDefined();
+    expect(baseElement.querySelector('[data-slot="dialog-content"]')).toBeNull();
+
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Title' }), {
+      target: { value: 'Migrate Git controls' },
+    });
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Description' }), {
+      target: { value: 'Direct Mantine controls for Git workflow.' },
+    });
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Create as draft PR' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Create PR' }));
+
+    expect(mocks.createPRMutateAsync).toHaveBeenCalledWith({
+      taskId: 'task-worktree',
+      title: 'Migrate Git controls',
+      body: 'Direct Mantine controls for Git workflow.',
+      draft: true,
+    });
+    expect(window.open).toHaveBeenCalledWith(
+      'https://github.com/example/pr/1',
+      '_blank',
+      'noopener,noreferrer'
+    );
+  });
+
+  it('requires an explicit reason before overriding cleanup hazards', async () => {
+    const user = userEvent.setup();
+    const task = createMockTask({
+      id: 'task-cleanup',
+      git: {
+        repo: 'veritas',
+        baseBranch: 'main',
+        branch: 'feature/mantine-git',
+        worktreePath: '/tmp/veritas-worktree',
+        worktreeManifestId: 'worktree-mantine',
+        worktreeLeaseId: 'lease-mantine',
+      },
+    });
+
+    renderWithProviders(<WorktreeStatus task={task} />);
+    await user.click(screen.getByRole('button', { name: 'Delete Worktree' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Delete worktree?' });
+    const deleteButton = within(dialog).getByRole('button', { name: 'Delete' });
+
+    expect(within(dialog).getByText(/not merged into the remote base/)).toBeDefined();
+    expect((deleteButton as HTMLButtonElement).disabled).toBe(true);
+    await user.type(
+      within(dialog).getByRole('textbox', { name: 'Override reason' }),
+      'Operator reviewed and accepted the retained branch risk.'
+    );
+    await user.click(deleteButton);
+
+    expect(mocks.deleteWorktreeMutate).toHaveBeenCalledWith({
+      taskId: 'task-cleanup',
+      force: true,
+      reason: 'Operator reviewed and accepted the retained branch risk.',
+    });
+  });
+
+  it.each([
+    ['PR', 'Create PR', 'Create Pull Request', 'Create PR'],
+    ['merge', 'Merge', 'Merge to main?', 'Merge & Complete'],
+    ['cleanup', 'Delete Worktree', 'Delete worktree?', 'Delete'],
+  ])(
+    'retains %s confirmation through failure and closes only after successful retry',
+    async (kind, opener, title, submit) => {
+      const user = userEvent.setup();
+      const mutation =
+        kind === 'PR'
+          ? mocks.createPRMutateAsync
+          : kind === 'merge'
+            ? mocks.mergeWorktreeMutate
+            : mocks.deleteWorktreeMutate;
+      let rejectRequest!: (error: Error) => void;
+      mutation.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectRequest = reject;
+          })
+      );
+      renderWithProviders(
+        <WorktreeStatus
+          task={createMockTask({
+            id: 'task-pending-git',
+            git: {
+              repo: 'veritas',
+              baseBranch: 'main',
+              branch: 'feature/pending',
+              worktreePath: '/tmp/pending-fixture',
+              worktreeManifestId: 'fixture',
+            },
+          })}
+        />
+      );
+      await user.click(screen.getByRole('button', { name: opener }));
+      const dialog = await screen.findByRole('dialog', { name: title });
+      const draftLabel =
+        kind === 'PR' ? 'Description' : kind === 'cleanup' ? 'Override reason' : null;
+      if (draftLabel)
+        fireEvent.change(within(dialog).getByRole('textbox', { name: draftLabel }), {
+          target: { value: 'Retain this reviewed draft.' },
+        });
+      const submitButton = within(dialog).getByRole('button', { name: submit });
+      // Mutation mocks deliberately never report isPending: the local guard must
+      // acquire ownership synchronously rather than relying on query notification.
+      fireEvent.click(submitButton);
+      fireEvent.click(submitButton);
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Close dialog' }));
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+      expect(mutation).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole('dialog', { name: title })).toBe(dialog);
+      expect(
+        (within(dialog).getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled
+      ).toBe(true);
+      if (draftLabel)
+        expect(
+          (within(dialog).getByRole('textbox', { name: draftLabel }) as HTMLTextAreaElement)
+            .disabled
+        ).toBe(true);
+      await act(async () => rejectRequest(new Error('Fixture operation failed')));
+      expect(within(dialog).getByText('Fixture operation failed').getAttribute('role')).toBe(
+        'alert'
+      );
+      if (draftLabel)
+        expect(
+          (within(dialog).getByRole('textbox', { name: draftLabel }) as HTMLTextAreaElement).value
+        ).toBe('Retain this reviewed draft.');
+      mutation.mockResolvedValueOnce(
+        kind === 'PR' ? { url: 'https://github.com/example/pr/2' } : undefined
+      );
+      await user.click(within(dialog).getByRole('button', { name: submit }));
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: title })).toBeNull());
+      expect(mutation).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it('offers admin adoption for a pre-6.0 worktree without running status actions', async () => {
+    const user = userEvent.setup();
+    const task = createMockTask({
+      id: 'task-legacy-worktree',
+      git: {
+        repo: 'veritas',
+        baseBranch: 'main',
+        branch: 'feature/legacy',
+        worktreePath: '/tmp/legacy-worktree',
+      },
+    });
+
+    renderWithProviders(<WorktreeStatus task={task} />);
+
+    expect(screen.getByText('Legacy worktree needs adoption')).toBeDefined();
+    expect(screen.getByText(/Local changes are preserved/)).toBeDefined();
+    expect(mocks.useWorktreeStatus).toHaveBeenCalledWith('task-legacy-worktree', false);
+    await user.click(screen.getByRole('button', { name: 'Adopt existing worktree' }));
+    expect(mocks.adoptWorktreeMutate).toHaveBeenCalledWith('task-legacy-worktree');
+  });
+
+  it('renders workflow runs through direct Mantine modal controls and starts a run', async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST') {
+        return createJsonResponse({
+          id: 'run-new',
+          workflowId: 'workflow-1',
+          status: 'running',
+          startedAt: '2026-06-01T09:15:00Z',
+        });
+      }
+      if (url.endsWith('/workflows')) {
+        return createJsonResponse([
+          {
+            id: 'workflow-1',
+            name: 'Release Workflow',
+            version: 3,
+            description: 'Run release checks',
+            agents: [{ id: 'agent-1', name: 'QA' }],
+            steps: [{ id: 'step-1', name: 'Smoke' }],
+          },
+        ]);
+      }
+      if (url.includes('/workflows/launch-recommendations')) {
+        return createJsonResponse({
+          generatedAt: '2026-06-05T12:00:00.000Z',
+          context: {
+            workflowId: 'workflow-1',
+            taskId: 'task-workflow',
+            project: 'veritas-kanban',
+            taskType: 'feature',
+            cwd: '/tmp/veritas-worktree',
+            verificationGates: [],
+          },
+          recommendations: [
+            {
+              id: 'template:release',
+              kind: 'template',
+              label: 'Reviewed launch template',
+              detail: 'Active launch template matches prior successful run signals.',
+              confidence: 0.86,
+              reasonCodes: ['workflow:matched', 'source-run:matched'],
+              provenance: [{ type: 'run', id: 'run-success' }],
+              templateId: 'template-release',
+              templateStatus: 'active',
+              overrides: { templateId: 'template-release', agent: 'codex' },
+            },
+          ],
+        });
+      }
+      return createJsonResponse([
+        {
+          id: 'run-active',
+          workflowId: 'workflow-1',
+          status: 'blocked',
+          currentStep: 'Manual QA',
+          startedAt: '2026-06-01T09:00:00Z',
+        },
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const task = createMockTask({
+      id: 'task-workflow',
+      type: 'feature',
+      project: 'veritas-kanban',
+      git: {
+        repo: 'veritas',
+        baseBranch: 'main',
+        branch: 'feature/mantine-git',
+        worktreePath: '/tmp/veritas-worktree',
+      },
+    });
+    const { baseElement, container } = renderWithProviders(
+      <WorkflowSection task={task} open onOpenChange={vi.fn()} />
+    );
+
+    expect(await screen.findByText('Release Workflow')).toBeDefined();
+    expect(await screen.findByText('Reviewed launch template')).toBeDefined();
+    expect(screen.getByText('86%')).toBeDefined();
+    expect(screen.getByText('workflow:matched')).toBeDefined();
+    expect(screen.getByText('1 source')).toBeDefined();
+    expect(screen.getByText('run-active')).toBeDefined();
+    expect(container.querySelector('.mantine-Modal-content')).toBeDefined();
+    expect(container.querySelector('.mantine-Badge-root')).toBeDefined();
+    expect(container.querySelector('.mantine-Paper-root')).toBeDefined();
+    expect(baseElement.querySelector('[data-slot="dialog-content"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="badge"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="button"]')).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Start' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining(
+          '/workflows/launch-recommendations?workflowId=workflow-1&taskId=task-workflow'
+        ),
+        expect.anything()
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining('/workflows/workflow-1/runs'),
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ taskId: 'task-workflow' }),
+        })
+      );
+    });
+    expect(mocks.toast).toHaveBeenCalledWith({
+      title: 'Workflow run started',
+      description: 'Run ID: run-new',
+    });
+  });
+
+  it('normalizes omitted workflow collections instead of crashing the task action', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/workflows')) {
+        return createJsonResponse([
+          {
+            id: 'workflow-empty',
+            name: 'Empty Workflow',
+            version: 1,
+            description: 'Definition has no agents or steps yet',
+          },
+        ]);
+      }
+      if (url.includes('/workflows/launch-recommendations')) {
+        return createJsonResponse({ recommendations: [] });
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: vi.fn().mockResolvedValue({}),
+        text: vi.fn().mockResolvedValue(''),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderWithProviders(
+      <WorkflowSection
+        task={createMockTask({ id: 'task-without-workflow-run' })}
+        open
+        onOpenChange={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByText('Empty Workflow')).toBeDefined();
+    expect(screen.getByText('0 agents')).toBeDefined();
+    expect(screen.getByText('0 steps')).toBeDefined();
+    expect(screen.queryByText('This section encountered an error')).toBeNull();
+  });
+
+  it('retains workflow ownership while starting and exposes a recoverable failure', async () => {
+    let rejectStart!: (error: Error) => void;
+    const starts = vi.fn(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectStart = reject;
+        })
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, options?: RequestInit) => {
+        if (options?.method === 'POST') return starts();
+        const url = String(input);
+        return Promise.resolve(
+          createJsonResponse(
+            url.endsWith('/workflows')
+              ? [
+                  { id: 'first', name: 'First workflow', version: 1 },
+                  { id: 'second', name: 'Second workflow', version: 1 },
+                ]
+              : url.includes('launch-recommendations')
+                ? { recommendations: [] }
+                : []
+          )
+        );
+      })
+    );
+    const onOpenChange = vi.fn();
+    const task = createMockTask({ id: 'task-pending-workflow' });
+    renderWithProviders(<WorkflowSection task={task} open onOpenChange={onOpenChange} />);
+    const buttons = await screen.findAllByRole('button', { name: 'Start' });
+    fireEvent.click(buttons[0]);
+    fireEvent.click(buttons[1]);
+    expect(starts).toHaveBeenCalledTimes(1);
+    const historyBack = vi.spyOn(window.history, 'back');
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(historyBack).not.toHaveBeenCalled();
+    window.history.replaceState({ veritasTaskDetail: task.id }, '', '/');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(window.history.state.veritasTaskWorkflow).toBe(`${task.id}:workflow`);
+    await act(async () => rejectStart(new Error('Launch fixture failed')));
+    expect(screen.getByRole('alert').textContent).toContain('Launch fixture failed');
+    for (const button of buttons) expect((button as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(historyBack).toHaveBeenCalledOnce();
+    historyBack.mockRestore();
+  });
+
+  it('uses browser Back to close Workflow and preserve the originating task route', async () => {
+    const onOpenChange = vi.fn();
+    const task = createMockTask({ id: 'task-workflow-history' });
+    const taskState = { veritasTaskDetail: task.id };
+    window.history.replaceState(taskState, '', '/?q=release');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(createJsonResponse([])));
+
+    renderWithProviders(<WorkflowSection task={task} open onOpenChange={onOpenChange} />);
+
+    await waitFor(() => {
+      expect(window.history.state.veritasTaskWorkflow).toBe(`${task.id}:workflow`);
+    });
+    window.history.replaceState(taskState, '', '/?q=release');
+    window.dispatchEvent(new PopStateEvent('popstate', { state: taskState }));
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(window.location.pathname).toBe('/');
+    expect(window.location.search).toBe('?q=release');
+    expect(window.history.state.veritasTaskDetail).toBe(task.id);
+  });
+
+  it('shows task-owned workflow state in Run and preserves the workflow overlay action', async () => {
+    const user = userEvent.setup();
+    const onOpenWorkflow = vi.fn();
+    const task = createMockTask({ id: 'task-run-workflow', type: 'code' });
+    mocks.useActiveRuns.mockReturnValue({
+      data: [
+        {
+          id: 'run-blocked',
+          workflowId: 'release',
+          workflowVersion: 3,
+          taskId: task.id,
+          status: 'blocked',
+          currentStep: 'Maintainer approval',
+          startedAt: '2026-09-02T20:00:00.000Z',
+          steps: [],
+        },
+      ],
+    });
+
+    renderWithProviders(
+      <RunWorkflowPanel task={task} readOnly={false} onOpenWorkflow={onOpenWorkflow} />
+    );
+
+    expect(screen.getByText('Workflow: blocked')).toBeDefined();
+    expect(screen.getByText('release v3')).toBeDefined();
+    expect(screen.getByText('Current step: Maintainer approval')).toBeDefined();
+
+    await user.click(screen.getByRole('button', { name: 'Choose workflow' }));
+    expect(onOpenWorkflow).toHaveBeenCalledOnce();
+  });
+
+  it('renders run mode and QA gate controls through direct Mantine primitives', async () => {
+    const user = userEvent.setup();
+    const onUpdate = vi.fn();
+    const fetchMock = vi.fn().mockResolvedValue(createJsonResponse({}));
+    vi.stubGlobal('fetch', fetchMock);
+    const task = createMockTask({
+      id: 'task-run-mode',
+      runMode: undefined,
+      qaGate: { required: false, passed: false },
+    });
+
+    const { baseElement, container } = renderWithProviders(
+      <RunModeGateSection task={task} onUpdate={onUpdate} />
+    );
+
+    expect(container.querySelector('.mantine-Select-root')).toBeDefined();
+    expect(container.querySelector('.mantine-Switch-root')).toBeDefined();
+    expect(baseElement.querySelector('[data-slot="select-trigger"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="switch"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="button"]')).toBeNull();
+    expect(baseElement.querySelector('[data-slot="label"]')).toBeNull();
+
+    await user.click(screen.getByRole('combobox', { name: 'Run Mode' }));
+    await user.click(await screen.findByText(/Eng Review/));
+    await user.click(screen.getByRole('switch', { name: 'Require QA before done' }));
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledWith('runMode', 'eng-review');
+    });
+    expect(onUpdate).toHaveBeenCalledWith('qaGate', {
+      required: true,
+      passed: false,
+      passedAt: undefined,
+      passedBy: undefined,
+    });
+  });
+});

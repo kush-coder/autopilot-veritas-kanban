@@ -1,0 +1,965 @@
+# Deployment Guide
+
+This guide covers deploying Veritas Kanban in production using Docker (recommended) or bare metal.
+
+---
+
+## Table of Contents
+
+- [Quick Start (Docker)](#quick-start-docker)
+- [Docker Configuration](#docker-configuration)
+- [NODE_ENV & Docker](#node_env--docker)
+- [Bare Metal Deployment](#bare-metal-deployment)
+  - [Prerequisites](#prerequisites)
+  - [Build Steps](#build-steps)
+  - [Running](#running)
+  - [Reverse Proxy (nginx)](#reverse-proxy-nginx)
+  - [Reverse Proxy (Caddy)](#reverse-proxy-caddy)
+  - [Reverse Proxy (Traefik)](#reverse-proxy-traefik)
+  - [Sub-Path Deployment](#sub-path-deployment)
+  - [systemd Service](#systemd-service)
+- [Environment Variables](#environment-variables)
+- [Data & Backup](#data--backup)
+- [Upgrading](#upgrading)
+- [Health Check](#health-check)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Quick Start (Docker)
+
+The fastest way to get Veritas Kanban running in production:
+
+Use the production compose example in this guide for deployed instances. The repo's demo Compose files are local-only and may disable auth for walkthroughs; do not expose them on LAN, tunnel, VPS, or reverse-proxy interfaces.
+
+```bash
+# Clone the repository
+git clone https://github.com/BradGroux/veritas-kanban.git
+cd veritas-kanban
+
+# Copy and configure environment
+cp server/.env.example server/.env
+# Edit server/.env — at minimum, set VERITAS_ADMIN_KEY to a strong secret
+
+# Build and start
+docker compose up -d --build
+
+# Verify it's running
+curl http://localhost:3001/health
+# → {"status":"ok","timestamp":"..."}
+```
+
+The app is now available at **http://localhost:3001**.
+
+Data is persisted in a Docker named volume (`kanban-data`), so it survives container restarts.
+
+> **⚠️ Important:** Do not set `NODE_ENV=development` in your Docker environment — the UI won't load. See [NODE_ENV & Docker](#node_env--docker) for details.
+
+> **Remote security posture:** Exposing Veritas beyond loopback is v5 server
+> mode. Keep auth enabled, disable localhost bypass, use HTTPS/VPN/tunnel
+> protection for browser/mobile access, and prefer one trusted origin for `/`,
+> `/api`, and `/ws`. See
+> [ADR 0002](architecture/ADR-0002-v5-remote-server-security-posture.md).
+
+---
+
+## Docker Configuration
+
+### Dockerfile Overview
+
+The multi-stage Dockerfile enforces architecture-specific production image budgets:
+
+| Architecture | Maximum compressed image size | 6.1.2 implementation baseline |
+| ------------ | ----------------------------- | ----------------------------- |
+| `arm64`      | 200,000,000 bytes             | 195,910,880 bytes             |
+| `amd64`      | 600,000,000 bytes             | 571,590,173 bytes             |
+
+The final release candidate is remeasured at the release milestone; these
+implementation baselines are not substituted for final artifact evidence.
+
+| Stage          | Purpose                                                                  |
+| -------------- | ------------------------------------------------------------------------ |
+| `deps`         | Install all pnpm workspace dependencies                                  |
+| `build-shared` | Compile the shared TypeScript package                                    |
+| `build-web`    | Build the React frontend with Vite                                       |
+| `build-server` | Compile the server and deploy its production dependency closure          |
+| `production`   | Copy only the server closure and built web assets into Node.js 22 Alpine |
+
+The production stage does not contain npm, pnpm, the root workspace/lockfile,
+CLI dependencies, or MCP dependencies. It retains only the server and shared
+package identity manifests required for module resolution and version health.
+It runs as the non-root `veritas` user (UID 1001).
+
+The `amd64` image is larger because the Linux Codex runtime bundled by `@openai/codex-sdk`
+occupies about 302 MB of its unpacked filesystem, including a roughly 245 MB executable.
+Retaining it keeps the `codex-sdk` provider functional without an operator-supplied binary.
+The budgets leave about 2% headroom on `arm64` and 5% on `amd64`, so material dependency growth
+still fails the contract instead of being normalized by one loose cross-platform ceiling.
+
+CI builds the production target and runs `pnpm check:docker-image`. The contract fails when the
+image reaches its architecture budget or when the runtime smoke cannot prove non-root execution,
+SQLite startup, API authentication, static web serving, health checks, and the native `bcrypt`
+module. `VERITAS_DOCKER_MAX_BYTES` can set an explicit budget for another architecture.
+
+**Path Resolution (v2.1.3):** All services use the shared `paths.ts` utility for consistent path resolution. The resolution priority is: `DATA_DIR` / `VERITAS_DATA_DIR` env var → auto-discovery of monorepo root (walks up from cwd looking for `pnpm-workspace.yaml`) → fallback to cwd. A filesystem root guard prevents silent `/` resolution, which previously caused `EACCES: permission denied` errors in Docker. The production image uses `WORKDIR /app/server` for backwards compatibility.
+
+### docker-compose.yml
+
+```yaml
+services:
+  veritas-kanban:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: veritas-kanban
+    ports:
+      - '3001:3001'
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DATA_DIR=/app/data
+      - VERITAS_AUTH_ENABLED=true
+      - VERITAS_ADMIN_KEY=your-secure-admin-key-here
+      # - VERITAS_JWT_SECRET=your-jwt-secret-here
+      # - CORS_ORIGINS=https://kanban.example.com
+      # - VERITAS_API_KEYS=agent1:key1:agent,reader:key2:read-only
+    volumes:
+      - kanban-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  kanban-data:
+    driver: local
+```
+
+### Exposed Ports
+
+| Port | Protocol | Description                            |
+| ---- | -------- | -------------------------------------- |
+| 3001 | HTTP     | API server + static frontend           |
+| 3001 | WS       | WebSocket (real-time updates) on `/ws` |
+
+### Build Arguments
+
+The Dockerfile does not use build arguments — all configuration is done via runtime environment variables.
+
+### Using a Bind Mount Instead of a Named Volume
+
+If you prefer direct filesystem access to data:
+
+```yaml
+volumes:
+  - ./data:/app/data
+```
+
+Make sure the host directory exists and is writable by UID 1001:
+
+```bash
+mkdir -p ./data
+chown 1001:1001 ./data
+```
+
+When `VERITAS_STORAGE=sqlite`, the bind mount must resolve to durable local
+storage on the Docker host. Do not place the authoritative database on NFS,
+SMB/CIFS, FUSE, WebDAV, a NAS mount, a synchronized cloud folder, or an
+ephemeral container overlay. Detected unsafe or unverified filesystem posture
+refuses startup before SQLite opens the file. Cloud-sync folders may still look
+like ordinary local storage to the operating system, so the operator must keep
+them out of the authoritative path. See
+[SQLite Filesystem Safety Posture](SQLITE-SCHEMA.md#filesystem-safety-posture).
+
+---
+
+## NODE_ENV & Docker
+
+> **⚠️ Common pitfall:** Setting `NODE_ENV=development` in your `docker-compose.yml` will break the UI. You'll see `Cannot GET /` when visiting the app in your browser. ([#197](https://github.com/BradGroux/veritas-kanban/issues/197))
+
+### How it works
+
+Veritas Kanban uses a **split architecture** during development:
+
+| Mode          | Frontend                             | Backend                       | UI served by                            |
+| ------------- | ------------------------------------ | ----------------------------- | --------------------------------------- |
+| `production`  | Pre-built static files (`web/dist/`) | Express on `:3001`            | **Express** (serves static files + API) |
+| `development` | Vite dev server on `:3000`/`:5173`   | Express on `:3001` (API only) | **Vite** (with HMR, proxy to API)       |
+
+In **development mode**, Express is API-only — it does _not_ serve the frontend. The Vite dev server handles that separately. Inside a Docker container, there's no Vite dev server, so nothing serves the UI at `/`.
+
+The Dockerfile's production stage sets `ENV NODE_ENV=production` by default and builds the frontend into static assets that Express serves directly. **Don't override this with `development`.**
+
+### Docker quick-start (working example)
+
+```yaml
+services:
+  veritas-kanban:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - '3001:3001'
+    environment:
+      # NODE_ENV defaults to production in the Dockerfile — don't set it to development
+      - PORT=3001
+      - VERITAS_ADMIN_KEY=your-secure-key-here # Required — minimum 32 characters
+      - VERITAS_JWT_SECRET=your-jwt-secret-here # Recommended — sessions won't survive restarts without this
+    volumes:
+      - kanban-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  kanban-data:
+    driver: local
+```
+
+```bash
+# Build and start
+docker compose up -d --build
+
+# Verify health
+curl http://localhost:3001/health
+# → {"status":"ok","timestamp":"..."}
+
+# Open the UI
+open http://localhost:3001
+```
+
+### Required environment variables for Docker
+
+| Variable             | Required    | Description                                                                                 |
+| -------------------- | ----------- | ------------------------------------------------------------------------------------------- |
+| `VERITAS_ADMIN_KEY`  | **Yes**     | Admin API key (≥ 32 chars). Generate: `openssl rand -hex 32`                                |
+| `VERITAS_JWT_SECRET` | Recommended | JWT signing secret. Without it, sessions reset on restart. Generate: `openssl rand -hex 64` |
+| `PORT`               | No          | Defaults to `3001`                                                                          |
+| `NODE_ENV`           | No          | Defaults to `production` in Docker. **Do not set to `development`**                         |
+| `DATA_DIR`           | No          | Defaults to `/app/data`. Map a volume here for persistence                                  |
+
+### When do you use `NODE_ENV=development`?
+
+Only for **local development outside Docker**, where you run both servers:
+
+```bash
+# Terminal 1: API server with hot-reload
+pnpm dev
+
+# This starts:
+#   - Express API on http://localhost:3001
+#   - Vite dev server on http://localhost:3000 (proxies API calls to :3001)
+```
+
+If you need to debug inside a container, use `docker exec` to inspect — don't switch to dev mode.
+
+---
+
+## Bare Metal Deployment
+
+### Prerequisites
+
+| Requirement | Version         |
+| ----------- | --------------- |
+| Node.js     | 22.22.1+        |
+| pnpm        | 11.1.1 (pinned) |
+
+Install pnpm if not present:
+
+```bash
+corepack enable
+corepack prepare pnpm@11.1.1 --activate
+```
+
+### Build Steps
+
+```bash
+# Clone
+git clone https://github.com/BradGroux/veritas-kanban.git
+cd veritas-kanban
+
+# Install dependencies
+pnpm install --frozen-lockfile
+
+# Build all packages (shared → server + web)
+pnpm build
+
+# Set up environment
+cp server/.env.example server/.env
+# Edit server/.env — configure VERITAS_ADMIN_KEY and other settings
+```
+
+### Running
+
+```bash
+# Start the production server
+NODE_ENV=production node server/dist/index.js
+```
+
+The server:
+
+- Serves the API at `http://localhost:3001/api`
+- Serves the built React frontend at `http://localhost:3001`
+- Provides WebSocket updates at `ws://localhost:3001/ws`
+- Exposes API docs at `http://localhost:3001/api-docs`
+
+### Reverse Proxy (nginx)
+
+When running behind nginx (or any reverse proxy), set the `TRUST_PROXY` environment
+variable so Express can correctly detect the real client IP from `X-Forwarded-*`
+headers. This is required for accurate rate limiting and security logging.
+
+Reverse proxy deployments should follow the trusted-host model from
+[ADR 0002](architecture/ADR-0002-v5-remote-server-security-posture.md): route
+the web app, `/api`, `/ws`, `/health`, and PWA assets through the same public
+origin whenever possible. See [PWA install](guides/PWA_INSTALL.md) for mobile
+install and offline-shell behavior.
+
+Common values:
+
+- `TRUST_PROXY=1` — trust a single proxy hop (most common when nginx is directly in front)
+- ~~`TRUST_PROXY=true`~~ — **blocked by default** (trusts all proxies, dangerous on public internet). Use a hop count or subnet instead
+- `TRUST_PROXY=loopback` — only trust loopback addresses (`127.0.0.1`, `::1`)
+
+See the Express docs for full options: https://expressjs.com/en/guide/behind-proxies.html
+
+Place behind nginx for TLS termination and HTTP/2:
+
+```nginx
+upstream veritas {
+    server 127.0.0.1:3001;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name kanban.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/kanban.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/kanban.example.com/privkey.pem;
+
+    # Security headers (Veritas sets its own via Helmet, but these add defense-in-depth)
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # Proxy API and frontend
+    location / {
+        proxy_pass http://veritas;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Request ID propagation
+        proxy_set_header X-Request-ID $request_id;
+    }
+
+    # WebSocket upgrade
+    location /ws {
+        proxy_pass http://veritas;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Prevent proxy from closing idle WebSocket connections
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+
+# Redirect HTTP → HTTPS
+server {
+    listen 80;
+    server_name kanban.example.com;
+    return 301 https://$server_name$request_uri;
+}
+```
+
+When using a reverse proxy, update `CORS_ORIGINS` to your public domain:
+
+```env
+CORS_ORIGINS=https://kanban.example.com
+```
+
+### Reverse Proxy (Caddy)
+
+When using Caddy as a reverse proxy, also set `TRUST_PROXY` so Express trusts the
+Caddy hop and uses the correct client IP for rate limiting and logging.
+
+Examples:
+
+```env
+TRUST_PROXY=1       # Caddy directly in front of Veritas Kanban
+TRUST_PROXY=2       # If an additional CDN sits in front of Caddy
+```
+
+Caddy handles TLS automatically:
+
+```caddyfile
+kanban.example.com {
+    reverse_proxy localhost:3001
+}
+```
+
+Caddy automatically provisions and renews Let's Encrypt certificates, handles HTTP→HTTPS redirects, and supports WebSocket proxying out of the box.
+
+### Reverse Proxy (Traefik)
+
+When using Traefik as a reverse proxy, set `TRUST_PROXY=1` so Express trusts the
+Traefik hop and correctly handles rate limiting and security logging.
+
+Traefik with Docker labels (add to your `docker-compose.yml`):
+
+```yaml
+services:
+  veritas-kanban:
+    # ... (image, volumes, etc.)
+    environment:
+      - TRUST_PROXY=1
+    labels:
+      traefik.enable: 'true'
+      traefik.http.routers.kanban.rule: Host(`kanban.example.com`)
+      traefik.http.routers.kanban.entrypoints: websecure
+      traefik.http.routers.kanban.tls: 'true'
+      traefik.http.routers.kanban.tls.certresolver: mytlschallenge
+      traefik.http.services.kanban.loadbalancer.server.port: '3001'
+```
+
+**WebSocket:** Traefik automatically handles WebSocket upgrades when the initial HTTP request includes `Upgrade: websocket` headers — no special configuration is needed.
+
+### Sub-Path Deployment
+
+If you need to serve Veritas Kanban under a sub-path (e.g., `https://example.com/kanban/`)
+instead of a dedicated domain, the reverse proxy must strip the prefix before forwarding.
+
+**Traefik with `StripPrefix`:**
+
+```yaml
+labels:
+  traefik.http.routers.kanban.rule: Host(`example.com`) && PathPrefix(`/kanban`)
+  traefik.http.middlewares.kanban-strip.stripprefix.prefixes: /kanban
+  traefik.http.routers.kanban.middlewares: kanban-strip
+```
+
+**Important:** When the reverse proxy strips the prefix, the server sees requests at `/`
+as expected. However, the **frontend** generates URLs starting with `/` (e.g., `/api/tasks`,
+`/ws`), which bypass the reverse proxy's path matching. To fix this, build the frontend
+with the `VITE_BASE_PATH` build argument:
+
+```bash
+docker build --build-arg VITE_BASE_PATH=/kanban/ -t veritas-kanban .
+```
+
+This sets Vite's `base` URL, so the frontend loads assets from `/kanban/assets/...` and
+sends API requests to `/kanban/api/...`.
+
+> **Note:** `VITE_BASE_PATH` support requires PR [#189](https://github.com/BradGroux/veritas-kanban/pull/189)
+> or the equivalent changes to `vite.config.ts`, `web/src/lib/config.ts`, and
+> `web/src/lib/api/helpers.ts`.
+
+**Docker volumes for sub-path:** One volume at `DATA_DIR` persists tasks and runtime state:
+
+```yaml
+volumes:
+  - kanban-data:/app/data # tasks/ plus .veritas-kanban/
+```
+
+Do not mount a second volume at `/app/.veritas-kanban`; that is a legacy location used only
+as a read-only source during startup migration.
+
+### systemd Service
+
+Create `/etc/systemd/system/veritas-kanban.service`:
+
+```ini
+[Unit]
+Description=Veritas Kanban
+Documentation=https://github.com/BradGroux/veritas-kanban
+After=network.target
+
+[Service]
+Type=simple
+User=veritas
+Group=veritas
+WorkingDirectory=/opt/veritas-kanban
+ExecStart=/usr/bin/node server/dist/index.js
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Environment
+Environment=NODE_ENV=production
+Environment=PORT=3001
+EnvironmentFile=-/opt/veritas-kanban/server/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/veritas-kanban/.veritas-kanban /opt/veritas-kanban/tasks
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=veritas-kanban
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+# Create service user
+sudo useradd -r -s /bin/false veritas
+
+# Set ownership
+sudo chown -R veritas:veritas /opt/veritas-kanban
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable veritas-kanban
+sudo systemctl start veritas-kanban
+
+# Check status
+sudo systemctl status veritas-kanban
+sudo journalctl -u veritas-kanban -f
+```
+
+---
+
+## Environment Variables
+
+All variables are set in `server/.env` (or passed as environment variables in Docker).
+
+### Server Configuration
+
+| Variable    | Default | Description                                                                                                                              |
+| ----------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`      | `3001`  | HTTP server port                                                                                                                         |
+| `NODE_ENV`  | —       | **Must be `production` for Docker.** See [NODE_ENV & Docker](#node_env--docker) below. Omit to use the Dockerfile default (`production`) |
+| `LOG_LEVEL` | `info`  | Log verbosity: `trace`, `debug`, `info`, `warn`, `error`, `fatal`                                                                        |
+
+### Authentication
+
+| Variable                        | Default        | Description                                                                                                                                            |
+| ------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `VERITAS_AUTH_ENABLED`          | `true`         | Enable/disable authentication. Set `false` to disable (not recommended for production)                                                                 |
+| `VERITAS_ADMIN_KEY`             | —              | Admin API key with full access. **Must be ≥ 32 characters.** Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `VERITAS_API_KEYS`              | —              | Additional API keys. Format: `name:key:role,name2:key2:role2`. Roles: `admin`, `agent`, `read-only`                                                    |
+| `VERITAS_JWT_SECRET`            | auto-generated | JWT signing secret for user sessions. If unset, auto-generated (sessions won't survive restarts). Generate with: `openssl rand -hex 64`                |
+| `VERITAS_AUTH_LOCALHOST_BYPASS` | `false`        | Allow unauthenticated requests from localhost                                                                                                          |
+| `VERITAS_AUTH_LOCALHOST_ROLE`   | `read-only`    | Role for unauthenticated localhost connections: `read-only`, `agent`, or `admin`                                                                       |
+
+### Networking & Security
+
+| Variable                        | Default                                           | Description                                                                                                                                                                                  |
+| ------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TRUST_PROXY`                   | —                                                 | Express trust proxy setting for reverse proxy deployments. Common: `1` (single hop), `loopback`. Required for correct rate limiting behind nginx/Caddy/Traefik. `true` is blocked for safety |
+| `VERITAS_EGRESS_UPSTREAM_PROXY` | —                                                 | Optional operator HTTP proxy for policy-approved run egress. The gateway tunnels to the DNS-pinned destination and never persists proxy credentials                                          |
+| `CORS_ORIGINS`                  | `http://localhost:3000,http://localhost:5173,...` | Comma-separated list of allowed CORS origins                                                                                                                                                 |
+| `RATE_LIMIT_MAX`                | `300`                                             | Max API requests per minute per IP (localhost exempt). Auth endpoints have a stricter 15 req/min limit                                                                                       |
+| `CSP_REPORT_ONLY`               | `false`                                           | Use Content-Security-Policy-Report-Only instead of enforcing                                                                                                                                 |
+| `CSP_REPORT_URI`                | —                                                 | URL to receive CSP violation reports                                                                                                                                                         |
+
+### Prometheus metrics
+
+`GET /metrics` remains unauthenticated for local development. In production, use one of these explicit modes:
+
+- `PROMETHEUS_METRICS_TOKEN=<secret>` and configure Prometheus to send `Authorization: Bearer <secret>`.
+- A normal Veritas API key whose role or permissions include `telemetry:read`.
+- `PROMETHEUS_METRICS_PUBLIC=true` only on a trusted private network where unauthenticated operational metrics are intentional.
+
+### Data & Storage
+
+| Variable                   | Default                   | Description                                                                |
+| -------------------------- | ------------------------- | -------------------------------------------------------------------------- |
+| `VERITAS_DATA_DIR`         | Project root when unset   | Storage root used when `DATA_DIR` is unset                                 |
+| `DATA_DIR`                 | `/app/data` (Docker only) | Preferred storage root; takes precedence over `VERITAS_DATA_DIR`           |
+| `VERITAS_STORAGE`          | `file`                    | Selects `file` or `sqlite` storage                                         |
+| `VERITAS_SQLITE_PATH`      | Runtime `veritas.db`      | SQLite database override; must resolve to verified durable local storage   |
+| `VERITAS_SQLITE_TOPOLOGY`  | —                         | Set explicitly to `single-host` before compatibility/override maintenance  |
+| `VERITAS_SQLITE_HOST_ID`   | —                         | Stable unique host binding for SQLite compatibility ownership policy       |
+| `TELEMETRY_RETENTION_DAYS` | `30`                      | Days to keep telemetry event files before deletion                         |
+| `TELEMETRY_COMPRESS_DAYS`  | `7`                       | Days after which NDJSON telemetry files are gzip-compressed (0 = disabled) |
+
+### Integration
+
+| Variable           | Default                  | Description                                     |
+| ------------------ | ------------------------ | ----------------------------------------------- |
+| `CLAWDBOT_GATEWAY` | `http://127.0.0.1:18789` | OpenClaw gateway URL for AI agent orchestration |
+
+### Frontend (web/.env)
+
+| Variable         | Default                         | Description                                                                                                                                    |
+| ---------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VITE_API_URL`   | `/api` (uses Vite proxy in dev) | API base URL. Set if the server runs on a different host/port                                                                                  |
+| `VITE_BASE_PATH` | `/`                             | Build-time path prefix for sub-path deployments (e.g., `/kanban/`). Sets Vite's `base` config. See [Sub-Path Deployment](#sub-path-deployment) |
+
+### Authentication Methods
+
+The API supports three authentication methods:
+
+```bash
+# 1. Authorization header (Bearer token)
+curl -H "Authorization: Bearer <api-key>" http://localhost:3001/api/tasks
+
+# 2. X-API-Key header
+curl -H "X-API-Key: <api-key>" http://localhost:3001/api/tasks
+
+# 3. Query parameter (for WebSocket connections)
+wscat -c "ws://localhost:3001/ws?api_key=<api-key>"
+```
+
+### Role Permissions
+
+| Role        | Access                                         |
+| ----------- | ---------------------------------------------- |
+| `admin`     | Full access to all endpoints                   |
+| `agent`     | Read/write tasks, run agents, manage worktrees |
+| `read-only` | GET endpoints only (view tasks, read config)   |
+
+---
+
+## Data & Backup
+
+### Where Data Lives
+
+| Path                                  | Contents                                                           |
+| ------------------------------------- | ------------------------------------------------------------------ |
+| `tasks/active/`                       | Active task markdown files (YAML frontmatter + body)               |
+| `tasks/archive/`                      | Archived task markdown files                                       |
+| `.veritas-kanban/`                    | Internal config, logs, worktrees, agent requests                   |
+| `.veritas-kanban/config.json`         | Application settings                                               |
+| `.veritas-kanban/security.json`       | JWT secret (if not using `VERITAS_JWT_SECRET` env var)             |
+| `.veritas-kanban/logs/`               | Application logs                                                   |
+| `.veritas-kanban/worktrees/`          | Task and temporary integration worktree directories                |
+| `.veritas-kanban/worktree-manifests/` | Durable worktree ownership, base, lifecycle, and override evidence |
+| `.veritas-kanban/agent-requests/`     | Pending AI agent requests                                          |
+
+In Docker, `DATA_DIR=/app/data`. Tasks live under `/app/data/tasks` and all runtime state
+lives under `/app/data/.veritas-kanban`; no persistent state is written to `/app` or
+`/app/server` outside that volume.
+
+**Auth state persistence fix (v3.1.1):** Runtime config/state files (including `security.json`) now always live under `${DATA_DIR}/.veritas-kanban`. On startup, Veritas Kanban automatically migrates legacy runtime files it can see at container-only paths (for example, `/app/.veritas-kanban` or `/app/server/.veritas-kanban`) into the Docker volume. A replaced container cannot see data left in an old container layer or an unmounted legacy volume.
+
+If the old runtime state is in a named volume, mount that volume read-only at its former path for one startup. For example, add the legacy mount temporarily to your Compose service:
+
+```yaml
+services:
+  veritas-kanban:
+    volumes:
+      - kanban-data:/app/data
+      - legacy-veritas-config:/app/.veritas-kanban:ro
+```
+
+Start the service, verify the expected files now exist under
+`/app/data/.veritas-kanban`, then remove the legacy mount from Compose. The migration is
+copy-only: it does not delete the legacy source, and an existing destination file wins.
+
+If you upgraded from an older image and already lost auth state, you can recover by copying `security.json` from a still-running/old container (if available) into the volume:
+
+```bash
+# Find the old container ID, then copy the file into your host
+docker cp <old-container>:/app/server/.veritas-kanban/security.json ./security.json
+
+# Or if it lived at /app/.veritas-kanban
+docker cp <old-container>:/app/.veritas-kanban/security.json ./security.json
+
+# Place it into the volume-backed data dir
+mkdir -p ./data/.veritas-kanban
+cp ./security.json ./data/.veritas-kanban/security.json
+```
+
+For older versions (pre-3.1.1), set `DATA_DIR` or `VERITAS_DATA_DIR` to `/app/data` in `docker-compose.yml` to ensure runtime state persists across rebuilds.
+
+### Backup
+
+#### Bare Metal
+
+```bash
+# Full backup
+tar czf veritas-backup-$(date +%Y%m%d).tar.gz \
+  tasks/ \
+  .veritas-kanban/ \
+  server/.env
+
+# Tasks only
+tar czf veritas-tasks-$(date +%Y%m%d).tar.gz tasks/
+```
+
+#### Docker
+
+For a live SQLite deployment, create a completed SQLite export from Settings ->
+Maintenance or `POST /api/v1/maintenance/sqlite/export`, then copy the completed
+bundle to remote backup storage. A raw filesystem archive is safe only after the
+Veritas container is stopped; copying a live database without its coordinated
+WAL state can produce an incomplete backup.
+
+```bash
+# Stop before making a raw named-volume archive
+docker compose down
+docker run --rm \
+  -v kanban-data:/data \
+  -v $(pwd):/backup \
+  alpine tar czf /backup/veritas-backup-$(date +%Y%m%d).tar.gz -C /data .
+docker compose up -d
+```
+
+### Restore
+
+#### Bare Metal
+
+```bash
+# Stop the server first
+sudo systemctl stop veritas-kanban
+
+# Restore
+tar xzf veritas-backup-20260129.tar.gz -C /opt/veritas-kanban/
+
+# Restart
+sudo systemctl start veritas-kanban
+```
+
+#### Docker
+
+```bash
+# Stop the container
+docker compose down
+
+# Restore into the volume
+docker run --rm \
+  -v kanban-data:/data \
+  -v $(pwd):/backup \
+  alpine sh -c 'set -eu; archive=/backup/veritas-backup-20260129.tar.gz; test -d /data; test "$(readlink -f /data)" = /data; test -r "$archive"; tar tzf "$archive" >/dev/null; find /data -mindepth 1 -delete; tar xzf "$archive" -C /data'
+
+# Restart
+docker compose up -d
+```
+
+---
+
+## Upgrading
+
+### Docker
+
+```bash
+cd veritas-kanban
+
+# Pull latest changes
+git pull
+
+# Rebuild and restart (zero-downtime with health check)
+docker compose up -d --build
+
+# Verify
+docker compose logs -f
+curl http://localhost:3001/health
+```
+
+### Bare Metal
+
+```bash
+cd /opt/veritas-kanban
+
+# Pull latest changes
+git pull
+
+# Install any new dependencies
+pnpm install --frozen-lockfile
+
+# Rebuild all packages
+pnpm build
+
+# Restart the service
+sudo systemctl restart veritas-kanban
+
+# Verify
+curl http://localhost:3001/health
+sudo journalctl -u veritas-kanban --since "1 min ago"
+```
+
+### Migration Notes
+
+Veritas Kanban runs startup migrations automatically (`runStartupMigrations()`
+in `server/src/index.ts`). These are idempotent and safe to run on every
+startup.
+
+For v5 file-to-SQLite upgrades, run the dry-run migration, preserve the
+pre-migration backup and journal, and follow
+[v5 SQLite Migration Recovery](MIGRATION-RECOVERY.md). App rollback after a
+SQLite migration is limited by schema compatibility; restore the pre-migration
+file-backed backup when an older app cannot open a newer database.
+
+### Source-Checkout Runtime Data Separation
+
+When running from a source checkout (not Docker), runtime data and source
+files share the same directory tree by default:
+
+| Lifecycle        | Paths                                        | Action on upgrade           |
+| ---------------- | -------------------------------------------- | --------------------------- |
+| **Source**       | `server/`, `web/`, `cli/`, `shared/`, `mcp/` | Safe to `git pull`, rebuild |
+| **Runtime data** | `.veritas-kanban/`, `tasks/`, `storage/`     | Preserve across upgrades    |
+
+`.gitignore` excludes all runtime directories, so `git pull` will not overwrite
+them. However, to make the separation explicit and protect runtime data on
+bare-metal or CI setups, set `VERITAS_DATA_DIR` (or `DATA_DIR`) to a directory
+outside the source tree:
+
+```bash
+export VERITAS_DATA_DIR=/var/lib/veritas-kanban
+```
+
+All services resolve runtime paths through `server/src/utils/paths.ts`, which
+respects `DATA_DIR` / `VERITAS_DATA_DIR` as the authoritative override (#774).
+
+**Startup reconciliation:** Current agent launches persist a
+`run-supervisor/v1` record under the configured runtime data directory or in
+SQLite. After an unclean stop, startup validates the exact provider, launch,
+task-envelope, worktree, host, lease, and process/session identity before
+reattaching. A stale lease has one compare-and-set winner, verified process
+groups remain stoppable, event replay resumes after the durable cursor, and a
+terminal result is applied idempotently if the server crashed before task
+mutation. Unsafe or legacy runs move to `blocked` with a typed recovery reason
+and operator action instead of being restarted automatically (#781, #853).
+
+---
+
+## Health Check
+
+The server exposes an unauthenticated health endpoint:
+
+```bash
+curl http://localhost:3001/health
+# → {"status":"ok","timestamp":"2026-01-29T12:00:00.000Z"}
+```
+
+Remote clients and desktop onboarding should also validate:
+
+- `GET /api/health` for the canonical Veritas API liveness payload.
+- `GET /health/ready` for storage, memory, and disk readiness.
+- `GET /api/auth/status` for setup/auth/session state.
+- `/ws` upgrade from the same origin used by the web app.
+
+When SQLite is active, authenticated admin calls to `/health/deep` and
+`/api/health/deep` include redacted filesystem posture, journal mode, and
+integrity evidence. If the filesystem is unsafe or unverified, the server
+refuses startup before binding the HTTP port; inspect container or desktop
+supervisor logs for the reason and move `VERITAS_SQLITE_PATH` to supported local
+storage.
+
+### Governed SQLite journal conversion
+
+Never edit journal pragmas against a running Veritas database. Configure an
+admin CLI key, preview the exact operation, schedule it, and restart once:
+
+```bash
+export VK_API_KEY="$VERITAS_ADMIN_KEY"
+export VERITAS_SQLITE_TOPOLOGY=single-host
+export VERITAS_SQLITE_HOST_ID=veritas-primary-01
+
+vk sqlite journal preview \
+  --target delete \
+  --single-host \
+  --override-reason "Temporary single-host compatibility" \
+  --expires-at 2026-07-16T00:00:00Z \
+  --json
+
+vk sqlite journal apply \
+  --preview-id <preview-id> \
+  --preview-token <preview-token> \
+  --confirm <preview-id> \
+  --acknowledge-risks
+
+# Restart the normal service once, then inspect the result.
+vk sqlite journal status --json
+```
+
+Use `--target wal` to return a supported-local database to ordinary WAL mode.
+If status reports `recovery-required`, keep the database, maintenance directory,
+and backup artifacts intact and do not start another writer. The next bootstrap
+completes forward only when the current journal mode and full integrity are
+verified, or reverts the mode in place when that remains safe. It never blindly
+restores an older backup; persistent or ambiguous failure requires operator
+recovery before normal startup. Conversion never makes SQLite a shared network
+database.
+
+The journal policy and owner lock are authenticated with `VERITAS_ADMIN_KEY`.
+Return the database to ordinary local WAL mode before rotating that key. If an
+unexpected shutdown leaves an owner lock during rotation, verify that the
+recorded host/process is dead before following the recovery procedure; never
+delete an active or foreign-host lock.
+
+The Docker image includes a built-in health check:
+
+- **Interval:** 30 seconds
+- **Timeout:** 5 seconds
+- **Start period:** 10 seconds
+- **Retries:** 3
+
+Check container health status:
+
+```bash
+docker inspect --format='{{.State.Health.Status}}' veritas-kanban
+```
+
+---
+
+## Troubleshooting
+
+### Container won't start
+
+```bash
+# Check logs
+docker compose logs veritas-kanban
+
+# Common issues:
+# - Port 3001 already in use → change the port mapping
+# - Permission denied on volume → check UID 1001 ownership
+```
+
+### Authentication not working
+
+```bash
+# Check auth diagnostics (requires admin key)
+curl -H "X-API-Key: your-admin-key" http://localhost:3001/api/auth/diagnostics
+```
+
+### WebSocket connection refused
+
+- Verify `CORS_ORIGINS` includes your frontend URL
+- If behind a reverse proxy, ensure WebSocket upgrade headers are forwarded
+- Check that the proxy timeout is long enough (WebSocket connections are long-lived)
+
+### Rate limiting errors behind a reverse proxy
+
+If you see `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` errors in the logs, it means your reverse
+proxy is sending `X-Forwarded-For` headers but Express doesn't trust them. Fix by setting
+the `TRUST_PROXY` environment variable:
+
+```bash
+# Docker Compose
+environment:
+  - TRUST_PROXY=1    # One proxy hop (nginx, Caddy, or Traefik directly in front)
+  - TRUST_PROXY=2    # Two hops (CDN + reverse proxy)
+```
+
+Without this, the rate limiter uses the proxy's IP instead of the real client IP, causing
+all clients to share a single rate limit bucket.
+
+### Weak admin key warning at startup
+
+The server warns if `VERITAS_ADMIN_KEY` is less than 32 characters. Generate a strong key:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+### API documentation
+
+The built-in Swagger UI is available at:
+
+```
+http://localhost:3001/api-docs
+```

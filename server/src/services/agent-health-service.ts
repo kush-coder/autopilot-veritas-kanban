@@ -1,0 +1,323 @@
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import type { AgentConfig } from '@veritas-kanban/shared';
+import { hasClaudeCodeBareAuthentication } from './claude-code-adapter.js';
+import {
+  OperationalMetadataRepository,
+  operationalMetadataRepository,
+} from '../storage/operational-metadata-repository.js';
+
+const execFileAsync = promisify(execFile);
+const PROVIDER_VERSION_TIMEOUT_MS = 5_000;
+const PROVIDER_VERSION_MAX_BUFFER_BYTES = 8 * 1024;
+
+interface CommandOptions {
+  timeout?: number;
+  maxBuffer?: number;
+  shell?: boolean;
+}
+
+interface CommandResult {
+  stdout: string;
+  stderr: string;
+}
+
+export type AgentHealthCommandRunner = (
+  command: string,
+  args: string[],
+  options?: CommandOptions
+) => Promise<CommandResult>;
+
+interface ProviderVersionProbe {
+  attempted: boolean;
+  output?: string;
+  source?: string;
+  error?: string;
+}
+
+const defaultCommandRunner: AgentHealthCommandRunner = async (command, args, options) => {
+  const { stdout, stderr } = await execFileAsync(command, args, {
+    ...options,
+    encoding: 'utf8',
+  });
+  return { stdout: String(stdout), stderr: String(stderr) };
+};
+
+export interface AgentHealthStatus {
+  type: string;
+  name: string;
+  enabled: boolean;
+  configured: boolean;
+  command: string;
+  executableFound: boolean;
+  executablePath?: string;
+  providerVersion?: string;
+  providerVersionSource?: string;
+  authenticated: boolean | null;
+  healthy: boolean;
+  checkedAt: string;
+  reason?: string;
+  diagnostics?: string[];
+}
+
+export interface AgentHealthChecker {
+  checkAgent(agent: AgentConfig): Promise<AgentHealthStatus>;
+}
+
+export class AgentHealthService implements AgentHealthChecker {
+  constructor(
+    private readonly runCommand: AgentHealthCommandRunner = defaultCommandRunner,
+    private readonly operationalMetadata: OperationalMetadataRepository = operationalMetadataRepository
+  ) {}
+
+  async checkAgent(agent: AgentConfig): Promise<AgentHealthStatus> {
+    const checkedAt = new Date().toISOString();
+    const executable = await this.findExecutable(agent.command);
+    const versionArgs = this.versionProbeArgs(agent);
+    const version =
+      executable.found && versionArgs
+        ? await this.probeProviderVersion(agent.command, versionArgs)
+        : { attempted: false };
+    const auth = executable.found ? await this.checkAuth(agent, version) : { authenticated: null };
+    const reason = this.buildReason(agent, executable.found, auth.authenticated, auth.error);
+
+    return {
+      type: agent.type,
+      name: agent.name,
+      enabled: agent.enabled,
+      configured: true,
+      command: agent.command,
+      executableFound: executable.found,
+      executablePath: executable.path,
+      providerVersion: version.output,
+      providerVersionSource: version.source,
+      authenticated: auth.authenticated,
+      healthy: agent.enabled && executable.found && auth.authenticated !== false,
+      checkedAt,
+      reason,
+      ...(auth.diagnostics?.length ? { diagnostics: auth.diagnostics } : {}),
+    };
+  }
+
+  private async findExecutable(command: string): Promise<{ found: boolean; path?: string }> {
+    if (!command.trim()) return { found: false };
+
+    const directPath = await this.operationalMetadata.probeExecutablePath(command);
+    if (directPath.directPath) return { found: directPath.found, path: directPath.path };
+
+    try {
+      const { stdout } = await this.runCommand('which', [command]);
+      return { found: true, path: stdout.trim() };
+    } catch {
+      return { found: false };
+    }
+  }
+
+  private async checkAuth(
+    agent: AgentConfig,
+    versionProbe: ProviderVersionProbe
+  ): Promise<{ authenticated: boolean | null; error?: string; diagnostics?: string[] }> {
+    const command = this.operationalMetadata.basename(agent.command);
+    const provider = agent.provider ?? '';
+
+    if (provider === 'codex-cloud' || command === 'gh') {
+      return this.runAuthProbe(agent.command, ['auth', 'status'], /logged in/i);
+    }
+
+    if (provider === 'ollama-local') {
+      return this.runAuthProbe(agent.command, ['list'], /name|model/i);
+    }
+
+    if (provider === 'ollama-cloud') {
+      if (process.env.OLLAMA_API_KEY) return { authenticated: true };
+      return { authenticated: null };
+    }
+
+    if (provider === 'lm-studio-local') {
+      return this.runAuthProbe(
+        agent.command,
+        ['server', 'status', '--json', '--quiet'],
+        /"running"\s*:\s*true|server is running/i
+      );
+    }
+
+    if (provider === 'hermes-cli' || command === 'hermes') {
+      // Hermes v2026.7.7.2: binary existence + version probe. API key is optional at
+      // probe time; the actual run will fail if no key is configured.
+      const versionAuth = this.authResultFromVersionProbe(versionProbe, /hermes|version|\d+\.\d+/i);
+      if (!versionAuth.authenticated) return versionAuth;
+      // Check for at least one supported API key in the environment
+      const hasKey = Boolean(process.env.HERMES_API_KEY || process.env.ANTHROPIC_API_KEY);
+      if (!hasKey) {
+        return {
+          authenticated: null,
+          error: 'No HERMES_API_KEY or ANTHROPIC_API_KEY found in environment',
+        };
+      }
+      return { authenticated: true };
+    }
+
+    if (provider === 'claude-code') {
+      return this.probeClaudeCodeAuthentication(agent.command);
+    }
+
+    if (provider.startsWith('codex') || command === 'codex') {
+      return this.runAuthProbe(agent.command, ['login', 'status'], /logged in/i);
+    }
+
+    return { authenticated: null };
+  }
+
+  private async probeClaudeCodeAuthentication(
+    command: string
+  ): Promise<{ authenticated: boolean; error?: string; diagnostics: string[] }> {
+    const diagnostics: string[] = [];
+    try {
+      const { stdout, stderr } = await this.runCommand(command, ['auth', 'status'], {
+        timeout: PROVIDER_VERSION_TIMEOUT_MS,
+        maxBuffer: PROVIDER_VERSION_MAX_BUFFER_BYTES,
+        shell: false,
+      });
+      const output = boundUtf8(`${stdout}${stderr}`.trim(), PROVIDER_VERSION_MAX_BUFFER_BYTES);
+      const authStatusReady = /"loggedIn"\s*:\s*true|"logged_in"\s*:\s*true|logged in/i.test(
+        output
+      );
+      diagnostics.push(
+        authStatusReady
+          ? 'Claude Code authentication status is ready.'
+          : 'Claude Code authentication status did not report a logged-in session.'
+      );
+    } catch {
+      diagnostics.push('Claude Code authentication status probe failed.');
+    }
+
+    const bareAuthentication = hasClaudeCodeBareAuthentication(process.env);
+    diagnostics.push(
+      bareAuthentication
+        ? 'Explicit bare-mode authentication is configured.'
+        : 'Bare mode requires explicit environment authentication; OAuth and keychain state are not inherited.'
+    );
+
+    try {
+      const { stdout } = await this.runCommand(command, ['agents', '--json'], {
+        timeout: PROVIDER_VERSION_TIMEOUT_MS,
+        maxBuffer: PROVIDER_VERSION_MAX_BUFFER_BYTES,
+        shell: false,
+      });
+      const parsed = JSON.parse(
+        boundUtf8(String(stdout).trim(), PROVIDER_VERSION_MAX_BUFFER_BYTES) || '[]'
+      ) as unknown;
+      const count = Array.isArray(parsed)
+        ? parsed.length
+        : parsed &&
+            typeof parsed === 'object' &&
+            Array.isArray((parsed as { agents?: unknown }).agents)
+          ? (parsed as { agents: unknown[] }).agents.length
+          : 0;
+      diagnostics.push(`Claude Code agent discovery returned ${count} definition(s).`);
+    } catch {
+      diagnostics.push('Claude Code agent discovery probe failed; run `claude agents --json`.');
+    }
+
+    const authenticated = bareAuthentication;
+    return {
+      authenticated,
+      ...(authenticated
+        ? {}
+        : {
+            error: 'Claude Code bare mode requires explicit environment authentication.',
+          }),
+      diagnostics,
+    };
+  }
+
+  private async runAuthProbe(
+    command: string,
+    args: string[],
+    successPattern: RegExp
+  ): Promise<{ authenticated: boolean; error?: string }> {
+    try {
+      const { stdout, stderr } = await this.runCommand(command, args);
+      const output = `${stdout}${stderr}`.trim();
+      return {
+        authenticated: successPattern.test(output),
+        error: successPattern.test(output) ? undefined : output || 'Authentication status unknown',
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Authentication probe failed';
+      return { authenticated: false, error: message };
+    }
+  }
+
+  private versionProbeArgs(agent: AgentConfig): string[] | undefined {
+    if (agent.supportProfile) {
+      return agent.supportProfile.executable.versionArgs.length > 0
+        ? [...agent.supportProfile.executable.versionArgs]
+        : undefined;
+    }
+    return agent.provider === 'acp-stdio' ? undefined : ['--version'];
+  }
+
+  private async probeProviderVersion(
+    command: string,
+    args: string[]
+  ): Promise<ProviderVersionProbe> {
+    const source = `${this.operationalMetadata.basename(command)} ${args.join(' ')}`;
+    try {
+      const { stdout, stderr } = await this.runCommand(command, args, {
+        timeout: PROVIDER_VERSION_TIMEOUT_MS,
+        maxBuffer: PROVIDER_VERSION_MAX_BUFFER_BYTES,
+        shell: false,
+      });
+      const output = boundUtf8(`${stdout}${stderr}`.trim(), PROVIDER_VERSION_MAX_BUFFER_BYTES);
+      return {
+        attempted: true,
+        output: output || undefined,
+        source: output ? source : undefined,
+        error: output ? undefined : 'Provider version output was empty',
+      };
+    } catch (error) {
+      return {
+        attempted: true,
+        error: error instanceof Error ? error.message : 'Provider version probe failed',
+      };
+    }
+  }
+
+  private authResultFromVersionProbe(
+    probe: ProviderVersionProbe,
+    successPattern: RegExp
+  ): { authenticated: boolean; error?: string } {
+    const output = probe.output ?? '';
+    const authenticated = successPattern.test(output);
+    return {
+      authenticated,
+      error: authenticated
+        ? undefined
+        : probe.error || output || (probe.attempted ? 'Authentication status unknown' : undefined),
+    };
+  }
+
+  private buildReason(
+    agent: AgentConfig,
+    executableFound: boolean,
+    authenticated: boolean | null,
+    authError?: string
+  ): string | undefined {
+    if (!agent.enabled) return 'Agent is disabled';
+    if (!executableFound) return `Executable "${agent.command}" was not found on PATH`;
+    if (authenticated === false) {
+      return authError ? `Authentication check failed: ${authError}` : 'Authentication required';
+    }
+    return undefined;
+  }
+}
+
+function boundUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.byteLength <= maxBytes) return value;
+  return bytes
+    .subarray(0, maxBytes)
+    .toString('utf8')
+    .replace(/\uFFFD$/u, '');
+}

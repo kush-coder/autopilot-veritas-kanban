@@ -1,0 +1,31 @@
+{
+  "name": "@veritas-kanban/cli",
+  "version": "6.2.1",
+  "description": "CLI for Veritas Kanban task management",
+  "type": "module",
+  "bin": {
+    "vk": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run --maxWorkers=4",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@veritas-kanban/shared": "workspace:*",
+    "commander": "^15.0.0",
+    "chalk": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "typescript": "^6.0.3",
+    "tsx": "^4.23.13"
+  },
+  "license": "MIT",
+  "author": "Brad Groux <brad@digitalmeld.io>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BradGroux/veritas-kanban.git"
+  }
+}

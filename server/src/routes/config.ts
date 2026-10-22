@@ -1,0 +1,428 @@
+import { Router, type Router as RouterType } from 'express';
+import { z } from 'zod';
+import { ConfigService } from '../services/config-service.js';
+import type { RepoConfig, AgentConfig, AgentType } from '@veritas-kanban/shared';
+import { asyncHandler } from '../middleware/async-handler.js';
+import { ValidationError, BadRequestError } from '../middleware/error-handler.js';
+import { authorize } from '../middleware/auth.js';
+import { AgentBudgetPolicySchema } from '../schemas/agent-budget-schemas.js';
+import { AgentProfilePackageService } from '../services/agent-profile-package-service.js';
+import { TeamRosterService } from '../services/team-roster-service.js';
+import {
+  AgentProfileImportBodySchema,
+  AgentProfileUpdateBodySchema,
+  AgentProfileValidateBodySchema,
+  AgentProfilePackageFormatSchema,
+} from '../schemas/agent-profile-package-schemas.js';
+import {
+  TeamRosterFormatSchema,
+  TeamRosterImportBodySchema,
+  TeamRosterManifestSchema,
+  TeamRosterRoutePreviewBodySchema,
+  TeamRosterValidateBodySchema,
+} from '../schemas/team-roster-schemas.js';
+import { HarnessSupportService } from '../services/harness-support-service.js';
+import { HarnessCompatibilityMatrixService } from '../services/harness-compatibility-matrix-service.js';
+
+const router: RouterType = Router();
+const configService = new ConfigService();
+const harnessSupportService = new HarnessSupportService({ configService });
+const harnessCompatibilityMatrixService = new HarnessCompatibilityMatrixService();
+const agentProfilePackageService = new AgentProfilePackageService(configService);
+const teamRosterService = new TeamRosterService(configService);
+
+// Validation schemas
+const repoSchema = z.object({
+  name: z.string().min(1).max(50),
+  path: z.string().min(1),
+  defaultBranch: z.string().min(1).default('main'),
+});
+
+const agentSchema = z.object({
+  type: z
+    .string()
+    .min(1)
+    .max(50)
+    .regex(/^[a-z0-9-]+$/, 'Agent type must be lowercase alphanumeric with dashes'),
+  name: z.string().min(1).max(100),
+  command: z.string().min(1),
+  args: z.array(z.string()),
+  enabled: z.boolean(),
+  provider: z
+    .enum([
+      'openclaw',
+      'codex-cli',
+      'codex-sdk',
+      'codex-app-server',
+      'claude-code',
+      'acp-stdio',
+      'hermes-cli',
+      'codex-cloud',
+      'ollama-local',
+      'ollama-cloud',
+      'lm-studio-local',
+      'custom',
+    ])
+    .optional(),
+  model: z.string().optional(),
+  sandboxPresetId: z.string().min(1).max(80).optional(),
+  budget: AgentBudgetPolicySchema.optional(),
+});
+
+const setDefaultAgentSchema = z.object({
+  agent: z.string().min(1, 'Agent type is required'),
+});
+
+const validateRepoPathSchema = z.object({
+  path: z.string().min(1, 'Path is required'),
+});
+
+// GET /api/config - Get full config
+router.get(
+  '/',
+  asyncHandler(async (_req, res) => {
+    const config = await configService.getConfig();
+    res.json(config);
+  })
+);
+
+// GET /api/config/repos - List repos
+router.get(
+  '/repos',
+  asyncHandler(async (_req, res) => {
+    const config = await configService.getConfig();
+    res.json(config.repos);
+  })
+);
+
+// GET /api/config/team-roster - Get workspace team roster manifest
+router.get(
+  '/team-roster',
+  asyncHandler(async (_req, res) => {
+    res.json(await teamRosterService.getRoster());
+  })
+);
+
+// POST /api/config/team-roster/validate - Validate roster YAML/JSON or object
+router.post(
+  '/team-roster/validate',
+  asyncHandler(async (req, res) => {
+    const input = TeamRosterValidateBodySchema.parse(req.body);
+    res.json(
+      input.roster
+        ? teamRosterService.validateRoster(input.roster)
+        : teamRosterService.validateContent({
+            content: input.content as string,
+            format: input.format,
+          })
+    );
+  })
+);
+
+// POST /api/config/team-roster/import - Import or replace roster YAML/JSON
+router.post(
+  '/team-roster/import',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    const input = TeamRosterImportBodySchema.parse(req.body);
+    try {
+      res.status(201).json(await teamRosterService.importRoster(input));
+    } catch (error) {
+      throw new BadRequestError(error instanceof Error ? error.message : 'Invalid team roster');
+    }
+  })
+);
+
+// PUT /api/config/team-roster - Replace team roster manifest
+router.put(
+  '/team-roster',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    const roster = TeamRosterManifestSchema.parse(req.body);
+    try {
+      res.json(await teamRosterService.saveRoster(roster));
+    } catch (error) {
+      throw new BadRequestError(error instanceof Error ? error.message : 'Invalid team roster');
+    }
+  })
+);
+
+// GET /api/config/team-roster/export - Export roster as YAML or JSON
+router.get(
+  '/team-roster/export',
+  asyncHandler(async (req, res) => {
+    const format =
+      TeamRosterFormatSchema.parse(req.query.format) ??
+      (req.query.format === 'json' ? 'json' : 'yaml');
+    try {
+      res.json(await teamRosterService.exportRoster(format));
+    } catch (error) {
+      throw new BadRequestError(
+        error instanceof Error ? error.message : 'Failed to export team roster'
+      );
+    }
+  })
+);
+
+// POST /api/config/team-roster/preview-route - Preview roster route for task metadata
+router.post(
+  '/team-roster/preview-route',
+  asyncHandler(async (req, res) => {
+    const input = TeamRosterRoutePreviewBodySchema.parse(req.body);
+    res.json(await teamRosterService.previewRoute(input));
+  })
+);
+
+// GET /api/config/agent-profiles - List reusable agent profile packages
+router.get(
+  '/agent-profiles',
+  asyncHandler(async (_req, res) => {
+    res.json(await agentProfilePackageService.listProfiles());
+  })
+);
+
+// POST /api/config/agent-profiles/validate - Validate profile package YAML/JSON
+router.post(
+  '/agent-profiles/validate',
+  asyncHandler(async (req, res) => {
+    const input = AgentProfileValidateBodySchema.parse(req.body);
+    res.json(agentProfilePackageService.validateContent(input));
+  })
+);
+
+// POST /api/config/agent-profiles/import - Import or replace a profile package
+router.post(
+  '/agent-profiles/import',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    const input = AgentProfileImportBodySchema.parse(req.body);
+    try {
+      const result = await agentProfilePackageService.importProfile(input);
+      res.status(result.created ? 201 : 200).json(result);
+    } catch (error) {
+      throw new BadRequestError(error instanceof Error ? error.message : 'Invalid profile package');
+    }
+  })
+);
+
+// GET /api/config/agent-profiles/:id - Get a profile package
+router.get(
+  '/agent-profiles/:id',
+  asyncHandler(async (req, res) => {
+    const profile = await agentProfilePackageService.getProfile(req.params.id as string);
+    if (!profile) {
+      throw new BadRequestError(`Agent profile package not found: ${req.params.id}`);
+    }
+    res.json(profile);
+  })
+);
+
+// GET /api/config/agent-profiles/:id/export - Export a profile as YAML or JSON
+router.get(
+  '/agent-profiles/:id/export',
+  asyncHandler(async (req, res) => {
+    const format =
+      AgentProfilePackageFormatSchema.parse(req.query.format) ??
+      (req.query.format === 'json' ? 'json' : 'yaml');
+    try {
+      res.json(await agentProfilePackageService.exportProfile(req.params.id as string, format));
+    } catch (error) {
+      throw new BadRequestError(
+        error instanceof Error ? error.message : 'Failed to export profile package'
+      );
+    }
+  })
+);
+
+// PATCH /api/config/agent-profiles/:id - Edit profile metadata and enablement
+router.patch(
+  '/agent-profiles/:id',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    const patch = AgentProfileUpdateBodySchema.parse(req.body);
+    try {
+      res.json(await agentProfilePackageService.updateProfile(req.params.id as string, patch));
+    } catch (error) {
+      throw new BadRequestError(
+        error instanceof Error ? error.message : 'Failed to update profile package'
+      );
+    }
+  })
+);
+
+// DELETE /api/config/agent-profiles/:id - Remove a profile package
+router.delete(
+  '/agent-profiles/:id',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    try {
+      await agentProfilePackageService.deleteProfile(req.params.id as string);
+      res.status(204).send();
+    } catch (error) {
+      throw new BadRequestError(
+        error instanceof Error ? error.message : 'Failed to delete profile package'
+      );
+    }
+  })
+);
+
+// POST /api/config/repos - Add repo
+router.post(
+  '/repos',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    let repo: RepoConfig;
+    try {
+      repo = repoSchema.parse(req.body) as RepoConfig;
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        throw new ValidationError('Validation failed', error.issues);
+      }
+      throw error;
+    }
+    try {
+      const config = await configService.addRepo(repo);
+      res.status(201).json(config);
+    } catch (error: any) {
+      throw new BadRequestError(error.message || 'Failed to add repo');
+    }
+  })
+);
+
+// PATCH /api/config/repos/:name - Update repo
+router.patch(
+  '/repos/:name',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    let updates;
+    try {
+      updates = repoSchema.partial().parse(req.body);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        throw new ValidationError('Validation failed', error.issues);
+      }
+      throw error;
+    }
+    try {
+      const config = await configService.updateRepo(req.params.name as string, updates);
+      res.json(config);
+    } catch (error: any) {
+      throw new BadRequestError(error.message || 'Failed to update repo');
+    }
+  })
+);
+
+// DELETE /api/config/repos/:name - Remove repo
+router.delete(
+  '/repos/:name',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    try {
+      const config = await configService.removeRepo(req.params.name as string);
+      res.json(config);
+    } catch (error: any) {
+      throw new BadRequestError(error.message || 'Failed to remove repo');
+    }
+  })
+);
+
+// POST /api/config/repos/validate - Validate repo path
+router.post(
+  '/repos/validate',
+  asyncHandler(async (req, res) => {
+    let path: string;
+    try {
+      ({ path } = validateRepoPathSchema.parse(req.body));
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        throw new ValidationError('Validation failed', error.issues);
+      }
+      throw error;
+    }
+    try {
+      const result = await configService.validateRepoPath(path);
+      res.json(result);
+    } catch (error: any) {
+      throw new BadRequestError(error.message || 'Failed to validate path', { valid: false });
+    }
+  })
+);
+
+// GET /api/config/repos/:name/branches - Get repo branches
+router.get(
+  '/repos/:name/branches',
+  asyncHandler(async (req, res) => {
+    try {
+      const branches = await configService.getRepoBranches(req.params.name as string);
+      res.json(branches);
+    } catch (error: any) {
+      throw new BadRequestError(error.message || 'Failed to get branches');
+    }
+  })
+);
+
+// GET /api/config/agent-support - Canonical redacted harness readiness projection
+router.get(
+  '/agent-support',
+  asyncHandler(async (_req, res) => {
+    res.json(await harnessSupportService.list());
+  })
+);
+
+// GET /api/config/harness-compatibility - Reviewed compatibility and live support evidence
+router.get(
+  '/harness-compatibility',
+  asyncHandler(async (_req, res) => {
+    const supportStatuses = await harnessSupportService.list();
+    res.json(harnessCompatibilityMatrixService.build(supportStatuses));
+  })
+);
+
+// GET /api/config/agents - List agents
+router.get(
+  '/agents',
+  asyncHandler(async (_req, res) => {
+    const config = await configService.getConfig();
+    res.json(config.agents);
+  })
+);
+
+// PUT /api/config/agents - Update all agents
+router.put(
+  '/agents',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    let agents: AgentConfig[];
+    try {
+      agents = z.array(agentSchema).parse(req.body) as AgentConfig[];
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        throw new ValidationError('Validation failed', error.issues);
+      }
+      throw error;
+    }
+    const config = await configService.updateAgents(agents);
+    res.json(config);
+  })
+);
+
+// PUT /api/config/default-agent - Set default agent
+router.put(
+  '/default-agent',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    let agent: string;
+    try {
+      ({ agent } = setDefaultAgentSchema.parse(req.body));
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        throw new ValidationError('Validation failed', error.issues);
+      }
+      throw error;
+    }
+    const config = await configService.setDefaultAgent(agent as AgentType);
+    res.json(config);
+  })
+);
+
+export { router as configRoutes };

@@ -1,0 +1,185 @@
+import { Menu, dialog, type MenuItemConstructorOptions } from 'electron';
+
+import {
+  createDesktopCommandRequest,
+  DESKTOP_COMMAND_REGISTRY,
+  type DesktopCommandDispatcher,
+} from './commands.js';
+import type { DesktopStatusSnapshot } from './types.js';
+import type {
+  DesktopCommandName,
+  DesktopUpdateStatus,
+} from '../shared/desktop-bridge-contracts.js';
+
+export interface ConfigureDesktopMenuOptions {
+  dispatch(command: DesktopCommandName): void;
+  copyVersionInfo(): void;
+  openHelp(): void;
+  status: DesktopStatusSnapshot;
+  updateStatus?: DesktopUpdateStatus;
+  platform?: NodeJS.Platform;
+}
+
+export function configureDesktopMenu(options: ConfigureDesktopMenuOptions): void {
+  Menu.setApplicationMenu(Menu.buildFromTemplate(createDesktopMenuTemplate(options)));
+}
+
+export function createDesktopMenuTemplate(
+  options: ConfigureDesktopMenuOptions
+): MenuItemConstructorOptions[] {
+  const isMac = (options.platform ?? process.platform) === 'darwin';
+  const command = (name: DesktopCommandName): MenuItemConstructorOptions => {
+    const definition = DESKTOP_COMMAND_REGISTRY[name];
+    return {
+      label: definition.label,
+      accelerator: definition.accelerator,
+      enabled: isCommandEnabled(name, options.status, options.updateStatus),
+      click: () => options.dispatch(name),
+    };
+  };
+
+  const macosMenus: MenuItemConstructorOptions[] = isMac
+    ? [
+        { role: 'windowMenu' },
+        {
+          role: 'help',
+          submenu: [
+            {
+              label: 'Veritas Kanban Help',
+              click: () => options.openHelp(),
+            },
+            {
+              ...command('open-onboarding'),
+              label: 'Show Setup && Diagnostics',
+            },
+          ],
+        },
+      ]
+    : [];
+
+  return [
+    {
+      label: 'Veritas Kanban',
+      submenu: [
+        { role: 'about', label: 'About Veritas Kanban' },
+        { type: 'separator' },
+        {
+          label: 'Copy Version Information',
+          click: () => options.copyVersionInfo(),
+        },
+        { type: 'separator' },
+        command('open-onboarding'),
+        command('open-settings'),
+        command('communication-health'),
+        { type: 'separator' },
+        command('check-for-updates'),
+        command('download-update'),
+        command('install-update'),
+        { type: 'separator' },
+        ...(isMac
+          ? [
+              { role: 'services' as const },
+              { type: 'separator' as const },
+              { role: 'hide' as const, accelerator: 'Command+H' },
+              { role: 'hideOthers' as const, accelerator: 'Command+Alt+H' },
+              { role: 'unhide' as const },
+              { type: 'separator' as const },
+            ]
+          : []),
+        { role: 'quit', accelerator: 'CommandOrControl+Q' },
+      ],
+    },
+    {
+      label: 'File',
+      submenu: [
+        command('new-task'),
+        command('import-data'),
+        command('export-data'),
+        command('create-backup'),
+        { type: 'separator' },
+        { role: 'close', accelerator: 'CommandOrControl+W' },
+      ],
+    },
+    { role: 'editMenu' },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'resetZoom', accelerator: 'CommandOrControl+0' },
+        { role: 'zoomIn', accelerator: 'CommandOrControl+Plus' },
+        { role: 'zoomOut', accelerator: 'CommandOrControl+-' },
+        { type: 'separator' },
+        { role: 'togglefullscreen', accelerator: isMac ? 'Control+Command+F' : 'F11' },
+      ],
+    },
+    {
+      label: 'Navigate',
+      submenu: [
+        command('open-command-center'),
+        command('open-search'),
+        command('open-settings'),
+        { type: 'separator' },
+        command('reset-layout'),
+      ],
+    },
+    {
+      label: 'Desktop',
+      submenu: [
+        command('restart-local-server'),
+        command('open-logs'),
+        command('show-diagnostics'),
+        command('create-debug-bundle'),
+        { type: 'separator' },
+        command('test-notification'),
+        command('test-squad-webhook'),
+        command('copy-redacted-diagnostics'),
+      ],
+    },
+    ...macosMenus,
+  ];
+}
+
+export function dispatchDesktopMenuCommand(
+  dispatcher: DesktopCommandDispatcher,
+  command: DesktopCommandName
+): void {
+  void dispatcher
+    .dispatch(createDesktopCommandRequest(command, 'menu'))
+    .then((result) => {
+      if (!result.accepted)
+        return dialog.showMessageBox({
+          type: 'info',
+          message: DESKTOP_COMMAND_REGISTRY[command].label,
+          detail: result.message ?? 'This action is unavailable. Open the workspace and try again.',
+        });
+    })
+    .catch(() =>
+      dialog.showMessageBox({
+        type: 'error',
+        message: 'Unable to complete the command',
+        detail: 'Check Setup & Diagnostics, then try again.',
+      })
+    );
+}
+
+function isCommandEnabled(
+  command: DesktopCommandName,
+  status: DesktopStatusSnapshot,
+  updateStatus?: DesktopUpdateStatus
+): boolean {
+  if (command === 'restart-local-server') {
+    return status.mode === 'local-dev' || status.mode === 'local-production';
+  }
+  if (command === 'open-logs') {
+    return Boolean(status.logsDir);
+  }
+  if (command === 'test-squad-webhook') {
+    return status.server.state === 'ready';
+  }
+  if (command === 'download-update') {
+    return updateStatus?.state === 'available';
+  }
+  if (command === 'install-update') {
+    return updateStatus?.state === 'ready';
+  }
+  return true;
+}

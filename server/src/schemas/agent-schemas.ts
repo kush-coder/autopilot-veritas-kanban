@@ -1,0 +1,45 @@
+import { z } from 'zod';
+import { AgentBudgetPolicySchema } from './agent-budget-schemas.js';
+import { TaskCommitPolicySchema } from './task-envelope-schemas.js';
+
+const AgentTypeSchema = z.string().min(1).max(50);
+
+/**
+ * POST /api/agents/:taskId/start - Start agent on task
+ */
+export const StartAgentBodySchema = z.object({
+  agent: AgentTypeSchema.optional(),
+  profileId: AgentTypeSchema.optional(),
+  overrideReason: z.string().trim().min(8).max(1000).optional(),
+  sandboxPresetId: z.string().trim().min(1).max(80).optional(),
+  budget: AgentBudgetPolicySchema.optional(),
+  commitPolicy: TaskCommitPolicySchema.optional(),
+});
+
+export type StartAgentBody = z.infer<typeof StartAgentBodySchema>;
+
+/**
+ * POST /api/agents/:taskId/complete - Agent completion callback
+ */
+export const CompleteAgentBodySchema = z.object({
+  success: z.boolean(),
+  summary: z.string().optional(),
+  error: z.string().optional(),
+});
+
+export type CompleteAgentBody = z.infer<typeof CompleteAgentBodySchema>;
+
+/**
+ * POST /api/agents/:taskId/tokens - Report token usage
+ */
+export const ReportTokensBodySchema = z.object({
+  attemptId: z.string().trim().min(1).max(120),
+  inputTokens: z.number({ message: 'inputTokens is required' }).int().nonnegative(),
+  outputTokens: z.number({ message: 'outputTokens is required' }).int().nonnegative(),
+  totalTokens: z.number().int().nonnegative().optional(),
+  cost: z.number().nonnegative().optional(),
+  model: z.string().optional(),
+  agent: AgentTypeSchema.optional(),
+});
+
+export type ReportTokensBody = z.infer<typeof ReportTokensBodySchema>;

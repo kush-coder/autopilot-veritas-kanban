@@ -1,0 +1,538 @@
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  Notification,
+  safeStorage,
+  shell,
+  screen,
+  systemPreferences,
+} from 'electron';
+import path from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
+
+import { DESKTOP_APP_ID, DESKTOP_APP_NAME, DESKTOP_MIN_WINDOW } from './app-metadata.js';
+import { registerDesktopBridge } from './bridge.js';
+import { DesktopCommandDispatcher } from './commands.js';
+import { applyTitlebarAction, resolveTitlebarAction } from './titlebar-action.js';
+import { SettingsWindowController, SETTINGS_WINDOW_COMMANDS } from './settings-window.js';
+import { sendAcknowledgedRendererCommand } from './renderer-commands.js';
+import { extractDeepLinkFromArgv, parseDesktopDeepLink } from './deep-links.js';
+import { configureDesktopMenu, dispatchDesktopMenuCommand } from './menu.js';
+import {
+  hasSameOriginNavigation,
+  isOwnedDesktopSender,
+  openValidatedExternalUrl,
+} from './navigation.js';
+import { DesktopNotificationCenter, ElectronNotificationAdapter } from './notifications.js';
+import { createDesktopPaths, resolveRepoRoot } from './paths.js';
+import { findAvailablePort } from './ports.js';
+import { DesktopRuntime } from './runtime.js';
+import { DesktopSecretStore } from './secrets.js';
+import { statusPageUrl } from './status-page.js';
+import {
+  DesktopUpdateService,
+  ElectronAutoUpdaterAdapter,
+  resolveDesktopUpdateChannel,
+} from './updates.js';
+import {
+  createDesktopAboutPanelOptions,
+  createDesktopAppInfo,
+  formatDesktopVersionInfo,
+} from './version-info.js';
+import {
+  DESKTOP_BRIDGE_EVENTS,
+  redactDesktopBridgeValue,
+  type DesktopUpdateStatus,
+} from '../shared/desktop-bridge-contracts.js';
+import {
+  applyDesktopWindowState,
+  captureDesktopWindowState,
+  readDesktopWindowState,
+  writeDesktopWindowStateSync,
+  type DesktopWindowState,
+} from './window-state.js';
+
+const require = createRequire(import.meta.url);
+const { autoUpdater } = require('electron-updater') as typeof import('electron-updater');
+const DESKTOP_HELP_URL =
+  'https://github.com/BradGroux/veritas-kanban/blob/main/docs/GETTING-STARTED.md';
+
+let mainWindow: BrowserWindow | null = null;
+let runtime: DesktopRuntime | null = null;
+let settingsWindow: SettingsWindowController | null = null;
+let commandDispatcher: DesktopCommandDispatcher | null = null;
+let updateService: DesktopUpdateService | null = null;
+let windowStatePaths: ReturnType<typeof createDesktopPaths> | null = null;
+let quitting = false;
+let shutdownStarted = false;
+const pendingDeepLinks: string[] = [];
+
+function activeMainWindow(): BrowserWindow | null {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return null;
+  }
+  return mainWindow;
+}
+
+function showDesktopError(message: string): void {
+  if (quitting) return;
+
+  const window = activeMainWindow();
+  if (!window) return;
+
+  void window
+    .loadURL(statusPageUrl('Veritas Kanban desktop error', message, runtime?.snapshot()))
+    .catch(() => undefined);
+}
+
+function isPackagedRuntime(): boolean {
+  return app.isPackaged || process.env.VERITAS_DESKTOP_PRODUCTION === 'true';
+}
+
+const launchPackaged = isPackagedRuntime();
+const launchRepoRoot = resolveRepoRoot(app.getAppPath());
+const launchProfile = process.env.VERITAS_DESKTOP_PROFILE || 'default';
+const launchWorkspace = process.env.VERITAS_DESKTOP_WORKSPACE || 'local';
+
+if (!launchPackaged) {
+  const devUserDataPath = path.join(
+    launchRepoRoot,
+    '.veritas-desktop-dev',
+    launchProfile,
+    'app-home'
+  );
+  mkdirSync(devUserDataPath, { recursive: true });
+  app.setPath('userData', devUserDataPath);
+}
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+}
+
+function createMainWindow(savedState: DesktopWindowState): BrowserWindow {
+  const preloadPath = path.join(__dirname, '../preload/index.cjs');
+  const primary = screen.getPrimaryDisplay();
+  const workAreas = [
+    primary,
+    ...screen.getAllDisplays().filter((display) => display.id !== primary.id),
+  ].map((display) => display.workArea);
+  const windowBounds = applyDesktopWindowState(savedState, undefined, workAreas);
+
+  const window = new BrowserWindow({
+    title: DESKTOP_APP_NAME,
+    minWidth: Math.min(DESKTOP_MIN_WINDOW.width, windowBounds.width),
+    minHeight: Math.min(DESKTOP_MIN_WINDOW.height, windowBounds.height),
+    ...windowBounds,
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    trafficLightPosition: process.platform === 'darwin' ? { x: 16, y: 18 } : undefined,
+    backgroundColor: '#111318',
+    show: false,
+    webPreferences: {
+      preload: preloadPath,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+    },
+  });
+
+  window.once('ready-to-show', () => window.show());
+  if (savedState.maximized) {
+    window.maximize();
+  }
+  window.on('close', () => {
+    if (windowStatePaths) {
+      writeDesktopWindowStateSync(windowStatePaths, captureDesktopWindowState(window));
+    }
+  });
+  window.on('closed', () => {
+    if (mainWindow === window) {
+      mainWindow = null;
+    }
+  });
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    void openValidatedExternalUrl(shell, url);
+    return { action: 'deny' };
+  });
+  window.webContents.on('will-navigate', (event, url) => {
+    const current = runtime?.getRendererOrigin();
+    if (current && !hasSameOriginNavigation(url, current)) {
+      event.preventDefault();
+      void openValidatedExternalUrl(shell, url);
+    }
+  });
+  window.webContents.on('did-fail-load', (_event, _code, description) => {
+    if (!quitting) {
+      void window.loadURL(
+        statusPageUrl('Veritas Kanban could not load', description, runtime?.snapshot())
+      );
+    }
+  });
+
+  return window;
+}
+
+function handleDeepLink(url: string): void {
+  if (!commandDispatcher) {
+    pendingDeepLinks.push(url);
+    return;
+  }
+
+  try {
+    const deepLink = parseDesktopDeepLink(url);
+    void commandDispatcher.dispatch(deepLink.command);
+  } catch (error) {
+    activeMainWindow()?.webContents.send(DESKTOP_BRIDGE_EVENTS.communicationCheck.channel, {
+      target: 'external',
+      state: 'failed',
+      detail: error instanceof Error ? error.message : String(error),
+      checkedAt: new Date().toISOString(),
+    });
+  }
+}
+
+function flushPendingDeepLinks(): void {
+  for (const deepLink of pendingDeepLinks.splice(0)) {
+    handleDeepLink(deepLink);
+  }
+}
+
+function refreshDesktopMenu(): void {
+  if (!runtime || !commandDispatcher) {
+    return;
+  }
+
+  const appInfo = createDesktopAppInfo(app.getVersion(), launchPackaged);
+  configureDesktopMenu({
+    status: runtime.snapshot(),
+    updateStatus: updateService?.snapshot(),
+    copyVersionInfo: () => clipboard.writeText(formatDesktopVersionInfo(appInfo)),
+    openHelp: () => {
+      void openValidatedExternalUrl(shell, DESKTOP_HELP_URL);
+    },
+    dispatch: (command) => {
+      if (commandDispatcher) {
+        dispatchDesktopMenuCommand(commandDispatcher, command);
+      }
+    },
+  });
+}
+
+function updateServiceFallback(packaged: boolean): DesktopUpdateStatus {
+  const appInfo = createDesktopAppInfo(app.getVersion(), packaged);
+  return {
+    state: 'unsupported',
+    currentVersion: appInfo.version,
+    channel: appInfo.channel,
+    checkedAt: new Date().toISOString(),
+    detail: 'Updater service is not initialized.',
+  };
+}
+
+async function boot(): Promise<void> {
+  app.setName(DESKTOP_APP_NAME);
+  app.setAppUserModelId(DESKTOP_APP_ID);
+
+  const packaged = launchPackaged;
+  const appInfo = createDesktopAppInfo(app.getVersion(), packaged);
+  app.setAboutPanelOptions(createDesktopAboutPanelOptions(appInfo));
+  const repoRoot = launchRepoRoot;
+  const profile = launchProfile;
+  const workspace = launchWorkspace;
+  const paths = createDesktopPaths({
+    userDataPath: app.getPath('userData'),
+    repoRoot,
+    isPackaged: packaged,
+    profile,
+    workspace,
+  });
+  windowStatePaths = paths;
+
+  const serverPort = await findAvailablePort(
+    Number(process.env.VERITAS_DESKTOP_SERVER_PORT || 3001)
+  );
+  const webPort = await findAvailablePort(
+    Number(process.env.VERITAS_DESKTOP_WEB_PORT || 3000),
+    '127.0.0.1',
+    50,
+    new Set([serverPort])
+  );
+
+  mainWindow = createMainWindow(await readDesktopWindowState(paths));
+  await mainWindow.loadURL(statusPageUrl('Starting Veritas Kanban', 'Preparing the local app.'));
+
+  const secretStore = new DesktopSecretStore({ safeStorage, paths });
+  const secretState = secretStore.inspect();
+  if (!secretState.available) {
+    await mainWindow.loadURL(
+      statusPageUrl(
+        'Veritas Kanban needs Keychain access',
+        `${secretState.error} ${secretState.recoveryActions.join(' ')}`,
+        undefined
+      )
+    );
+    return;
+  }
+
+  let secrets;
+  try {
+    secrets = await secretStore.loadRuntimeSecrets();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await mainWindow.loadURL(statusPageUrl('Veritas Kanban secret recovery needed', message));
+    return;
+  }
+
+  runtime = new DesktopRuntime({
+    repoRoot,
+    resourcesPath: process.resourcesPath,
+    paths,
+    serverPort,
+    webPort,
+    isPackaged: packaged,
+    profile,
+    workspace,
+    secrets,
+    secretsBackedByKeychain: secretState.available,
+  });
+
+  const notifications = new DesktopNotificationCenter(
+    new ElectronNotificationAdapter(Notification),
+    (request) => {
+      mainWindow?.webContents.send(DESKTOP_BRIDGE_EVENTS.notificationAction.channel, request);
+    }
+  );
+  updateService = new DesktopUpdateService({
+    adapter: new ElectronAutoUpdaterAdapter(autoUpdater),
+    packaged,
+    currentVersion: app.getVersion(),
+    channel: resolveDesktopUpdateChannel(
+      process.env.VERITAS_UPDATE_CHANNEL,
+      app.getVersion(),
+      packaged
+    ),
+    forceDevUpdateConfig: process.env.VERITAS_DESKTOP_UPDATER_FORCE_DEV === 'true',
+    emitStatus: (status) => {
+      for (const window of [activeMainWindow(), settingsWindow?.getWindow()])
+        window?.webContents.send(DESKTOP_BRIDGE_EVENTS.updateStatus.channel, status);
+      refreshDesktopMenu();
+    },
+  });
+
+  const activeRuntime = runtime;
+  const nativeSettings = new SettingsWindowController({
+    ipc: ipcMain,
+    origin: () => activeRuntime.getRendererOrigin(),
+    quitting: () => quitting,
+    returnFocus: () => activeMainWindow()?.focus(),
+    createWindow: () => {
+      const area = screen.getPrimaryDisplay().workArea;
+      const window = new BrowserWindow({
+        title: 'Settings — Veritas Kanban',
+        width: Math.min(1040, area.width),
+        height: Math.min(800, area.height),
+        minWidth: Math.min(640, area.width),
+        minHeight: Math.min(480, area.height),
+        show: false,
+        backgroundColor: '#111318',
+        webPreferences: {
+          preload: path.join(__dirname, '../preload/index.cjs'),
+          nodeIntegration: false,
+          contextIsolation: true,
+          sandbox: true,
+        },
+      });
+      window.webContents.setWindowOpenHandler(({ url }) => {
+        void openValidatedExternalUrl(shell, url);
+        return { action: 'deny' };
+      });
+      window.webContents.on('will-navigate', (event, url) => {
+        const parsed = new URL(url);
+        if (
+          !hasSameOriginNavigation(url, activeRuntime.getRendererOrigin()) ||
+          parsed.searchParams.get('desktop-settings') !== '1'
+        ) {
+          event.preventDefault();
+          void openValidatedExternalUrl(shell, url);
+        }
+      });
+      return window;
+    },
+  });
+
+  settingsWindow = nativeSettings;
+
+  commandDispatcher = new DesktopCommandDispatcher({
+    runtime,
+    shell,
+    quit: () => app.quit(),
+    sendRendererCommand: (command) =>
+      process.platform === 'darwin' && SETTINGS_WINDOW_COMMANDS.has(command.command)
+        ? nativeSettings.open(command)
+        : sendAcknowledgedRendererCommand(ipcMain, activeMainWindow()?.webContents, command),
+    checkForUpdates: () =>
+      updateService?.checkForUpdates() ?? Promise.resolve(updateServiceFallback(packaged)),
+    downloadUpdate: () =>
+      updateService?.downloadUpdate() ?? Promise.resolve(updateServiceFallback(packaged)),
+    installUpdate: () => updateService?.installUpdate() ?? updateServiceFallback(packaged),
+    showTestNotification: () => {
+      notifications.show({
+        id: `setup-test-${Date.now()}`,
+        kind: 'setup-test',
+        title: 'Veritas Kanban notification test',
+        body: 'Local desktop notifications are working.',
+        target: { type: 'settings' },
+        privacyMode: 'private',
+      });
+    },
+    copyRedactedDiagnostics: (status) => {
+      clipboard.writeText(JSON.stringify(redactDesktopBridgeValue(status), null, 2));
+    },
+  });
+
+  registerDesktopBridge(
+    ipcMain,
+    runtime,
+    shell,
+    packaged,
+    app.getVersion(),
+    commandDispatcher,
+    updateService,
+    {
+      performTitlebarAction: () =>
+        applyTitlebarAction(
+          activeMainWindow(),
+          resolveTitlebarAction(
+            process.platform,
+            process.platform === 'darwin'
+              ? systemPreferences.getUserDefault('AppleActionOnDoubleClick', 'string')
+              : ''
+          )
+        ),
+    },
+    (event) =>
+      isOwnedDesktopSender(
+        event,
+        [activeMainWindow()?.webContents, settingsWindow?.getWindow()?.webContents],
+        activeRuntime.getRendererOrigin(),
+        activeMainWindow()?.webContents
+      )
+  );
+  refreshDesktopMenu();
+  runtime.on('status', (status) => {
+    for (const window of [activeMainWindow(), settingsWindow?.getWindow()])
+      window?.webContents.send(DESKTOP_BRIDGE_EVENTS.serverStatus.channel, status);
+    refreshDesktopMenu();
+  });
+
+  try {
+    await runtime.start();
+    flushPendingDeepLinks();
+    await mainWindow.loadURL(runtime.getRendererOrigin());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await mainWindow.loadURL(
+      statusPageUrl('Veritas Kanban startup failed', message, runtime.snapshot())
+    );
+  }
+}
+
+app.on('ready', () => {
+  app.setAsDefaultProtocolClient('veritas');
+  const initialDeepLink = extractDeepLinkFromArgv(process.argv);
+  if (initialDeepLink) {
+    pendingDeepLinks.push(initialDeepLink);
+  }
+  void boot();
+});
+
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  handleDeepLink(url);
+});
+
+app.on('second-instance', (_event, argv) => {
+  const deepLink = extractDeepLinkFromArgv(argv);
+  if (deepLink) {
+    handleDeepLink(deepLink);
+  }
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.focus();
+  }
+});
+
+let preparingQuit = false;
+app.on('before-quit', (event) => {
+  if (shutdownStarted) {
+    quitting = true;
+    return;
+  }
+  event.preventDefault();
+  if (preparingQuit) return;
+  preparingQuit = true;
+  void (async () => {
+    try {
+      if (settingsWindow && !(await settingsWindow.prepareToQuit())) {
+        await dialog.showMessageBox({
+          type: 'warning',
+          title: 'Settings are not saved',
+          message: 'Wait for Settings to finish saving, or retry the failed save, then quit again.',
+          buttons: ['Return to Settings'],
+        });
+        return;
+      }
+      quitting = true;
+      shutdownStarted = true;
+      try {
+        await runtime?.stop();
+      } finally {
+        app.quit();
+      }
+    } finally {
+      preparingQuit = false;
+    }
+  })();
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+let reopeningWindow = false;
+app.on('activate', () => {
+  if (activeMainWindow() || reopeningWindow || quitting) return;
+  reopeningWindow = true;
+  void (async () => {
+    // Closing the last Mac window keeps its managed server and IPC handlers alive.
+    if (runtime && windowStatePaths) {
+      const savedState = await readDesktopWindowState(windowStatePaths);
+      if (quitting) return;
+      mainWindow = createMainWindow(savedState);
+      await mainWindow.loadURL(runtime.getRendererOrigin());
+      flushPendingDeepLinks();
+    } else {
+      await boot();
+    }
+  })()
+    .catch((error: unknown) => {
+      showDesktopError(error instanceof Error ? error.message : 'Unable to reopen the window.');
+    })
+    .finally(() => {
+      reopeningWindow = false;
+    });
+});
+
+process.on('uncaughtException', (error) => {
+  showDesktopError(error.message);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  showDesktopError(message);
+});

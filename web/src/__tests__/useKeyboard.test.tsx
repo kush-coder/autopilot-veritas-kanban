@@ -1,0 +1,428 @@
+/**
+ * Tests for hooks/useKeyboard.tsx — KeyboardProvider & keyboard shortcuts.
+ */
+import React from 'react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { taskBoardRankAtIndex, type Task, type TaskStatus } from '@veritas-kanban/shared';
+import { createMockTask } from './test-utils';
+
+// Mock toast — vi.mock is hoisted before imports.
+// useKeyboard.tsx imports from relative path but vitest resolves @/ aliases in mocks.
+vi.mock('@/hooks/useToast', () => ({
+  toast: vi.fn(),
+  useToast: () => ({ toast: vi.fn(), toasts: [], dismiss: vi.fn() }),
+  default: vi.fn(),
+}));
+
+const featureSettingsMock = vi.hoisted(() => ({
+  settings: {
+    board: {
+      columns: [
+        { id: 'todo', title: 'To Do' },
+        { id: 'in-progress', title: 'In Progress' },
+        { id: 'blocked', title: 'Blocked' },
+        { id: 'done', title: 'Done' },
+      ],
+    },
+  },
+}));
+
+vi.mock('@/hooks/useFeatureSettings', () => ({
+  useFeatureSettings: () => featureSettingsMock,
+}));
+
+import { KeyboardProvider, useKeyboard } from '@/hooks/useKeyboard';
+
+// ── Test Component ───────────────────────────────────────────
+
+/** Stable empty array to avoid infinite re-render loops from default params. */
+const EMPTY_TASKS: Task[] = [];
+
+function TestConsumer({
+  tasks = EMPTY_TASKS,
+  onOpenTask,
+  onMoveTask,
+}: {
+  tasks?: Task[];
+  onOpenTask?: (task: Task) => void;
+  onMoveTask?: (taskId: string, status: TaskStatus) => void;
+}) {
+  const { setTasks, setOnOpenTask, setOnMoveTask, selectedTaskId, isHelpOpen, openHelpDialog } =
+    useKeyboard();
+
+  React.useEffect(() => {
+    setTasks(tasks);
+  }, [tasks, setTasks]);
+
+  React.useEffect(() => {
+    if (onOpenTask) setOnOpenTask(onOpenTask);
+    if (onMoveTask) setOnMoveTask(onMoveTask);
+  }, [onOpenTask, onMoveTask, setOnOpenTask, setOnMoveTask]);
+
+  return (
+    <div>
+      <div data-testid="selected">{selectedTaskId ?? 'none'}</div>
+      <div data-testid="help-open">{isHelpOpen ? 'yes' : 'no'}</div>
+      <button data-testid="open-help" onClick={openHelpDialog}>
+        Open Help
+      </button>
+    </div>
+  );
+}
+
+function renderWithProvider(props: React.ComponentProps<typeof TestConsumer> = {}) {
+  return render(
+    <KeyboardProvider>
+      <TestConsumer {...props} />
+    </KeyboardProvider>
+  );
+}
+
+// ── Tests ────────────────────────────────────────────────────
+
+describe('KeyboardProvider', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    featureSettingsMock.settings = {
+      board: {
+        columns: [
+          { id: 'todo', title: 'To Do' },
+          { id: 'in-progress', title: 'In Progress' },
+          { id: 'blocked', title: 'Blocked' },
+          { id: 'done', title: 'Done' },
+        ],
+      },
+    };
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('follows positions and durable ranks across custom columns, reorder, and filtering', () => {
+    featureSettingsMock.settings.board.columns = [
+      { id: 'ready', title: 'Ready' },
+      { id: 'todo', title: 'To Do' },
+    ];
+    const legacy = createMockTask({ id: 'legacy', title: 'Zulu', status: 'ready', position: 1 });
+    const later = createMockTask({ id: 'later', title: 'Alpha', status: 'ready', position: 5 });
+    const ranked = createMockTask({
+      id: 'ranked',
+      title: 'Middle',
+      status: 'ready',
+      position: 99,
+      boardRank: taskBoardRankAtIndex([legacy, later], 1),
+    });
+    const todo = createMockTask({ id: 'todo', status: 'todo', position: -100 });
+    const hidden = createMockTask({ id: 'hidden', status: 'retired', position: -200 });
+    const tasks = [todo, later, ranked, legacy, hidden];
+    const view = renderWithProvider({ tasks });
+    for (const id of ['legacy', 'ranked', 'later', 'todo']) {
+      fireEvent.keyDown(window, { key: 'j' });
+      expect(screen.getByTestId('selected').textContent).toBe(id);
+    }
+    fireEvent.keyDown(window, { key: 'ArrowUp' });
+    expect(screen.getByTestId('selected').textContent).toBe('later');
+    const reordered = [
+      todo,
+      { ...later, boardRank: taskBoardRankAtIndex([legacy, ranked], 0) },
+      ranked,
+      legacy,
+    ];
+    view.rerender(
+      <KeyboardProvider>
+        <TestConsumer tasks={reordered} />
+      </KeyboardProvider>
+    );
+    expect(screen.getByTestId('selected').textContent).toBe('later');
+    fireEvent.keyDown(window, { key: 'ArrowDown' });
+    expect(screen.getByTestId('selected').textContent).toBe('legacy');
+    view.rerender(
+      <KeyboardProvider>
+        <TestConsumer tasks={[ranked, todo]} />
+      </KeyboardProvider>
+    );
+    expect(screen.getByTestId('selected').textContent).toBe('none');
+    fireEvent.keyDown(window, { key: 'k' });
+    expect(screen.getByTestId('selected').textContent).toBe('todo');
+  });
+
+  it('throws when useKeyboard is used outside provider', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    function BadConsumer() {
+      useKeyboard();
+      return null;
+    }
+
+    expect(() => render(<BadConsumer />)).toThrow(
+      'useKeyboard must be used within KeyboardProvider'
+    );
+  });
+
+  it.each(['metaKey', 'ctrlKey', 'altKey', 'shiftKey'] as const)(
+    'leaves %s combinations to the platform',
+    (modifier) => {
+      const create = vi.fn();
+      const move = vi.fn();
+      function RegisterCreate() {
+        const { setOpenCreateDialog } = useKeyboard();
+        React.useEffect(() => setOpenCreateDialog(create), [setOpenCreateDialog]);
+        return null;
+      }
+      render(
+        <KeyboardProvider>
+          <RegisterCreate />
+          <TestConsumer tasks={[createMockTask({ id: 'task_one' })]} onMoveTask={move} />
+        </KeyboardProvider>
+      );
+      for (const key of ['c', 'j', 'k', '1', 'ArrowDown', 'ArrowUp', 'Enter']) {
+        const event = new KeyboardEvent('keydown', { key, [modifier]: true, cancelable: true });
+        fireEvent(window, event);
+        expect(event.defaultPrevented).toBe(false);
+      }
+      expect(create).not.toHaveBeenCalled();
+      expect(move).not.toHaveBeenCalled();
+      expect(screen.getByTestId('selected').textContent).toBe('none');
+      fireEvent.keyDown(window, { key: 'c' });
+      expect(create).toHaveBeenCalledOnce();
+    }
+  );
+
+  it('preserves the intentional chat chord and ignores IME composition', () => {
+    const chat = vi.fn();
+    const create = vi.fn();
+    function RegisterCommands() {
+      const { setOpenChatPanel, setOpenCreateDialog } = useKeyboard();
+      React.useEffect(() => {
+        setOpenChatPanel(chat);
+        setOpenCreateDialog(create);
+      }, [setOpenChatPanel, setOpenCreateDialog]);
+      return null;
+    }
+    render(
+      <KeyboardProvider>
+        <RegisterCommands />
+      </KeyboardProvider>
+    );
+    fireEvent.keyDown(window, { key: 'C', metaKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: 'C', ctrlKey: true, shiftKey: true });
+    expect(chat).toHaveBeenCalledTimes(2);
+    fireEvent.keyDown(window, { key: 'C', ctrlKey: true, shiftKey: true, altKey: true });
+    fireEvent.keyDown(window, { key: 'C', metaKey: true, shiftKey: true, isComposing: true });
+    fireEvent.keyDown(window, { key: 'c', isComposing: true });
+    fireEvent.keyDown(window, { key: 'c', keyCode: 229 });
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('starts with no selected task and help closed', () => {
+    renderWithProvider();
+    expect(screen.getByTestId('selected').textContent).toBe('none');
+    expect(screen.getByTestId('help-open').textContent).toBe('no');
+  });
+
+  it('toggles help dialog with ? key', () => {
+    renderWithProvider();
+    fireEvent.keyDown(window, { key: '?' });
+    expect(screen.getByTestId('help-open').textContent).toBe('yes');
+
+    fireEvent.keyDown(window, { key: '?' });
+    expect(screen.getByTestId('help-open').textContent).toBe('no');
+  });
+
+  it('closes help dialog with Escape', () => {
+    renderWithProvider();
+    fireEvent.keyDown(window, { key: '?' });
+    expect(screen.getByTestId('help-open').textContent).toBe('yes');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.getByTestId('help-open').textContent).toBe('no');
+  });
+
+  it('navigates tasks with j/k keys', () => {
+    const tasks = [
+      createMockTask({ id: 'a', title: 'Alpha', status: 'todo' }),
+      createMockTask({ id: 'b', title: 'Beta', status: 'todo' }),
+      createMockTask({ id: 'c', title: 'Charlie', status: 'todo' }),
+    ];
+
+    renderWithProvider({ tasks });
+
+    fireEvent.keyDown(window, { key: 'j' });
+    expect(screen.getByTestId('selected').textContent).toBe('a');
+
+    fireEvent.keyDown(window, { key: 'j' });
+    expect(screen.getByTestId('selected').textContent).toBe('b');
+
+    fireEvent.keyDown(window, { key: 'k' });
+    expect(screen.getByTestId('selected').textContent).toBe('a');
+  });
+
+  it('navigates tasks with arrow keys', () => {
+    const tasks = [
+      createMockTask({ id: 'x', title: 'X', status: 'todo' }),
+      createMockTask({ id: 'y', title: 'Y', status: 'todo' }),
+    ];
+
+    renderWithProvider({ tasks });
+
+    fireEvent.keyDown(window, { key: 'ArrowDown' });
+    expect(screen.getByTestId('selected').textContent).toBe('x');
+
+    fireEvent.keyDown(window, { key: 'ArrowDown' });
+    expect(screen.getByTestId('selected').textContent).toBe('y');
+
+    fireEvent.keyDown(window, { key: 'ArrowUp' });
+    expect(screen.getByTestId('selected').textContent).toBe('x');
+  });
+
+  it('wraps around when navigating past the last/first task', () => {
+    const tasks = [
+      createMockTask({ id: 'first', title: 'First', status: 'todo' }),
+      createMockTask({ id: 'last', title: 'Last', status: 'todo' }),
+    ];
+
+    renderWithProvider({ tasks });
+
+    fireEvent.keyDown(window, { key: 'j' });
+    fireEvent.keyDown(window, { key: 'j' });
+    expect(screen.getByTestId('selected').textContent).toBe('last');
+
+    fireEvent.keyDown(window, { key: 'j' });
+    expect(screen.getByTestId('selected').textContent).toBe('first');
+  });
+
+  it('opens task with Enter key', () => {
+    const tasks = [createMockTask({ id: 'enter-test', title: 'Enter Task', status: 'todo' })];
+    const onOpenTask = vi.fn();
+
+    renderWithProvider({ tasks, onOpenTask });
+
+    fireEvent.keyDown(window, { key: 'j' });
+    fireEvent.keyDown(window, { key: 'Enter' });
+
+    expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'enter-test' }));
+  });
+
+  it('moves task to column with number keys 1-4', () => {
+    const tasks = [createMockTask({ id: 'move-test', title: 'Move Task', status: 'todo' })];
+    const onMoveTask = vi.fn();
+
+    renderWithProvider({ tasks, onMoveTask });
+
+    fireEvent.keyDown(window, { key: 'j' });
+    fireEvent.keyDown(window, { key: '2' });
+    expect(onMoveTask).toHaveBeenCalledWith('move-test', 'in-progress');
+
+    fireEvent.keyDown(window, { key: '4' });
+    expect(onMoveTask).toHaveBeenCalledWith('move-test', 'done');
+  });
+
+  it('maps number keys to configured custom column order', () => {
+    featureSettingsMock.settings = {
+      board: {
+        columns: [
+          { id: 'triage', title: 'Triage' },
+          { id: 'todo', title: 'To Do' },
+          { id: 'ready', title: 'Ready' },
+          { id: 'in-progress', title: 'In Progress' },
+          { id: 'done', title: 'Done' },
+        ],
+      },
+    };
+    const tasks = [createMockTask({ id: 'custom-move', title: 'Move Task', status: 'triage' })];
+    const onMoveTask = vi.fn();
+
+    renderWithProvider({ tasks, onMoveTask });
+
+    fireEvent.keyDown(window, { key: 'j' });
+    fireEvent.keyDown(window, { key: '3' });
+
+    expect(onMoveTask).toHaveBeenCalledWith('custom-move', 'ready');
+  });
+
+  it('clears selection with Escape', () => {
+    const tasks = [createMockTask({ id: 'esc', title: 'Esc Task', status: 'todo' })];
+
+    renderWithProvider({ tasks });
+
+    fireEvent.keyDown(window, { key: 'j' });
+    expect(screen.getByTestId('selected').textContent).toBe('esc');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.getByTestId('selected').textContent).toBe('none');
+  });
+
+  it('ignores shortcuts when typing in an input', () => {
+    const tasks = [createMockTask({ id: 'input-test', title: 'Input', status: 'todo' })];
+
+    const { container } = renderWithProvider({ tasks });
+
+    const input = document.createElement('input');
+    container.appendChild(input);
+
+    fireEvent.keyDown(input, { key: 'j' });
+    expect(screen.getByTestId('selected').textContent).toBe('none');
+  });
+
+  it('leaves Escape to a visible modal when pending controls lose focus', () => {
+    const tasks = [createMockTask({ id: 'pending', title: 'Pending task', status: 'todo' })];
+    const { container } = renderWithProvider({ tasks });
+    fireEvent.keyDown(window, { key: 'j' });
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    container.appendChild(dialog);
+
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.getByTestId('selected').textContent).toBe('pending');
+
+    dialog.style.display = 'none';
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.getByTestId('selected').textContent).toBe('none');
+  });
+
+  it.each(['button', 'a', 'select', 'summary'])(
+    'preserves native Enter behavior on a focused %s',
+    (tag) => {
+      const { container } = renderWithProvider();
+      const control = document.createElement(tag);
+      if (tag === 'a') control.setAttribute('href', '#example');
+      container.appendChild(control);
+      const event = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+      control.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+  );
+
+  it('respects keyboard events already handled by a child control', () => {
+    const tasks = [createMockTask({ id: 'handled', title: 'Handled', status: 'todo' })];
+    renderWithProvider({ tasks });
+    const event = new KeyboardEvent('keydown', { key: 'j', bubbles: true, cancelable: true });
+    event.preventDefault();
+    fireEvent(window, event);
+    expect(screen.getByTestId('selected').textContent).toBe('none');
+  });
+
+  it.each(['button', 'tab', 'switch', 'combobox'])(
+    'leaves arrow navigation owned by a nested role=%s control',
+    (role) => {
+      const tasks = [createMockTask({ id: 'control', title: 'Control', status: 'todo' })];
+      const { container } = renderWithProvider({ tasks });
+      const control = document.createElement('div');
+      control.setAttribute('role', role);
+      const child = document.createElement('span');
+      control.appendChild(child);
+      container.appendChild(control);
+      const event = new KeyboardEvent('keydown', {
+        key: 'ArrowDown',
+        bubbles: true,
+        cancelable: true,
+      });
+      fireEvent(child, event);
+      expect(event.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('selected').textContent).toBe('none');
+    }
+  );
+});

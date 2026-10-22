@@ -1,0 +1,6 @@
+# Jekyll configuration for GitHub Pages
+# Exclude docs containing {{ template syntax that conflicts with Liquid
+exclude:
+  - FEATURES.md # Contains workflow YAML examples with {{ }}
+  - WORKFLOW-GUIDE.md # Contains workflow YAML examples with {{ }}
+  - DEPLOYMENT.md

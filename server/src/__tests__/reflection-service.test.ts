@@ -1,0 +1,331 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { CreateReflectionCandidateInput, Task } from '@veritas-kanban/shared';
+import {
+  ReflectionService,
+  type ReflectionServiceOptions,
+  type ReflectionTaskService,
+} from '../services/reflection-service.js';
+
+function createInput(
+  overrides: Partial<CreateReflectionCandidateInput> = {}
+): CreateReflectionCandidateInput {
+  return {
+    category: 'team',
+    source: {
+      kind: 'user-correction',
+      taskId: 'task_20260626_reflect',
+      messageId: 'msg_1',
+    },
+    summary: 'Agent repeated a stale implementation path.',
+    previousApproach: 'Continued with the old route shape.',
+    correction: 'Use the current route schema before editing.',
+    nextAttempt: 'Inspect the live route schema first and update the smallest matching surface.',
+    evidence: [{ kind: 'note', title: 'Correction', content: 'User corrected the route shape.' }],
+    tags: ['workflow', 'agent-correction'],
+    ...overrides,
+  };
+}
+
+function createTask(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'task_20260626_reflect',
+    title: 'Reflection task',
+    description: '',
+    type: 'feature',
+    status: 'in-progress',
+    priority: 'medium',
+    created: '2026-06-26T12:00:00.000Z',
+    updated: '2026-06-26T12:00:00.000Z',
+    ...overrides,
+  } as Task;
+}
+
+function createHarness(
+  task: Task = createTask(),
+  promotionAdapters?: ReflectionServiceOptions['promotionAdapters']
+) {
+  const audit = vi.fn().mockResolvedValue(undefined);
+  const updateTask = vi.fn().mockResolvedValue(task);
+  const taskService: ReflectionTaskService = {
+    getTask: vi.fn().mockResolvedValue(task),
+    updateTask,
+  };
+  return {
+    audit,
+    updateTask,
+    taskService,
+    service: new ReflectionService({
+      persist: false,
+      audit,
+      taskService,
+      promotionAdapters,
+    }),
+  };
+}
+
+describe('ReflectionService', () => {
+  it('creates pending candidates without changing durable task lessons', async () => {
+    const { service, updateTask } = createHarness();
+
+    const candidate = await service.create(
+      createInput({
+        summary:
+          'Do not copy token=secret123 or /Users/bradgroux/Projects/private into durable memory.',
+      })
+    );
+
+    expect(candidate.status).toBe('pending');
+    expect(candidate.summary).toContain('token=[REDACTED]');
+    expect(candidate.summary).toContain('[REDACTED_PATH]');
+    expect(candidate.redaction).toMatchObject({
+      redacted: true,
+      notes: expect.arrayContaining(['credential', 'private-path']),
+    });
+    expect(updateTask).not.toHaveBeenCalled();
+  });
+
+  it('redacts extracted scope metadata before durable persistence', async () => {
+    const { service } = createHarness();
+
+    const candidate = await service.create(
+      createInput({
+        source: {
+          kind: 'error',
+          taskId: 'task_20260626_reflect',
+          runId: 'attempt_1',
+          eventIds: ['event_1'],
+        },
+        proposedScope: 'workspace',
+        rationale: 'Observed token=secret123 in /Users/bradgroux/Projects/private.',
+        applicability: 'Use when api_key=topsecret is present.',
+        contradictionIds: ['reflection_previous'],
+      })
+    );
+
+    expect(candidate).toMatchObject({
+      proposedScope: 'workspace',
+      source: { runId: 'attempt_1', eventIds: ['event_1'] },
+      contradictionIds: ['reflection_previous'],
+    });
+    expect(candidate.rationale).toContain('token=[REDACTED]');
+    expect(candidate.rationale).toContain('[REDACTED_PATH]');
+    expect(candidate.applicability).toContain('api_key=[REDACTED]');
+    expect(candidate.redaction.redacted).toBe(true);
+  });
+
+  it('returns the original candidate when an extraction retry reuses its idempotency key', async () => {
+    const { service, audit } = createHarness();
+    const input = createInput({ idempotencyKey: 'reflection_job_1:candidate:0' });
+
+    const first = await service.create(input);
+    const retried = await service.create(input);
+
+    expect(retried.id).toBe(first.id);
+    expect(audit).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts a reviewed task-linked candidate into task lessons', async () => {
+    const task = createTask({ lessonsLearned: 'Existing lesson', lessonTags: ['existing'] });
+    const { service, updateTask } = createHarness(task);
+    const candidate = await service.create(createInput());
+
+    const accepted = await service.accept(candidate.id, {
+      reviewedBy: 'brad',
+      promotionTarget: 'task-lesson',
+      reviewerNote: 'Promote this correction for future task work.',
+    });
+
+    expect(accepted.status).toBe('accepted');
+    expect(accepted.appliedTargets[0]).toMatchObject({ kind: 'task-lesson', id: task.id });
+    expect(updateTask).toHaveBeenCalledWith(
+      task.id,
+      expect.objectContaining({
+        lessonsLearned: expect.stringContaining('Reflection Lesson'),
+        lessonTags: expect.arrayContaining(['reflection', 'reflection:team']),
+      })
+    );
+  });
+
+  it('fails closed when a wider promotion has no explicit typed target input', async () => {
+    const { service } = createHarness();
+    const candidate = await service.create(
+      createInput({
+        promotionTarget: 'profile',
+      })
+    );
+
+    await expect(
+      service.accept(candidate.id, {
+        reviewedBy: 'brad',
+        promotionTarget: 'profile',
+      })
+    ).rejects.toThrow('requires explicit typed target input');
+  });
+
+  it('records the target returned by the matching typed promotion adapter', async () => {
+    const promotionAdapters = {
+      apply: vi.fn(async () => ({
+        kind: 'profile' as const,
+        id: 'profile_1',
+        title: 'Backend reviewer',
+        appliedAt: '2026-07-25T12:00:00.000Z',
+        appliedBy: 'brad',
+      })),
+    };
+    const { service } = createHarness(createTask(), promotionAdapters);
+    const candidate = await service.create(createInput({ promotionTarget: 'profile' }));
+
+    const accepted = await service.accept(candidate.id, {
+      reviewedBy: 'brad',
+      promotion: {
+        target: 'profile',
+        profileId: 'profile_1',
+        capabilitiesToAdd: ['schema-review'],
+      },
+    });
+
+    expect(accepted).toMatchObject({
+      status: 'accepted',
+      appliedTargets: [{ kind: 'profile', id: 'profile_1', appliedBy: 'brad' }],
+    });
+    expect(promotionAdapters.apply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reviewedBy: 'brad',
+        promotion: expect.objectContaining({ target: 'profile', profileId: 'profile_1' }),
+      })
+    );
+  });
+
+  it('ranks accepted lessons and records immutable run attribution', async () => {
+    const task = createTask({
+      title: 'Repair the current route schema',
+      description: 'Inspect route contracts before editing.',
+    });
+    const { service, audit } = createHarness(task);
+    const exact = await service.create(
+      createInput({
+        confidence: 0.9,
+        source: {
+          kind: 'user-correction',
+          taskId: task.id,
+          runId: 'attempt_source',
+          eventIds: ['event_source'],
+        },
+      })
+    );
+    await service.accept(exact.id, { reviewedBy: 'brad' });
+    const lowerRelevance = await service.create(
+      createInput({
+        confidence: 0.55,
+        summary: 'Tune image rendering for a later pass.',
+        correction: 'Inspect the image pipeline.',
+        nextAttempt: 'Run image snapshots.',
+        source: { kind: 'task-run', taskId: task.id, runId: 'attempt_image' },
+      })
+    );
+    await service.accept(lowerRelevance.id, { reviewedBy: 'brad' });
+    const unrelated = await service.create(
+      createInput({
+        summary: 'Tune unrelated image rendering.',
+        correction: 'Inspect the image pipeline.',
+        nextAttempt: 'Run image snapshots.',
+        source: { kind: 'task-run', taskId: 'task_other', runId: 'attempt_other' },
+      })
+    );
+    await service.accept(unrelated.id, { reviewedBy: 'brad' });
+
+    const selected = await service.retrieveForTask({
+      task,
+      workspaceId: 'veritas-kanban',
+      attemptId: 'attempt_next',
+      retrievedAt: '2026-07-25T20:00:00.000Z',
+      recordAttribution: true,
+    });
+
+    expect(selected[0]).toMatchObject({
+      reflectionId: exact.id,
+      sourceTaskId: task.id,
+      sourceRunId: 'attempt_source',
+      sourceEventIds: ['event_source'],
+      retrievalCount: 1,
+    });
+    expect(selected.map((item) => item.reflectionId)).toEqual([exact.id, lowerRelevance.id]);
+    expect(selected.some((item) => item.reflectionId === unrelated.id)).toBe(false);
+    const listed = await service.list({ status: 'accepted' });
+    expect(listed.candidates.find((candidate) => candidate.id === exact.id)).toMatchObject({
+      retrievalCount: 1,
+      lastRetrievedAt: '2026-07-25T20:00:00.000Z',
+      retrievals: [
+        {
+          taskId: task.id,
+          attemptId: 'attempt_next',
+          workspaceId: 'veritas-kanban',
+        },
+      ],
+    });
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'reflection.retrieved',
+        resource: exact.id,
+        details: expect.objectContaining({ attemptId: 'attempt_next' }),
+      })
+    );
+  });
+
+  it('previews accepted memory without incrementing observed use', async () => {
+    const task = createTask();
+    const { service } = createHarness(task);
+    const candidate = await service.create(createInput());
+    await service.accept(candidate.id, { reviewedBy: 'brad' });
+
+    const preview = await service.retrieveForTask({
+      task,
+      workspaceId: 'veritas-kanban',
+      attemptId: 'preview_1',
+      retrievedAt: '2026-07-25T20:00:00.000Z',
+      recordAttribution: false,
+    });
+
+    expect(preview[0].retrievalCount).toBe(0);
+    const listed = await service.list({ status: 'accepted' });
+    expect(listed.candidates[0].retrievalCount).toBeUndefined();
+  });
+
+  it('keeps rejected candidates auditable without applying lessons', async () => {
+    const { service, updateTask } = createHarness();
+    const candidate = await service.create(createInput());
+
+    const rejected = await service.reject(candidate.id, {
+      reviewedBy: 'brad',
+      reason: 'The lesson is too narrow to reuse.',
+    });
+
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reviewedBy: 'brad',
+      rejectionReason: 'The lesson is too narrow to reuse.',
+    });
+    expect(updateTask).not.toHaveBeenCalled();
+  });
+
+  it('groups duplicate candidates and soft-merges duplicates into the representative', async () => {
+    const { service } = createHarness();
+    const first = await service.create(createInput());
+    const second = await service.create(
+      createInput({ source: { kind: 'error', taskId: 'task_20260626_reflect', errorId: 'err_1' } })
+    );
+
+    expect(second.duplicateOf).toBe(first.id);
+    const listed = await service.list({ limit: 20 });
+    expect(listed.duplicateGroups).toHaveLength(1);
+    expect(listed.duplicateGroups[0].candidateIds).toEqual(
+      expect.arrayContaining([first.id, second.id])
+    );
+
+    const merged = await service.mergeDuplicate(second.id, { mergedBy: 'brad' });
+
+    expect(merged.status).toBe('deleted');
+    expect(merged.mergedInto).toBe(first.id);
+    expect(merged.deleteReason).toContain(first.id);
+  });
+});

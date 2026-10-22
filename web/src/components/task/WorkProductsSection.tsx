@@ -1,0 +1,597 @@
+import { useMemo, useState } from 'react';
+import { UiModal as Modal, OverlayFooter } from '@/components/ui/UiOverlay';
+import { UiAction } from '@/components/ui/UiVocabulary';
+import {
+  ActionIcon,
+  Alert,
+  Badge,
+  Button,
+  Group,
+  Loader,
+  Paper,
+  Stack,
+  Table,
+  Text,
+  Textarea,
+  TextInput,
+  ThemeIcon,
+  Tooltip,
+} from '@mantine/core';
+import { useQueryClient } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import { useTaskWorkProducts, useWorkProductVersions } from '@/hooks/useWorkProducts';
+import { toast } from '@/hooks/useToast';
+import { ArtifactPreviewModal } from './ArtifactPreviewModal';
+import {
+  isExternalTargetHref,
+  normalizeSafeHref,
+  type WorkProductKind,
+  type WorkProductPreview,
+  type WorkProductVersion,
+} from '@veritas-kanban/shared';
+import {
+  AlertCircle,
+  Clipboard,
+  Download,
+  Eye,
+  ExternalLink,
+  FileText,
+  History,
+  Pencil,
+  Sparkles,
+} from 'lucide-react';
+
+interface WorkProductsSectionProps {
+  taskId: string;
+}
+
+const KIND_LABELS: Record<WorkProductKind, string> = {
+  checklist: 'Checklist',
+  dashboard: 'Dashboard',
+  file: 'File',
+  markdown: 'Markdown',
+  report: 'Report',
+  summary: 'Summary',
+  table: 'Table',
+  text: 'Text',
+};
+
+function formatDate(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value));
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function safeDownloadName(product: WorkProductPreview, extension: string): string {
+  const slug = product.title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 80);
+  return `${slug || product.id}-v${product.version}.${extension}`;
+}
+
+function versionLabel(version: WorkProductVersion): string {
+  const changeType = version.changeType.charAt(0).toUpperCase() + version.changeType.slice(1);
+  return `${changeType} v${version.version}`;
+}
+
+async function writeClipboardText(content: string): Promise<void> {
+  const clipboard = window.navigator.clipboard;
+  if (clipboard?.writeText) {
+    await clipboard.writeText(content);
+    return;
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = content;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textarea);
+
+  if (!copied) {
+    throw new Error('Clipboard is unavailable');
+  }
+}
+
+export function WorkProductsSection({ taskId }: WorkProductsSectionProps) {
+  const queryClient = useQueryClient();
+  const { data: products = [], isLoading, error } = useTaskWorkProducts(taskId);
+  const [historyProduct, setHistoryProduct] = useState<WorkProductPreview | null>(null);
+  const [editProduct, setEditProduct] = useState<WorkProductPreview | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editBody, setEditBody] = useState('');
+  const [editLoading, setEditLoading] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [previewProduct, setPreviewProduct] = useState<WorkProductPreview | null>(null);
+  const { data: versions = [], isLoading: versionsLoading } = useWorkProductVersions(
+    historyProduct?.id ?? null
+  );
+  const sortedProducts = useMemo(
+    () => [...products].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+    [products]
+  );
+
+  const copyRedacted = async (product: WorkProductPreview) => {
+    try {
+      const content = await api.workProducts.export(product.id, {
+        format: 'markdown',
+        redacted: true,
+      });
+      await writeClipboardText(content);
+      toast({
+        title: 'Work product copied',
+        description: `${product.title} was copied with redaction enabled.`,
+      });
+    } catch (err) {
+      toast({
+        title: 'Copy failed',
+        description: err instanceof Error ? err.message : 'Could not copy work product.',
+        variant: 'destructive',
+      });
+    }
+  };
+
+  const openEditor = async (product: WorkProductPreview) => {
+    setEditProduct(product);
+    setEditTitle(product.title);
+    setEditBody('');
+    setEditLoading(true);
+    try {
+      const content = await api.workProducts.export(product.id, {
+        format: 'markdown',
+        redacted: true,
+      });
+      setEditBody(content);
+    } catch (err) {
+      toast({
+        title: 'Edit load failed',
+        description:
+          err instanceof Error ? err.message : 'Could not load editable work product content.',
+        variant: 'destructive',
+      });
+      setEditProduct(null);
+    } finally {
+      setEditLoading(false);
+    }
+  };
+
+  const saveEdit = async () => {
+    if (!editProduct) return;
+    const title = editTitle.trim();
+    const markdown = editBody.trimEnd();
+    if (!title || !markdown) {
+      toast({
+        title: 'Edit not saved',
+        description: 'Title and content are required.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    setEditSaving(true);
+    try {
+      await api.workProducts.update(editProduct.id, {
+        title,
+        render: {
+          schemaVersion: 1,
+          kind: 'markdown',
+          markdown,
+        },
+        changeType: 'manual',
+        changeSummary: 'Manual edit before handoff',
+      });
+      await queryClient.invalidateQueries({ queryKey: ['tasks', taskId, 'work-products'] });
+      toast({
+        title: 'Work product updated',
+        description: `${title} was saved as a new version.`,
+      });
+      setEditProduct(null);
+      setEditTitle('');
+      setEditBody('');
+    } catch (err) {
+      toast({
+        title: 'Save failed',
+        description: err instanceof Error ? err.message : 'Could not save work product edit.',
+        variant: 'destructive',
+      });
+    } finally {
+      setEditSaving(false);
+    }
+  };
+
+  const exportRedacted = async (product: WorkProductPreview) => {
+    try {
+      const content = await api.workProducts.export(product.id, {
+        format: 'markdown',
+        redacted: true,
+      });
+      const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = safeDownloadName(product, 'md');
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toast({
+        title: 'Work product exported',
+        description: `${product.title} was exported with redaction enabled.`,
+      });
+    } catch (err) {
+      toast({
+        title: 'Export failed',
+        description: err instanceof Error ? err.message : 'Could not export work product.',
+        variant: 'destructive',
+      });
+    }
+  };
+
+  const downloadArtifact = async (product: WorkProductPreview) => {
+    if (!product.artifact || product.artifact.state !== 'available') return;
+    try {
+      const blob = await api.workProducts.downloadArtifact(product.id, product.version);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = product.artifact.safeName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toast({
+        title: 'Artifact downloaded',
+        description: `${product.artifact.safeName} passed its stored integrity check.`,
+      });
+    } catch (err) {
+      toast({
+        title: 'Download failed',
+        description: err instanceof Error ? err.message : 'Could not download artifact.',
+        variant: 'destructive',
+      });
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <Paper withBorder p="md" radius="md">
+        <Group gap="sm">
+          <Loader size="sm" />
+          <Text size="sm" c="dimmed">
+            Loading work products...
+          </Text>
+        </Group>
+      </Paper>
+    );
+  }
+
+  if (error) {
+    return (
+      <Alert
+        color="red"
+        icon={<AlertCircle className="h-4 w-4" />}
+        title="Work products failed to load"
+      >
+        {error instanceof Error ? error.message : 'Could not load task work products.'}
+      </Alert>
+    );
+  }
+
+  return (
+    <>
+      <Stack gap="md">
+        <Group justify="space-between" align="flex-start" wrap="nowrap">
+          <div>
+            <Group gap="xs">
+              <ThemeIcon size="sm" radius="xl" variant="light">
+                <Sparkles className="h-4 w-4" />
+              </ThemeIcon>
+              <Text fw={600}>Work Products</Text>
+              <Badge variant="light" color="gray">
+                {sortedProducts.length}
+              </Badge>
+            </Group>
+            <Text size="sm" c="dimmed" mt={4}>
+              Durable outputs linked to this task, with redacted copy/export defaults.
+            </Text>
+          </div>
+        </Group>
+
+        {sortedProducts.length === 0 ? (
+          <Paper withBorder p="md" radius="md">
+            <Group gap="sm" wrap="nowrap">
+              <ThemeIcon size="md" radius="xl" variant="light" className="flex-shrink-0">
+                <FileText className="h-5 w-5" />
+              </ThemeIcon>
+              <div className="min-w-0">
+                <Text fw={600}>No work products yet</Text>
+                <Text size="sm" c="dimmed" mt={2}>
+                  Generated reports, checklists, handoff notes, and evidence summaries will appear
+                  here.
+                </Text>
+              </div>
+            </Group>
+          </Paper>
+        ) : (
+          <Stack gap="sm">
+            {sortedProducts.map((product) => (
+              <Paper key={product.id} withBorder p="md" radius="md">
+                <Stack gap="sm">
+                  <Group justify="space-between" align="flex-start" gap="sm" wrap="nowrap">
+                    <div className="min-w-0">
+                      <Group gap="xs" wrap="wrap">
+                        <Text fw={600} className="break-words">
+                          {product.title}
+                        </Text>
+                        <Badge variant="light">{KIND_LABELS[product.kind]}</Badge>
+                        <Badge
+                          variant="outline"
+                          color={product.status === 'active' ? 'green' : 'gray'}
+                        >
+                          {product.status}
+                        </Badge>
+                        {product.redacted && (
+                          <Badge variant="outline" color="yellow">
+                            Redacted preview
+                          </Badge>
+                        )}
+                      </Group>
+                      <Text size="xs" c="dimmed" mt={4}>
+                        Updated {formatDate(product.updatedAt)} | v{product.version}
+                        {product.agent ? ` | ${product.agent}` : ''}
+                        {product.model ? ` | ${product.model}` : ''}
+                      </Text>
+                    </div>
+                    <Group gap={4} wrap="nowrap">
+                      {product.kind === 'file' && product.artifact && (
+                        <Tooltip label={`Preview ${product.artifact.safeName}`}>
+                          <ActionIcon
+                            aria-label={`Preview ${product.artifact.safeName}`}
+                            variant="subtle"
+                            onClick={() => setPreviewProduct(product)}
+                          >
+                            <Eye className="h-4 w-4" />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
+                      {product.kind === 'file' && product.artifact && (
+                        <Tooltip
+                          label={
+                            product.artifact.state === 'available'
+                              ? 'Download verified artifact'
+                              : product.artifact.redaction.reason || 'Artifact is unavailable'
+                          }
+                        >
+                          <span>
+                            <ActionIcon
+                              aria-label={`Download ${product.artifact.safeName}`}
+                              variant="subtle"
+                              disabled={product.artifact.state !== 'available'}
+                              onClick={() => downloadArtifact(product)}
+                            >
+                              <Download className="h-4 w-4" />
+                            </ActionIcon>
+                          </span>
+                        </Tooltip>
+                      )}
+                      {product.kind !== 'file' && (
+                        <Tooltip label="Copy redacted markdown">
+                          <ActionIcon
+                            aria-label={`Copy redacted ${product.title}`}
+                            variant="subtle"
+                            onClick={() => copyRedacted(product)}
+                          >
+                            <Clipboard className="h-4 w-4" />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
+                      {product.kind !== 'file' && (
+                        <Tooltip label="Edit redacted markdown">
+                          <ActionIcon
+                            aria-label={`Edit ${product.title}`}
+                            variant="subtle"
+                            onClick={() => openEditor(product)}
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
+                      {product.kind !== 'file' && (
+                        <Tooltip label="Export redacted markdown">
+                          <ActionIcon
+                            aria-label={`Export redacted ${product.title}`}
+                            variant="subtle"
+                            onClick={() => exportRedacted(product)}
+                          >
+                            <Download className="h-4 w-4" />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
+                      <Tooltip label="Version history">
+                        <ActionIcon
+                          aria-label={`Open version history for ${product.title}`}
+                          variant="subtle"
+                          onClick={() => setHistoryProduct(product)}
+                        >
+                          <History className="h-4 w-4" />
+                        </ActionIcon>
+                      </Tooltip>
+                    </Group>
+                  </Group>
+
+                  <Text size="sm" c="dimmed" className="whitespace-pre-wrap">
+                    {product.snippet || 'No preview text available.'}
+                  </Text>
+
+                  {product.artifact && (
+                    <Stack gap={2}>
+                      <Text size="sm" fw={500}>
+                        {product.artifact.safeName} | {product.artifact.mediaType} |{' '}
+                        {formatBytes(product.artifact.byteSize)}
+                      </Text>
+                      <Text size="xs" c="dimmed" className="break-all">
+                        SHA-256 {product.artifact.sha256}
+                      </Text>
+                      <Text size="xs" c="dimmed">
+                        Attempt {product.artifact.attemptId} | Event{' '}
+                        {product.artifact.producingEventId} | {product.artifact.state}
+                      </Text>
+                      {product.artifact.state !== 'available' && (
+                        <Alert color="yellow" title="Artifact quarantined" py="xs">
+                          {product.artifact.redaction.reason ||
+                            product.artifact.quarantineReason ||
+                            'Artifact content is unavailable by policy.'}
+                        </Alert>
+                      )}
+                    </Stack>
+                  )}
+
+                  {(product.sourceRunId || (product.sourceLinks?.length ?? 0) > 0) && (
+                    <Group gap="xs" wrap="wrap">
+                      {product.sourceRunId && (
+                        <Badge variant="light" color="blue">
+                          Run {product.sourceRunId}
+                        </Badge>
+                      )}
+                      {product.sourceLinks?.map((link) => {
+                        const href = normalizeSafeHref(link.href);
+                        if (!href) return null;
+                        const external = isExternalTargetHref(href);
+                        return (
+                          <Button
+                            key={`${product.id}:${href}:${link.label}`}
+                            component="a"
+                            href={href}
+                            target={external ? '_blank' : undefined}
+                            rel={external ? 'noopener noreferrer' : undefined}
+                            variant="subtle"
+                            size="compact-xs"
+                            rightSection={<ExternalLink className="h-3 w-3" />}
+                          >
+                            {link.label}
+                          </Button>
+                        );
+                      })}
+                    </Group>
+                  )}
+                </Stack>
+              </Paper>
+            ))}
+          </Stack>
+        )}
+      </Stack>
+
+      <ArtifactPreviewModal
+        opened={Boolean(previewProduct)}
+        productId={previewProduct?.id ?? null}
+        version={previewProduct?.version}
+        title={previewProduct?.title}
+        onClose={() => setPreviewProduct(null)}
+      />
+
+      <Modal
+        opened={Boolean(historyProduct)}
+        onClose={() => setHistoryProduct(null)}
+        title={historyProduct ? `Version history: ${historyProduct.title}` : 'Version history'}
+        variant="authoring"
+      >
+        {versionsLoading ? (
+          <Group gap="sm">
+            <Loader size="sm" />
+            <Text size="sm" c="dimmed">
+              Loading version history...
+            </Text>
+          </Group>
+        ) : versions.length === 0 ? (
+          <Text size="sm" c="dimmed">
+            No version history is available for this work product.
+          </Text>
+        ) : (
+          <Table.ScrollContainer minWidth="32rem">
+            <Table striped highlightOnHover withTableBorder>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Version</Table.Th>
+                  <Table.Th>Changed</Table.Th>
+                  <Table.Th>Summary</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {versions.map((version) => (
+                  <Table.Tr key={version.id}>
+                    <Table.Td>
+                      <Badge variant="light">{versionLabel(version)}</Badge>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm">{formatDate(version.createdAt)}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm">{version.changeSummary || version.title}</Text>
+                    </Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          </Table.ScrollContainer>
+        )}
+      </Modal>
+
+      <Modal
+        opened={Boolean(editProduct)}
+        onClose={() => {
+          if (!editSaving) setEditProduct(null);
+        }}
+        title={editProduct ? `Edit: ${editProduct.title}` : 'Edit work product'}
+        variant="authoring"
+        compound
+      >
+        {editLoading ? (
+          <Group gap="sm" className="vk-overlay-scroll">
+            <Loader size="sm" />
+            <Text size="sm" c="dimmed">
+              Loading editable content...
+            </Text>
+          </Group>
+        ) : (
+          <>
+            <Stack gap="sm" className="vk-overlay-scroll">
+              <TextInput
+                label="Title"
+                value={editTitle}
+                onChange={(event) => setEditTitle(event.currentTarget.value)}
+                disabled={editSaving}
+              />
+              <Textarea
+                label="Redacted markdown"
+                minRows={14}
+                value={editBody}
+                onChange={(event) => setEditBody(event.currentTarget.value)}
+                disabled={editSaving}
+              />
+            </Stack>
+            <OverlayFooter>
+              <UiAction variant="quiet" onClick={() => setEditProduct(null)} disabled={editSaving}>
+                Cancel
+              </UiAction>
+              <UiAction onClick={saveEdit} loading={editSaving}>
+                Save Version
+              </UiAction>
+            </OverlayFooter>
+          </>
+        )}
+      </Modal>
+    </>
+  );
+}

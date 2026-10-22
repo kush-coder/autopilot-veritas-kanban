@@ -1,0 +1,2231 @@
+import { assertLegacyAttemptEditable } from '../utils/task-attempt-edit.js';
+import { nanoid } from 'nanoid';
+import type {
+  Task,
+  CreateTaskInput,
+  UpdateTaskInput,
+  TaskTelemetryEvent,
+  TimeTracking,
+  RunStartedEvent,
+  RunCompletedEvent,
+  BoardColumnConfig,
+  TaskStatus,
+  TaskAttempt,
+  MoveTaskInput,
+  MoveTaskResult,
+  TaskBoardMoveReceipt,
+} from '@veritas-kanban/shared';
+import {
+  normalizeBoardColumns,
+  normalizeBoardDefaultStatus,
+  sortTasksByBoardPosition,
+  taskBoardRankAtIndex,
+  taskBoardPositionAtIndex,
+} from '@veritas-kanban/shared';
+import { getTelemetryService, type TelemetryService } from './telemetry-service.js';
+import { ConfigService } from './config-service.js';
+import { createLogger } from '../lib/logger.js';
+import {
+  ConflictError,
+  InternalError,
+  NotFoundError,
+  ValidationError,
+} from '../middleware/error-handler.js';
+import { fireHook, getHookEventForStatusChange } from './hook-service.js';
+import {
+  validateTransition,
+  executePostTransitionActions,
+  type TransitionActionCallbacks,
+} from './transition-hooks-service.js';
+import {
+  getAgentRegistryService,
+  createTaskSyncToken,
+  type TaskSyncContext,
+} from './agent-registry-service.js';
+import { getWorkProductService } from './work-product-service.js';
+import { getTasksActiveDir, getTasksArchiveDir, getTasksBacklogDir } from '../utils/paths.js';
+import { SqliteDatabase, type SqliteConnectionOptions } from '../storage/sqlite/database.js';
+import { SqliteTaskRepository } from '../storage/sqlite/task-repository.js';
+import { FileTaskRepository } from '../storage/task-file-repository.js';
+import {
+  buildTaskIdentityConflictDetails,
+  filterTaskIdentityDiagnostics,
+  scanTaskIdentityDiagnostics,
+  type TaskIdentityCandidate,
+  type TaskIdentityDiagnostics,
+  type TaskIdentityScanSource,
+} from './task-identity-diagnostics.js';
+import { getCeremonyService, type CeremonyService } from './ceremony-service.js';
+import { MAX_TASK_REORDER_ITEMS } from '../schemas/task-mutation-schemas.js';
+
+const log = createLogger('task-cache');
+const TASK_SYNC_CONTEXT: TaskSyncContext = createTaskSyncToken('task-service');
+const TASK_RECONCILE_CONTEXT: TaskSyncContext = createTaskSyncToken('task-reconciler');
+
+/**
+ * Task types that require 4x10 review gate (when enforcement is enabled)
+ */
+const CODE_TASK_TYPES = ['code', 'bug', 'feature', 'automation', 'system'];
+
+function normalizedTaskRevision(task: Pick<Task, 'revision'>): number {
+  return typeof task.revision === 'number' && Number.isInteger(task.revision) && task.revision >= 0
+    ? task.revision
+    : 1;
+}
+
+function normalizedBoardPosition(task: Pick<Task, 'position'>): number | null {
+  return typeof task.position === 'number' && Number.isFinite(task.position) ? task.position : null;
+}
+
+function boardMoveReceiptMatches(receipt: TaskBoardMoveReceipt, input: MoveTaskInput): boolean {
+  return (
+    receipt.operationId === input.operationId &&
+    receipt.sourceStatus === input.sourceStatus &&
+    receipt.sourcePosition === input.sourcePosition &&
+    receipt.destinationStatus === input.destinationStatus &&
+    receipt.destinationIndex === input.destinationIndex
+  );
+}
+
+interface BoardStatusConfig {
+  columns: BoardColumnConfig[];
+  defaultStatus: TaskStatus;
+  activeStatusIds: Set<string>;
+}
+
+type TaskMutationInput = UpdateTaskInput & {
+  protectManagedAttempt?: boolean;
+  attemptPatch?: Pick<TaskAttempt, 'id'> & Partial<Omit<TaskAttempt, 'id'>>;
+  lastBoardMove?: TaskBoardMoveReceipt;
+  boardRank?: string | null;
+};
+
+// Default paths are resolved via the shared paths utility so Docker, tests,
+// and local dev all agree on where tasks live.
+const DEFAULT_TASKS_DIR = getTasksActiveDir();
+const DEFAULT_ARCHIVE_DIR = getTasksArchiveDir();
+
+export interface TaskServiceOptions {
+  tasksDir?: string;
+  archiveDir?: string;
+  backlogDir?: string;
+  telemetryService?: TelemetryService;
+  storageType?: 'file' | 'sqlite';
+  sqliteDatabase?: SqliteDatabase;
+  sqliteConnectionOptions?: SqliteConnectionOptions;
+  configService?: Pick<ConfigService, 'getFeatureSettings'>;
+  ceremonyService?: Pick<CeremonyService, 'evaluateTaskCompletion'>;
+}
+
+/** Ignore file-watcher events within this window after our own writes */
+const WRITE_DEBOUNCE_MS = 200;
+
+export class TaskService {
+  private tasksDir: string;
+  private archiveDir: string;
+  private backlogDir: string | null;
+  private telemetry: TelemetryService;
+  private sqliteDatabase: SqliteDatabase | null = null;
+  private sqliteTasks: SqliteTaskRepository | null = null;
+  private fileTasks: FileTaskRepository | null = null;
+  private sqliteMutationQueue: Promise<unknown> = Promise.resolve();
+  private boardMoveQueue: Promise<unknown> = Promise.resolve();
+  private taskMutationQueues = new Map<string, Promise<void>>();
+  private configService: Pick<ConfigService, 'getFeatureSettings'>;
+  private ceremonyService: Pick<CeremonyService, 'evaluateTaskCompletion'>;
+
+  // ============ In-Memory Cache ============
+  private cache: Map<string, Task> = new Map();
+  private cacheInitialized = false;
+  private cacheLoading: Promise<void> | null = null;
+  private cacheStats = { hits: 0, misses: 0 };
+  private taskSyncReconcileInterval: ReturnType<typeof setInterval> | null = null;
+  private reconcileRunning = false;
+
+  // ============ Identity Diagnostics Cache ============
+  // Cached to avoid a full filesystem scan on every list request (#784).
+  // Invalidated by repository mutations and external file changes.
+  private identityDiagnosticsCache: TaskIdentityDiagnostics | null = null;
+
+  constructor(options: TaskServiceOptions = {}) {
+    this.tasksDir = options.tasksDir || DEFAULT_TASKS_DIR;
+    this.archiveDir = options.archiveDir || DEFAULT_ARCHIVE_DIR;
+    this.backlogDir =
+      options.backlogDir ?? (options.tasksDir || options.archiveDir ? null : getTasksBacklogDir());
+    this.telemetry = options.telemetryService || getTelemetryService();
+    this.configService = options.configService ?? new ConfigService();
+    this.ceremonyService = options.ceremonyService ?? getCeremonyService();
+    const storageType =
+      options.storageType ?? (process.env.VERITAS_STORAGE === 'sqlite' ? 'sqlite' : 'file');
+
+    if (storageType === 'sqlite') {
+      this.sqliteDatabase =
+        options.sqliteDatabase ?? new SqliteDatabase(options.sqliteConnectionOptions);
+      this.sqliteDatabase.open();
+      this.sqliteTasks = new SqliteTaskRepository(this.sqliteDatabase);
+    } else {
+      this.fileTasks = new FileTaskRepository({
+        activeDir: this.tasksDir,
+        archiveDir: this.archiveDir,
+      });
+    }
+
+    this.startTaskSyncReconciler();
+  }
+
+  // ============ Cache Helpers ============
+
+  /**
+   * Initialize the cache by loading all tasks from disk and starting the file watcher.
+   * Safe to call multiple times; only the first call does work.
+   */
+  private async initCache(): Promise<void> {
+    if (this.sqliteTasks) return;
+
+    if (this.cacheInitialized) return;
+
+    // Prevent concurrent initialization (e.g. parallel listTasks + getTask)
+    if (this.cacheLoading) {
+      await this.cacheLoading;
+      return;
+    }
+
+    this.cacheLoading = this.loadCacheFromDisk();
+    await this.cacheLoading;
+    this.cacheLoading = null;
+    this.cacheInitialized = true;
+    this.startWatcher();
+    log.debug({ count: this.cache.size }, 'Cache initialized');
+  }
+
+  /** Read every .md file in tasksDir and populate the cache */
+  private async loadCacheFromDisk(): Promise<void> {
+    const fileTasks = this.requireFileTasks();
+    await fileTasks.ensureReady();
+    const seeded = await fileTasks.seedExamplesIfEmpty();
+    if (seeded > 0) log.info({ count: seeded }, 'Seeded example tasks for first run');
+    this.cache.clear();
+    for (const task of await fileTasks.listActive()) this.cache.set(task.id, task);
+  }
+
+  /** Remove a cache entry whose filename matches (used when a file is deleted externally) */
+  private invalidateByFilename(filename: string): void {
+    // Task IDs are the first segment of the filename (before the slug)
+    const idMatch = filename.match(/^(task_[a-zA-Z0-9_-]+)-/);
+    if (idMatch) {
+      const id = idMatch[1];
+      if (this.cache.delete(id)) {
+        log.debug({ taskId: id }, 'Invalidated (file removed)');
+      }
+    }
+  }
+
+  /** Invalidate a specific task by ID. */
+  invalidateTaskCache(id: string): boolean {
+    const deleted = this.cache.delete(id);
+    if (deleted) {
+      log.debug({ taskId: id }, 'Invalidated');
+    }
+    return deleted;
+  }
+
+  async reloadTaskCache(): Promise<void> {
+    if (this.sqliteTasks) return;
+    this.cacheInitialized = false;
+    this.cacheLoading = null;
+    await this.initCache();
+  }
+
+  private runSqliteMutation<T>(callback: () => Promise<T>): Promise<T> {
+    const run = this.sqliteMutationQueue.then(callback, callback);
+    this.sqliteMutationQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private withTaskMutex<T>(id: string, callback: () => Promise<T>): Promise<T> {
+    const previous = this.taskMutationQueues.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.taskMutationQueues.set(id, current);
+
+    return previous.then(callback).finally(() => {
+      release();
+      if (this.taskMutationQueues.get(id) === current) this.taskMutationQueues.delete(id);
+    });
+  }
+
+  private withBoardMoveMutex<T>(callback: (commitStorage: () => void) => Promise<T>): Promise<T> {
+    const storageLockedCallback = async (): Promise<T> => {
+      if (this.sqliteDatabase) {
+        return this.runSqliteMutation(async () => {
+          const database = this.sqliteDatabase?.getConnection();
+          if (!database) throw new Error('SQLite task storage is unavailable');
+          database.exec('BEGIN IMMEDIATE;');
+          let transactionOpen = true;
+          const commitStorage = () => {
+            if (!transactionOpen) return;
+            database.exec('COMMIT;');
+            transactionOpen = false;
+          };
+          try {
+            const result = await callback(commitStorage);
+            commitStorage();
+            return result;
+          } catch (error) {
+            if (transactionOpen) {
+              try {
+                database.exec('ROLLBACK;');
+              } catch {
+                // Preserve the original failure.
+              }
+            }
+            throw error;
+          }
+        });
+      }
+
+      return this.requireFileTasks().withBoardMutation(async () => {
+        await this.loadCacheFromDisk();
+        return callback(() => undefined);
+      });
+    };
+    const run = this.boardMoveQueue.then(storageLockedCallback, storageLockedCallback);
+    this.boardMoveQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private async ensureBoardMoveTelemetry(
+    task: Task,
+    receipt: TaskBoardMoveReceipt
+  ): Promise<boolean> {
+    if (!this.telemetry.isEnabled() || receipt.sourceStatus === task.status) return true;
+
+    try {
+      const wasRecorded = async (): Promise<boolean> =>
+        (await this.telemetry.getTaskEvents(task.id)).some(
+          (event) =>
+            event.type === 'task.status_changed' &&
+            'operationId' in event &&
+            event.operationId === receipt.operationId
+        );
+      if (await wasRecorded()) return true;
+
+      await this.telemetry.emit<TaskTelemetryEvent>({
+        type: 'task.status_changed',
+        taskId: task.id,
+        project: task.project,
+        status: task.status,
+        previousStatus: receipt.sourceStatus,
+        operationId: receipt.operationId,
+      });
+      return wasRecorded();
+    } catch (error) {
+      log.warn(
+        { taskId: task.id, operationId: receipt.operationId, err: error },
+        'Board move telemetry will be retried if the operation is replayed'
+      );
+      return false;
+    }
+  }
+
+  async reconcileBoardMoveTelemetry(task: Task): Promise<boolean> {
+    if (!task.lastBoardMove || task.lastBoardMove.auditCompletedAt) return true;
+    return this.ensureBoardMoveTelemetry(task, task.lastBoardMove);
+  }
+
+  async markBoardMoveAuditComplete(id: string, operationId: string): Promise<Task | null> {
+    return this.withBoardMoveMutex(() =>
+      this.withTaskMutex(id, async () => {
+        if (this.sqliteTasks) {
+          const current = await this.sqliteTasks.findById(id);
+          if (!current) return null;
+          if (
+            current.lastBoardMove?.operationId !== operationId ||
+            current.lastBoardMove.auditCompletedAt
+          ) {
+            return current;
+          }
+          const completed: Task = {
+            ...current,
+            lastBoardMove: {
+              ...current.lastBoardMove,
+              auditCompletedAt: new Date().toISOString(),
+            },
+          };
+          await this.sqliteTasks.replaceActive(completed);
+          return completed;
+        }
+
+        let completed: Task | null = null;
+        const result = await this.requireFileTasks().withActiveMutation(
+          id,
+          async (current, persist) => {
+            if (
+              current.lastBoardMove?.operationId !== operationId ||
+              current.lastBoardMove.auditCompletedAt
+            ) {
+              completed = current;
+              return true;
+            }
+            completed = {
+              ...current,
+              lastBoardMove: {
+                ...current.lastBoardMove,
+                auditCompletedAt: new Date().toISOString(),
+              },
+            };
+            await persist(completed);
+            this.cache.set(id, completed);
+            return true;
+          }
+        );
+        return result === null ? null : completed;
+      })
+    );
+  }
+
+  /** Get a task from the cache */
+  private cacheGet(id: string): Task | undefined {
+    const task = this.cache.get(id);
+    if (task) {
+      this.cacheStats.hits++;
+      log.trace({ taskId: id, hits: this.cacheStats.hits }, 'Cache HIT');
+    } else {
+      this.cacheStats.misses++;
+      log.trace({ taskId: id, misses: this.cacheStats.misses }, 'Cache MISS');
+    }
+    return task;
+  }
+
+  /** Get all cached tasks sorted by updated date descending */
+  private cacheList(): Task[] {
+    const tasks = Array.from(this.cache.values());
+    return tasks.sort((a, b) => new Date(b.updated).getTime() - new Date(a.updated).getTime());
+  }
+
+  /** Start watching tasksDir for external file changes */
+  private startWatcher(): void {
+    this.fileTasks?.watchActive(({ filename, task }) => {
+      this.identityDiagnosticsCache = null;
+      if (!task) {
+        this.invalidateByFilename(filename);
+        return;
+      }
+      log.debug({ taskId: task.id }, 'Reloaded from disk');
+      this.cache.set(task.id, task);
+    });
+  }
+
+  /** Clean up watchers and cache. Call on server shutdown. */
+  dispose(): void {
+    this.fileTasks?.dispose();
+    if (this.taskSyncReconcileInterval) {
+      clearInterval(this.taskSyncReconcileInterval);
+      this.taskSyncReconcileInterval = null;
+    }
+    this.sqliteDatabase?.close();
+    this.sqliteDatabase = null;
+    this.sqliteTasks = null;
+    this.fileTasks = null;
+    this.cache.clear();
+    this.cacheInitialized = false;
+    this.cacheLoading = null;
+    log.debug({ hits: this.cacheStats.hits, misses: this.cacheStats.misses }, 'Cache disposed');
+  }
+
+  /**
+   * Clean up expired checkpoints (older than 24 hours).
+   * This should be called periodically (e.g., on service startup or via a scheduled task).
+   */
+  /**
+   * Cleanup expired checkpoints (older than 24 hours).
+   * O(N) iteration over all tasks — acceptable for expected scale (hundreds of tasks).
+   * Future optimization: add checkpoint index to data/checkpoints.json for O(1) lookup.
+   */
+  async cleanupExpiredCheckpoints(): Promise<{ cleaned: number; errors: number }> {
+    await this.initCache();
+    const tasks = this.cacheList();
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+    const now = Date.now();
+    let cleaned = 0;
+    let errors = 0;
+
+    for (const task of tasks) {
+      if (!task.checkpoint) continue;
+
+      const checkpointTime = new Date(task.checkpoint.timestamp).getTime();
+
+      // Handle invalid timestamps
+      if (isNaN(checkpointTime)) {
+        try {
+          await this.updateTask(task.id, { checkpoint: undefined });
+          cleaned++;
+          log.debug({ taskId: task.id }, 'Cleared checkpoint with invalid timestamp');
+        } catch (err) {
+          errors++;
+          log.error({ err, taskId: task.id }, 'Failed to clear invalid checkpoint');
+        }
+        continue;
+      }
+
+      const age = now - checkpointTime;
+
+      if (age > maxAge) {
+        try {
+          // Clear the expired checkpoint
+          await this.updateTask(task.id, { checkpoint: undefined });
+          cleaned++;
+          log.debug({ taskId: task.id, age }, 'Cleared expired checkpoint');
+        } catch (err) {
+          errors++;
+          log.error({ err, taskId: task.id }, 'Failed to clear expired checkpoint');
+        }
+      }
+    }
+
+    if (cleaned > 0 || errors > 0) {
+      log.info({ cleaned, errors }, 'Checkpoint cleanup completed');
+    }
+
+    return { cleaned, errors };
+  }
+
+  getIdentityScanSources(): TaskIdentityScanSource[] {
+    if (this.sqliteTasks) return [];
+    return this.requireFileTasks().getIdentityScanSources(this.backlogDir);
+  }
+
+  getActiveTasksDir(): string {
+    return this.fileTasks?.getActiveDirectory() ?? this.tasksDir;
+  }
+
+  getActiveTasksDestinationPath(): string {
+    return this.fileTasks?.getActiveDestinationPath() ?? 'active';
+  }
+
+  async getTaskIdentityDiagnostics(
+    extraSources: TaskIdentityScanSource[] = []
+  ): Promise<TaskIdentityDiagnostics> {
+    // Use cached result when no extra sources are requested (#784).
+    // The cache is invalidated by repository mutations and external file changes.
+    if (extraSources.length === 0) {
+      if (!this.identityDiagnosticsCache) {
+        this.identityDiagnosticsCache = await scanTaskIdentityDiagnostics(
+          this.getIdentityScanSources()
+        );
+      }
+      return this.identityDiagnosticsCache;
+    }
+    return scanTaskIdentityDiagnostics([...this.getIdentityScanSources(), ...extraSources]);
+  }
+
+  /** Invalidate the identity diagnostics cache (e.g. when backlog tasks change). */
+  invalidateIdentityDiagnosticsCache(): void {
+    this.identityDiagnosticsCache = null;
+  }
+
+  async assertTaskIdentityIntegrity(
+    operation: string,
+    taskId?: string,
+    options: {
+      allowSameLocationTaskIdDuplicates?: boolean;
+      candidates?: TaskIdentityCandidate[];
+      destinationPath?: string;
+      excludeTaskIds?: string[];
+      extraSources?: TaskIdentityScanSource[];
+    } = {}
+  ): Promise<void> {
+    let diagnostics = filterTaskIdentityDiagnostics(
+      await scanTaskIdentityDiagnostics(
+        [...this.getIdentityScanSources(), ...(options.extraSources ?? [])],
+        {
+          candidates: options.candidates,
+          excludeTaskIds: options.excludeTaskIds,
+        }
+      ),
+      taskId
+    );
+
+    if (options.allowSameLocationTaskIdDuplicates && taskId) {
+      const conflicts = diagnostics.conflicts.filter((conflict) => {
+        if (conflict.kind !== 'task-id') return true;
+        if (conflict.id !== taskId) return true;
+        const locations = new Set(conflict.sources.map((source) => source.location));
+        return locations.size > 1;
+      });
+      diagnostics = {
+        hasConflicts: conflicts.length > 0,
+        conflictCount: conflicts.length,
+        conflicts,
+      };
+    }
+
+    if (!diagnostics.hasConflicts) return;
+
+    throw new ConflictError(
+      'Duplicate task identity detected',
+      buildTaskIdentityConflictDetails(diagnostics, operation, {
+        taskId,
+        destinationPath: options.destinationPath,
+      })
+    );
+  }
+
+  private generateId(): string {
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    return `task_${date}_${nanoid(6)}`;
+  }
+
+  private requireFileTasks(): FileTaskRepository {
+    if (!this.fileTasks) throw new Error('File task repository is not configured');
+    return this.fileTasks;
+  }
+
+  private syncAgentRegistryForStatusTransition(task: Task): void {
+    if (!task.agent) return;
+
+    const registry = getAgentRegistryService();
+    registry.syncFromTask(
+      {
+        agentRef: task.agent,
+        taskId: task.id,
+        taskTitle: task.title,
+        taskStatus: task.status,
+      },
+      TASK_SYNC_CONTEXT
+    );
+  }
+
+  private async getBoardStatusConfig(): Promise<BoardStatusConfig> {
+    const settings = await this.configService.getFeatureSettings();
+    const columns = normalizeBoardColumns(settings.board?.columns);
+    const defaultStatus = normalizeBoardDefaultStatus(settings.board?.defaultStatus, columns);
+    return {
+      columns,
+      defaultStatus,
+      activeStatusIds: new Set(columns.map((column) => column.id)),
+    };
+  }
+
+  private assertConfiguredStatus(status: TaskStatus, config: BoardStatusConfig): void {
+    if (config.activeStatusIds.has(status)) return;
+    throw new ValidationError(`Invalid task status "${status}" for the configured board`, [
+      {
+        code: 'INVALID_STATUS',
+        message: `Status "${status}" is not configured as an active board column`,
+        path: ['status'],
+      },
+    ]);
+  }
+
+  private startTaskSyncReconciler(): void {
+    this.taskSyncReconcileInterval = setInterval(() => {
+      this.runTaskAgentReconciliation().catch((err) => {
+        log.warn({ err }, 'Task↔agent reconciliation pass failed');
+      });
+    }, 60_000);
+  }
+
+  private async runTaskAgentReconciliation(): Promise<void> {
+    if (this.reconcileRunning) return;
+    this.reconcileRunning = true;
+
+    try {
+      const tasks = await this.listTasks();
+      const registry = getAgentRegistryService();
+      const changes = registry.reconcileFromTasks(
+        tasks.map((task) => ({
+          id: task.id,
+          title: task.title,
+          status: task.status,
+          agent: task.agent,
+        })),
+        TASK_RECONCILE_CONTEXT
+      );
+
+      if (changes > 0) {
+        log.debug({ changes }, 'Reconciled task↔agent state drift');
+      }
+    } finally {
+      this.reconcileRunning = false;
+    }
+  }
+
+  async listTasks(): Promise<Task[]> {
+    if (this.sqliteTasks) {
+      return this.sqliteTasks.findAll();
+    }
+
+    await this.initCache();
+    return this.cacheList();
+  }
+
+  /**
+   * Batch-resolve task dependencies to avoid N+1 queries
+   * Loads all tasks once, then resolves dependencies from memory
+   */
+  async getTasksWithDependencies(taskIds?: string[]): Promise<Task[]> {
+    const allTasks = await this.listTasks();
+    const taskMap = new Map(allTasks.map((t) => [t.id, t]));
+
+    const tasksToResolve = taskIds ? allTasks.filter((t) => taskIds.includes(t.id)) : allTasks;
+
+    return tasksToResolve.map((task) => {
+      if (!task.blockedBy || task.blockedBy.length === 0) {
+        return task;
+      }
+
+      // Resolve dependencies from the in-memory map
+      const resolvedDependencies = task.blockedBy
+        .map((depId: string) => taskMap.get(depId))
+        .filter((t: Task | undefined): t is Task => t !== undefined);
+
+      return {
+        ...task,
+        _dependencies: resolvedDependencies, // Add resolved deps without modifying schema
+      };
+    });
+  }
+
+  async getTask(id: string): Promise<Task | null> {
+    await this.assertTaskIdentityIntegrity('task.get', id);
+    return this.getTaskWithoutIdentityCheck(id);
+  }
+
+  private async getTaskWithoutIdentityCheck(id: string): Promise<Task | null> {
+    if (this.sqliteTasks) {
+      return this.sqliteTasks.findById(id);
+    }
+
+    await this.initCache();
+    return this.cacheGet(id) ?? null;
+  }
+
+  async createTask(input: CreateTaskInput): Promise<Task> {
+    const now = new Date().toISOString();
+    const boardStatusConfig = await this.getBoardStatusConfig();
+    const status = input.status ?? boardStatusConfig.defaultStatus;
+    this.assertConfiguredStatus(status, boardStatusConfig);
+
+    const task: Task = {
+      id: this.generateId(),
+      title: input.title,
+      description: input.description || '',
+      type: input.type || 'code',
+      status,
+      priority: input.priority || 'medium',
+      project: input.project,
+      sprint: input.sprint,
+      agent: input.agent, // Pre-assigned agent (or "auto" for routing)
+      executionPolicy: input.executionPolicy,
+      subtasks: input.subtasks, // Include subtasks from template
+      blockedBy: input.blockedBy, // Include dependencies from blueprint
+      created: now,
+      updated: now,
+      revision: 1,
+      createdBy: input.createdBy,
+      updatedBy: input.updatedBy ?? input.createdBy,
+    };
+
+    // Validate agent ref against registry (#157)
+    if (task.agent) {
+      const registry = getAgentRegistryService();
+      const validation = registry.validateAgentRef(task.agent);
+      if (!validation.valid) {
+        throw new ValidationError(validation.reason || 'Invalid agent ref', [
+          {
+            code: 'INVALID_AGENT_REF',
+            message: validation.reason || 'Invalid agent ref',
+            path: ['agent'],
+          },
+        ]);
+      }
+    }
+
+    if (this.sqliteTasks) {
+      const sqliteTasks = this.sqliteTasks;
+      await this.runSqliteMutation(() => sqliteTasks.create(task));
+    } else {
+      const fileTasks = this.requireFileTasks();
+      const descriptor = fileTasks.describeActiveTask(task);
+
+      await this.assertTaskIdentityIntegrity('task.create', task.id, {
+        candidates: [fileTasks.describeIdentityCandidate(task, 'active')],
+        destinationPath: descriptor.diagnosticPath,
+      });
+
+      await fileTasks.createActive(task);
+      this.identityDiagnosticsCache = null;
+      this.cache.set(task.id, task);
+    }
+
+    // Emit telemetry event
+    await this.telemetry.emit<TaskTelemetryEvent>({
+      type: 'task.created',
+      taskId: task.id,
+      project: task.project,
+      status: task.status,
+    });
+
+    // Fire onCreated hook
+    fireHook('onCreated', task).catch((err) => {
+      log.warn({ taskId: task.id }, 'onCreated hook failed: %s', err);
+    });
+
+    return task;
+  }
+
+  async updateTask(
+    id: string,
+    input: UpdateTaskInput,
+    options: { protectManagedAttempt?: boolean } = {}
+  ): Promise<Task | null> {
+    const affectsBoard = input.position !== undefined || input.status !== undefined;
+    const mutationInput: TaskMutationInput = {
+      ...input,
+      ...(input.position !== undefined ? { boardRank: null } : {}),
+      protectManagedAttempt: options.protectManagedAttempt,
+    };
+    if (affectsBoard) {
+      return this.withBoardMoveMutex((commitStorage) =>
+        this.withTaskMutex(id, () =>
+          this.updateTaskMutation(id, mutationInput, true, commitStorage)
+        )
+      );
+    }
+    if (this.sqliteTasks) {
+      return this.runSqliteMutation(() =>
+        this.withTaskMutex(id, () => this.updateTaskMutation(id, mutationInput, true))
+      );
+    }
+    return this.withTaskMutex(id, () => this.updateTaskMutation(id, mutationInput));
+  }
+
+  async patchTaskAttempt(
+    id: string,
+    attemptId: string,
+    patch: Partial<Omit<TaskAttempt, 'id'>>
+  ): Promise<Task | null> {
+    const input: TaskMutationInput = {
+      attemptPatch: { id: attemptId, ...patch },
+    };
+    if (this.sqliteTasks) {
+      return this.runSqliteMutation(() =>
+        this.withTaskMutex(id, () => this.updateTaskMutation(id, input, true))
+      );
+    }
+    return this.withTaskMutex(id, () => this.updateTaskMutation(id, input));
+  }
+
+  private async updateTaskMutation(
+    id: string,
+    input: TaskMutationInput,
+    boardStorageLocked = false,
+    afterPersistence?: () => void
+  ): Promise<Task | null> {
+    await this.assertTaskIdentityIntegrity('task.update', id);
+
+    // Initial read to check existence and compute the lock filepath.
+    // NOTE: this data may be stale by the time we acquire the lock —
+    // the actual merge happens inside the lock with a fresh cache read.
+    const task = await this.getTaskWithoutIdentityCheck(id);
+    if (!task) return null;
+
+    // Handle git field separately to merge properly
+    const {
+      git: gitUpdate,
+      github: githubUpdate,
+      blockedReason: blockedReasonUpdate,
+      boardRank: boardRankUpdate,
+      expectedRevision: _expectedRevision,
+      attemptPatch,
+      protectManagedAttempt,
+      ...restInput
+    } = input;
+
+    let updatedTask!: Task;
+    let shouldGenerateCompletionPacket = false;
+    let attemptPatchApplied = attemptPatch === undefined;
+    let fileMutationTask: Task | null = null;
+    let persistFileTask: ((updated: Task) => Promise<void>) | null = null;
+    let mutationFound = true;
+    const runMutation = async (callback: () => Promise<void>): Promise<void> => {
+      if (this.sqliteTasks) {
+        if (boardStorageLocked) await callback();
+        else await this.runSqliteMutation(callback);
+        return;
+      }
+
+      const result = await this.requireFileTasks().withActiveMutation(
+        id,
+        async (current, persist) => {
+          fileMutationTask = current;
+          persistFileTask = persist;
+          await callback();
+          return true;
+        }
+      );
+      mutationFound = result !== null;
+    };
+
+    await runMutation(async () => {
+      // Re-read from cache inside the lock to get the latest state.
+      // This prevents concurrent writes (e.g., debounced field save vs.
+      // timer start) from overwriting each other's changes.
+      const freshTask = this.sqliteTasks
+        ? ((await this.sqliteTasks.findById(id)) ?? task)
+        : (fileMutationTask ?? task);
+
+      // Check inside the storage lock: launch may have installed a managed
+      // attempt after the generic route read the previous task revision.
+      if (protectManagedAttempt && input.attempt) {
+        assertLegacyAttemptEditable(freshTask.attempt);
+      }
+
+      if (attemptPatch && freshTask.attempt?.id !== attemptPatch.id) {
+        updatedTask = freshTask;
+        return;
+      }
+      attemptPatchApplied = true;
+
+      // Revision check inside the lock — prevents a TOCTOU race where two
+      // concurrent requests with the same valid revision both pass the
+      // pre-lock route check, serialize here, and both succeed.
+      if (_expectedRevision !== undefined) {
+        const currentRevision = normalizedTaskRevision(freshTask);
+        if (_expectedRevision !== currentRevision) {
+          throw new ConflictError(
+            `task ${id} has changed since it was loaded. Reload and retry with the latest revision.`,
+            {
+              resourceType: 'task',
+              resourceId: id,
+              expectedRevision: _expectedRevision,
+              currentRevision,
+              current: freshTask,
+            }
+          );
+        }
+      }
+
+      const previousStatus = freshTask.status;
+      const statusChanged = input.status !== undefined && input.status !== previousStatus;
+      let settings: Awaited<ReturnType<ConfigService['getFeatureSettings']>> | null = null;
+
+      if (statusChanged) {
+        settings = await this.configService.getFeatureSettings();
+        const columns = normalizeBoardColumns(settings.board?.columns);
+        this.assertConfiguredStatus(input.status as TaskStatus, {
+          columns,
+          defaultStatus: normalizeBoardDefaultStatus(settings.board?.defaultStatus, columns),
+          activeStatusIds: new Set(columns.map((column) => column.id)),
+        });
+      }
+
+      // Validate transition hooks (quality gates) before allowing status change
+      if (statusChanged && input.status && settings) {
+        // Check requireDeliverableForDone setting
+        if (input.status === 'done') {
+          if (settings.tasks.requireDeliverableForDone) {
+            const deliverables = input.deliverables ?? freshTask.deliverables ?? [];
+            if (deliverables.length === 0) {
+              throw new ValidationError(
+                'Cannot complete task without at least one deliverable (required by settings)',
+                [
+                  {
+                    code: 'DELIVERABLE_REQUIRED',
+                    message: 'Task requires at least one deliverable to be marked as done',
+                    path: ['status'],
+                  },
+                ]
+              );
+            }
+          }
+
+          // Enforcement: 4x10 Review Gate (only if enforcement settings are explicitly configured)
+          // Only applies to code-related task types
+          if (
+            settings.enforcement?.reviewGate === true &&
+            CODE_TASK_TYPES.includes(freshTask.type?.toLowerCase())
+          ) {
+            const scores = input.reviewScores ?? freshTask.reviewScores ?? [];
+            const allPerfect = scores.length === 4 && scores.every((s: number) => s === 10);
+            if (!allPerfect) {
+              const scoresDisplay =
+                scores.length === 4
+                  ? scores.join('/')
+                  : scores.length > 0
+                    ? scores.join('/')
+                    : 'none';
+              const detailMessage =
+                scores.length === 4
+                  ? `Review Gate: This ${freshTask.type} task requires all four review scores to be 10/10/10/10 before completion. Current scores: ${scoresDisplay}`
+                  : scores.length > 0
+                    ? `Review Gate: This ${freshTask.type} task requires all four review scores to be 10/10/10/10 before completion. Current scores: ${scoresDisplay} (incomplete)`
+                    : `Review Gate: This ${freshTask.type} task requires all four review scores to be 10/10/10/10 before completion. No review scores set yet.`;
+
+              throw new ValidationError(detailMessage, [
+                {
+                  code: 'REVIEW_GATE',
+                  message: detailMessage,
+                  path: ['reviewScores'],
+                },
+              ]);
+            }
+          }
+
+          // Enforcement: Closing Comments Required (only if enforcement settings are explicitly configured)
+          if (settings.enforcement?.closingComments === true) {
+            const comments = input.reviewComments ?? freshTask.reviewComments ?? [];
+            const hasClosingComment =
+              comments.length > 0 &&
+              comments.some((c: { content: string }) => c.content && c.content.length >= 20);
+            if (!hasClosingComment) {
+              const commentCount = comments.length;
+              const detailMessage =
+                commentCount === 0
+                  ? 'Closing Comments: At least one review comment with a deliverable summary (≥20 characters) is required before marking this task as done. No comments added yet.'
+                  : 'Closing Comments: At least one review comment with a deliverable summary (≥20 characters) is required before marking this task as done. Current comments are too short.';
+
+              throw new ValidationError(detailMessage, [
+                {
+                  code: 'CLOSING_COMMENTS_REQUIRED',
+                  message: detailMessage,
+                  path: ['reviewComments'],
+                },
+              ]);
+            }
+          }
+        }
+
+        // Create a preview of the task with proposed changes for validation
+        const previewTask: Task = {
+          ...freshTask,
+          ...restInput,
+          blockedReason:
+            blockedReasonUpdate === null
+              ? undefined
+              : (blockedReasonUpdate ?? freshTask.blockedReason),
+        };
+
+        if (input.status === 'done' && settings.enforcement) {
+          const ceremonyEvaluation = await this.ceremonyService.evaluateTaskCompletion(
+            previewTask,
+            settings.enforcement
+          );
+          if (!ceremonyEvaluation.allowed) {
+            const detailMessage = `Ceremony Enforcement: ${ceremonyEvaluation.blockedReasons.join(
+              ' '
+            )}`;
+            throw new ValidationError(detailMessage, [
+              {
+                code: 'CEREMONY_REQUIRED',
+                message: detailMessage,
+                path: ['status'],
+                details: ceremonyEvaluation.pending.map((requirement) => ({
+                  id: requirement.id,
+                  kind: requirement.kind,
+                  title: requirement.title,
+                  reason: requirement.reason,
+                  requiredArtifacts: requirement.requiredArtifacts,
+                  dueAt: requirement.dueAt,
+                })),
+              },
+            ]);
+          }
+        }
+
+        const validation = await validateTransition(previewTask, previousStatus, input.status);
+        if (!validation.allowed) {
+          throw new ValidationError(
+            validation.errorMessage || 'Transition blocked by quality gates',
+            validation.failedGates.map(
+              (g: { gate: { type: string; name: string }; message?: string }) => ({
+                code: g.gate.type,
+                message: g.message || g.gate.name,
+                path: ['status'],
+              })
+            )
+          );
+        }
+      }
+
+      // Handle checkpoint resumption: increment resumeCount if transitioning to in-progress with checkpoint
+      const hasCheckpointInput = Object.prototype.hasOwnProperty.call(input, 'checkpoint');
+      let checkpointUpdate = input.checkpoint;
+      let clearCheckpoint = hasCheckpointInput && input.checkpoint === undefined;
+      if (
+        !hasCheckpointInput &&
+        freshTask.checkpoint &&
+        input.status === 'in-progress' &&
+        previousStatus !== 'in-progress'
+      ) {
+        // Task is being resumed — increment resumeCount
+        checkpointUpdate = {
+          ...freshTask.checkpoint,
+          resumeCount: (freshTask.checkpoint.resumeCount || 0) + 1,
+        };
+      }
+
+      // Clear checkpoint when task completes successfully
+      if (input.status === 'done' && freshTask.checkpoint) {
+        clearCheckpoint = true;
+      }
+
+      // Validate agent ref against registry if being changed (#157)
+      if (restInput.agent !== undefined && restInput.agent !== freshTask.agent) {
+        const registry = getAgentRegistryService();
+        const validation = registry.validateAgentRef(restInput.agent);
+        if (!validation.valid) {
+          throw new ValidationError(validation.reason || 'Invalid agent ref', [
+            {
+              code: 'INVALID_AGENT_REF',
+              message: validation.reason || 'Invalid agent ref',
+              path: ['agent'],
+            },
+          ]);
+        }
+      }
+
+      updatedTask = {
+        ...freshTask,
+        ...restInput,
+        attempt:
+          attemptPatch && freshTask.attempt?.id === attemptPatch.id
+            ? { ...freshTask.attempt, ...attemptPatch }
+            : restInput.attempt !== undefined
+              ? restInput.attempt
+              : freshTask.attempt,
+        git: gitUpdate ? ({ ...freshTask.git, ...gitUpdate } as Task['git']) : freshTask.git,
+        github: githubUpdate ?? freshTask.github,
+        boardRank: boardRankUpdate === null ? undefined : (boardRankUpdate ?? freshTask.boardRank),
+        // Handle blockedReason: null means clear, undefined means keep existing
+        blockedReason:
+          blockedReasonUpdate === null
+            ? undefined
+            : (blockedReasonUpdate ?? freshTask.blockedReason),
+        // Apply checkpoint update (resume count or clear)
+        checkpoint: clearCheckpoint
+          ? undefined
+          : checkpointUpdate !== undefined
+            ? checkpointUpdate
+            : freshTask.checkpoint,
+        revision: normalizedTaskRevision(freshTask) + 1,
+        updated: new Date().toISOString(),
+      };
+
+      if (this.sqliteTasks) {
+        await this.sqliteTasks.replaceActive(updatedTask);
+      } else {
+        const fileTasks = this.requireFileTasks();
+        const descriptor = fileTasks.describeActiveTask(updatedTask);
+
+        await this.assertTaskIdentityIntegrity('task.update', id, {
+          candidates: [fileTasks.describeIdentityCandidate(updatedTask, 'active')],
+          destinationPath: descriptor.diagnosticPath,
+          excludeTaskIds: [id],
+        });
+
+        const persist = persistFileTask;
+        if (!persist) throw new Error('File task mutation persistence is unavailable');
+        await persist(updatedTask);
+        this.identityDiagnosticsCache = null;
+        this.cache.set(updatedTask.id, updatedTask);
+      }
+      afterPersistence?.();
+
+      // Emit telemetry event if status changed
+      if (statusChanged) {
+        if (input.lastBoardMove) {
+          try {
+            this.syncAgentRegistryForStatusTransition(updatedTask);
+          } catch (error) {
+            log.warn(
+              { taskId: updatedTask.id, operationId: input.lastBoardMove.operationId, err: error },
+              'Board move agent registry sync will be repaired by reconciliation'
+            );
+          }
+        } else {
+          this.syncAgentRegistryForStatusTransition(updatedTask);
+        }
+
+        if (input.lastBoardMove) {
+          await this.ensureBoardMoveTelemetry(updatedTask, input.lastBoardMove);
+        } else {
+          await this.telemetry.emit<TaskTelemetryEvent>({
+            type: 'task.status_changed',
+            taskId: updatedTask.id,
+            project: updatedTask.project,
+            status: updatedTask.status,
+            previousStatus,
+          });
+        }
+
+        // Fire lifecycle hook if applicable
+        const hookEvent = getHookEventForStatusChange(previousStatus, updatedTask.status);
+        if (hookEvent) {
+          fireHook(hookEvent, updatedTask, previousStatus).catch((err) => {
+            log.warn({ taskId: updatedTask.id, hookEvent }, 'Hook execution failed: %s', err);
+          });
+        }
+
+        // Enforcement: Auto-telemetry emission (run.started/run.completed)
+        const autoTelemetry = settings?.enforcement?.autoTelemetry === true;
+
+        if (autoTelemetry) {
+          const agent = updatedTask.agent || 'veritas';
+          if (updatedTask.status === 'in-progress' && previousStatus !== 'in-progress') {
+            // Emit run.started
+            this.telemetry
+              .emit<RunStartedEvent>({
+                type: 'run.started',
+                taskId: updatedTask.id,
+                agent,
+              })
+              .catch((err) => {
+                log.warn({ taskId: updatedTask.id }, 'Auto run.started emission failed: %s', err);
+              });
+          } else if (updatedTask.status === 'done' && previousStatus !== 'done') {
+            // Emit run.completed
+            const durationMs = updatedTask.timeTracking?.totalSeconds
+              ? updatedTask.timeTracking.totalSeconds * 1000
+              : 0;
+            this.telemetry
+              .emit<RunCompletedEvent>({
+                type: 'run.completed',
+                taskId: updatedTask.id,
+                agent,
+                success: true,
+                durationMs,
+              })
+              .catch((err) => {
+                log.warn({ taskId: updatedTask.id }, 'Auto run.completed emission failed: %s', err);
+              });
+          }
+        }
+
+        // Enforcement: Auto time tracking start/stop (only if enforcement is configured)
+        const autoTimeTracking = settings?.enforcement?.autoTimeTracking === true;
+        if (autoTimeTracking) {
+          if (updatedTask.status === 'in-progress' && previousStatus !== 'in-progress') {
+            // Auto-start timer
+            if (!updatedTask.timeTracking?.isRunning) {
+              this.startTimer(updatedTask.id).catch((err) => {
+                log.warn({ taskId: updatedTask.id }, 'Auto timer start failed: %s', err);
+              });
+            }
+          } else if (
+            (updatedTask.status === 'done' || updatedTask.status === 'blocked') &&
+            previousStatus !== 'done' &&
+            previousStatus !== 'blocked'
+          ) {
+            // Auto-stop timer
+            if (updatedTask.timeTracking?.isRunning) {
+              this.stopTimer(updatedTask.id).catch((err) => {
+                log.warn({ taskId: updatedTask.id }, 'Auto timer stop failed: %s', err);
+              });
+            }
+          }
+        }
+
+        // Execute post-transition actions (quality gates)
+        const actionCallbacks: TransitionActionCallbacks = {
+          onAutoStartTimer: async (t) => {
+            // Start time tracking if not already active
+            if (!t.timeTracking?.isRunning) {
+              await this.startTimer(t.id);
+            }
+          },
+          onAutoStopTimer: async (t) => {
+            // Stop time tracking if currently running
+            if (t.timeTracking?.isRunning) {
+              await this.stopTimer(t.id);
+            }
+          },
+          onLogActivity: async (t, from, to) => {
+            log.info({ taskId: t.id, from, to }, 'Transition action: logged activity');
+          },
+          onPromptLessonsLearned: async (t) => {
+            // Flag task for lessons learned capture (could set a field or emit event)
+            log.info({ taskId: t.id }, 'Transition action: prompt lessons learned');
+          },
+        };
+
+        executePostTransitionActions(
+          updatedTask,
+          previousStatus,
+          updatedTask.status,
+          actionCallbacks
+        ).catch((err) => {
+          log.warn({ taskId: updatedTask.id }, 'Post-transition actions failed: %s', err);
+        });
+
+        shouldGenerateCompletionPacket = updatedTask.status === 'done' && previousStatus !== 'done';
+      }
+    });
+
+    if (!mutationFound) return null;
+    if (!attemptPatchApplied) {
+      return null;
+    }
+
+    if (shouldGenerateCompletionPacket) {
+      try {
+        await getWorkProductService().generateCompletionPacket(updatedTask);
+      } catch (err) {
+        log.warn({ taskId: updatedTask.id }, 'Completion packet generation failed: %s', err);
+      }
+    }
+
+    return updatedTask;
+  }
+
+  async deleteTask(id: string): Promise<boolean> {
+    if (this.sqliteTasks) {
+      return this.runSqliteMutation(() =>
+        this.withTaskMutex(id, () => this.deleteTaskMutation(id, true))
+      );
+    }
+    return this.withTaskMutex(id, () => this.deleteTaskMutation(id));
+  }
+
+  private async deleteTaskMutation(id: string, sqliteStorageLocked = false): Promise<boolean> {
+    if (this.sqliteTasks) {
+      await this.assertTaskIdentityIntegrity('task.delete', id, {
+        allowSameLocationTaskIdDuplicates: true,
+      });
+      const task = await this.getTaskWithoutIdentityCheck(id);
+      if (!task) return false;
+
+      const sqliteTasks = this.sqliteTasks;
+      return sqliteStorageLocked
+        ? sqliteTasks.deleteActive(id)
+        : this.runSqliteMutation(() => sqliteTasks.deleteActive(id));
+    }
+
+    await this.assertTaskIdentityIntegrity('task.delete', id, {
+      allowSameLocationTaskIdDuplicates: true,
+    });
+    const task = await this.getTaskWithoutIdentityCheck(id);
+    if (!task) return false;
+
+    const deleted = await this.requireFileTasks().deleteActive(id);
+    if (!deleted) return false;
+    this.identityDiagnosticsCache = null;
+    this.invalidateTaskCache(id);
+
+    const { getAttachmentService } = await import('./attachment-service.js');
+    await getAttachmentService().deleteAllAttachments(id);
+    return true;
+  }
+
+  async archiveTask(
+    id: string,
+    options?: { deletedAt?: string; deletedBy?: string; purgeAfter?: string }
+  ): Promise<boolean> {
+    if (this.sqliteTasks) {
+      return this.runSqliteMutation(() =>
+        this.withTaskMutex(id, () => this.archiveTaskMutation(id, options, true))
+      );
+    }
+    return this.withTaskMutex(id, () => this.archiveTaskMutation(id, options));
+  }
+
+  private async archiveTaskMutation(
+    id: string,
+    options?: { deletedAt?: string; deletedBy?: string; purgeAfter?: string },
+    sqliteStorageLocked = false
+  ): Promise<boolean> {
+    if (this.sqliteTasks) {
+      await this.assertTaskIdentityIntegrity('task.archive', id, {
+        allowSameLocationTaskIdDuplicates: true,
+      });
+      const task = await this.getTaskWithoutIdentityCheck(id);
+      if (!task) return false;
+
+      const archivedTask: Task = {
+        ...task,
+        updated: new Date().toISOString(),
+        deletedAt: options?.deletedAt ?? task.deletedAt,
+        deletedBy: options?.deletedBy ?? task.deletedBy,
+        purgeAfter: options?.purgeAfter ?? task.purgeAfter,
+      };
+      const sqliteTasks = this.sqliteTasks;
+      const archived = await (sqliteStorageLocked
+        ? sqliteTasks.archive(id, archivedTask)
+        : this.runSqliteMutation(() => sqliteTasks.archive(id, archivedTask)));
+      if (!archived) return false;
+
+      await this.telemetry.emit<TaskTelemetryEvent>({
+        type: 'task.archived',
+        taskId: archivedTask.id,
+        project: archivedTask.project,
+        status: archivedTask.status,
+      });
+
+      fireHook('onArchived', archivedTask).catch((err) => {
+        log.warn({ taskId: archivedTask.id }, 'onArchived hook failed: %s', err);
+      });
+
+      return true;
+    }
+
+    await this.assertTaskIdentityIntegrity('task.archive', id, {
+      allowSameLocationTaskIdDuplicates: true,
+    });
+    const archiveResult: { task?: Task } = {};
+    const archived = await this.requireFileTasks().archiveActive(id, (freshTask) => {
+      archiveResult.task = {
+        ...freshTask,
+        updated: new Date().toISOString(),
+        deletedAt: options?.deletedAt ?? freshTask.deletedAt,
+        deletedBy: options?.deletedBy ?? freshTask.deletedBy,
+        purgeAfter: options?.purgeAfter ?? freshTask.purgeAfter,
+      };
+      return archiveResult.task;
+    });
+    const freshArchivedTask = archiveResult.task;
+    if (!archived || !freshArchivedTask) return false;
+    this.identityDiagnosticsCache = null;
+    this.invalidateTaskCache(id);
+
+    const { getAttachmentService } = await import('./attachment-service.js');
+    await getAttachmentService().archiveAttachments(id);
+
+    const { getProgressService } = await import('./progress-service.js');
+    await getProgressService().deleteProgress(id);
+
+    await this.telemetry.emit<TaskTelemetryEvent>({
+      type: 'task.archived',
+      taskId: freshArchivedTask.id,
+      project: freshArchivedTask.project,
+      status: freshArchivedTask.status,
+    });
+
+    fireHook('onArchived', freshArchivedTask).catch((err) => {
+      log.warn({ taskId: freshArchivedTask.id }, 'onArchived hook failed: %s', err);
+    });
+
+    return true;
+  }
+
+  async listArchivedTasks(): Promise<Task[]> {
+    if (this.sqliteTasks) {
+      return this.sqliteTasks.listArchived();
+    }
+
+    return this.requireFileTasks().listArchived();
+  }
+
+  async getArchivedTask(id: string): Promise<Task | null> {
+    if (this.sqliteTasks) {
+      return this.sqliteTasks.findArchivedById(id);
+    }
+    return this.requireFileTasks().findArchivedById(id);
+  }
+
+  private isRestoreWindowExpired(task: Task): boolean {
+    if (!task.purgeAfter) {
+      return false;
+    }
+
+    const purgeAfterTime = new Date(task.purgeAfter).getTime();
+    if (Number.isFinite(purgeAfterTime) && purgeAfterTime >= Date.now()) {
+      return false;
+    }
+
+    log.info(
+      { taskId: task.id, purgeAfter: task.purgeAfter },
+      'Restore window invalid or expired for archived task'
+    );
+    return true;
+  }
+
+  async restoreTask(id: string): Promise<Task | null> {
+    if (this.sqliteTasks) {
+      return this.runSqliteMutation(() =>
+        this.withTaskMutex(id, () => this.restoreTaskMutation(id, true))
+      );
+    }
+    return this.withTaskMutex(id, () => this.restoreTaskMutation(id));
+  }
+
+  private async restoreTaskMutation(id: string, sqliteStorageLocked = false): Promise<Task | null> {
+    if (this.sqliteTasks) {
+      await this.assertTaskIdentityIntegrity('task.restore', id);
+      const task = await this.getArchivedTask(id);
+      if (!task || this.isRestoreWindowExpired(task)) return null;
+
+      const sqliteTasks = this.sqliteTasks;
+      const restoredTask = await (sqliteStorageLocked
+        ? sqliteTasks.restore(id)
+        : this.runSqliteMutation(() => sqliteTasks.restore(id)));
+      if (!restoredTask) return null;
+
+      await this.telemetry.emit<TaskTelemetryEvent>({
+        type: 'task.restored',
+        taskId: restoredTask.id,
+        project: restoredTask.project,
+        status: restoredTask.status,
+      });
+
+      return restoredTask;
+    }
+
+    await this.assertTaskIdentityIntegrity('task.restore', id);
+    const restoreResult: { task?: Task } = {};
+    const restored = await this.requireFileTasks().restoreArchived(id, (freshTask) => {
+      if (this.isRestoreWindowExpired(freshTask)) return null;
+      restoreResult.task = {
+        ...freshTask,
+        status: 'done',
+        updated: new Date().toISOString(),
+        deletedAt: undefined,
+        deletedBy: undefined,
+        purgeAfter: undefined,
+      };
+      return restoreResult.task;
+    });
+    const restoredTask = restoreResult.task;
+    if (!restored || !restoredTask) return null;
+    this.identityDiagnosticsCache = null;
+
+    const { getAttachmentService } = await import('./attachment-service.js');
+    await getAttachmentService().restoreAttachments(id);
+
+    this.cache.set(restoredTask.id, restoredTask);
+
+    await this.telemetry.emit<TaskTelemetryEvent>({
+      type: 'task.restored',
+      taskId: restoredTask.id,
+      project: restoredTask.project,
+      status: restoredTask.status,
+    });
+
+    return restoredTask;
+  }
+
+  /**
+   * Get projects that are ready to archive (all tasks are done)
+   */
+  async getArchiveSuggestions(): Promise<{ sprint: string; taskCount: number; tasks: Task[] }[]> {
+    const tasks = await this.listTasks();
+
+    // Group tasks by sprint
+    const sprintTasks = new Map<string, Task[]>();
+
+    for (const task of tasks) {
+      if (task.sprint) {
+        const existing = sprintTasks.get(task.sprint) || [];
+        existing.push(task);
+        sprintTasks.set(task.sprint, existing);
+      }
+    }
+
+    // Find sprints where ALL tasks are done
+    const suggestions: { sprint: string; taskCount: number; tasks: Task[] }[] = [];
+
+    for (const [sprint, sprintTaskList] of Array.from(sprintTasks.entries())) {
+      const allDone = sprintTaskList.every((t) => t.status === 'done');
+      if (allDone && sprintTaskList.length > 0) {
+        suggestions.push({
+          sprint,
+          taskCount: sprintTaskList.length,
+          tasks: sprintTaskList,
+        });
+      }
+    }
+
+    return suggestions;
+  }
+
+  /**
+   * Archive all tasks in a sprint
+   */
+  async archiveSprint(sprint: string): Promise<{ archived: number; taskIds: string[] }> {
+    const tasks = await this.listTasks();
+    const sprintTasks = tasks.filter((t) => t.sprint === sprint);
+
+    if (sprintTasks.length === 0) {
+      throw new ValidationError(
+        `No active tasks found for sprint "${sprint}" (may already be archived)`
+      );
+    }
+
+    // Check all tasks are done
+    const notDone = sprintTasks.filter((t) => t.status !== 'done');
+    if (notDone.length > 0) {
+      throw new ValidationError(`Cannot archive sprint: ${notDone.length} task(s) are not done`);
+    }
+
+    // Archive all tasks
+    const archivedIds: string[] = [];
+    for (const task of sprintTasks) {
+      await this.archiveTask(task.id);
+      archivedIds.push(task.id);
+    }
+
+    return {
+      archived: archivedIds.length,
+      taskIds: archivedIds,
+    };
+  }
+
+  // ============ Time Tracking Methods ============
+
+  /**
+   * Start a timer for a task.
+   * Per-task exclusivity: only one timer per task (but multiple tasks can
+   * each have their own running timer — supports multi-agent workflows).
+   */
+  async startTimer(taskId: string): Promise<Task> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError('Task not found');
+    }
+
+    if (task.timeTracking?.isRunning) {
+      throw new ConflictError('Timer is already running for this task');
+    }
+
+    const entryId = `time_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = new Date().toISOString();
+
+    const newEntry = {
+      id: entryId,
+      startTime: now,
+    };
+
+    const timeTracking = {
+      entries: [...(task.timeTracking?.entries || []), newEntry],
+      totalSeconds: task.timeTracking?.totalSeconds || 0,
+      isRunning: true,
+      activeEntryId: entryId,
+    };
+
+    return (await this.updateTask(taskId, { timeTracking })) as Task;
+  }
+
+  /**
+   * Stop the running timer for a task
+   */
+  async stopTimer(taskId: string): Promise<Task> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError('Task not found');
+    }
+
+    if (!task.timeTracking?.isRunning || !task.timeTracking.activeEntryId) {
+      throw new ConflictError('No timer is running for this task');
+    }
+
+    const now = new Date();
+    const activeEntryId = task.timeTracking.activeEntryId;
+    const entries = task.timeTracking.entries.map(
+      (entry: {
+        id: string;
+        startTime: string;
+        endTime?: string;
+        duration?: number;
+        description?: string;
+        manual?: boolean;
+      }) => {
+        if (entry.id === activeEntryId) {
+          const startTime = new Date(entry.startTime);
+          const duration = Math.floor((now.getTime() - startTime.getTime()) / 1000);
+          return {
+            ...entry,
+            endTime: now.toISOString(),
+            duration,
+          };
+        }
+        return entry;
+      }
+    );
+
+    // Recalculate total
+    const totalSeconds = entries.reduce(
+      (sum: number, e: { duration?: number }) => sum + (e.duration || 0),
+      0
+    );
+
+    const timeTracking: TimeTracking = {
+      entries,
+      totalSeconds,
+      isRunning: false,
+    };
+
+    return this.updateTask(taskId, { timeTracking }) as Promise<Task>;
+  }
+
+  /**
+   * Add a manual time entry
+   */
+  async addTimeEntry(taskId: string, duration: number, description?: string): Promise<Task> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError('Task not found');
+    }
+
+    const entryId = `time_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = new Date().toISOString();
+
+    const newEntry = {
+      id: entryId,
+      startTime: now,
+      endTime: now,
+      duration,
+      description,
+      manual: true,
+    };
+
+    const entries = [...(task.timeTracking?.entries || []), newEntry];
+    const totalSeconds = entries.reduce((sum, e) => sum + (e.duration || 0), 0);
+
+    const timeTracking = {
+      entries,
+      totalSeconds,
+      isRunning: task.timeTracking?.isRunning || false,
+      activeEntryId: task.timeTracking?.activeEntryId,
+    };
+
+    return this.updateTask(taskId, { timeTracking }) as Promise<Task>;
+  }
+
+  /**
+   * Add a dependency relationship between two tasks
+   * @param taskId - The task that will depend on or block another
+   * @param targetId - The task to depend on or to block
+   * @param type - 'depends_on' or 'blocks'
+   */
+  async addDependency(
+    taskId: string,
+    targetId: string,
+    type: 'depends_on' | 'blocks'
+  ): Promise<Task> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError(`Task ${taskId} not found`);
+    }
+
+    const targetTask = await this.getTask(targetId);
+    if (!targetTask) {
+      throw new NotFoundError(`Target task ${targetId} not found`);
+    }
+
+    // Deep-copy dependencies so we never mutate the cache entries in place.
+    // Mutating in-place before the final cycle check can corrupt the cache,
+    // causing checkForCycle to see the not-yet-committed edges and mis-detect cycles.
+    const dependencies = {
+      depends_on: [...(task.dependencies?.depends_on || [])],
+      blocks: [...(task.dependencies?.blocks || [])],
+    };
+    const targetDependencies = {
+      depends_on: [...(targetTask.dependencies?.depends_on || [])],
+      blocks: [...(targetTask.dependencies?.blocks || [])],
+    };
+
+    // Check for cycle BEFORE any updates
+    if (type === 'depends_on') {
+      // Adding A depends_on B: check if B already transitively depends_on A (would form a cycle).
+      const hasCycle = await this.checkForCycle(targetId, taskId, 'depends_on');
+      if (hasCycle) {
+        throw new ValidationError('Adding this dependency would create a cycle');
+      }
+    } else {
+      // Adding A blocks B: check if B already transitively blocks A (would form a cycle).
+      // Both relationships form a directed graph in the same order, so the same DFS
+      // direction applies: start from target (B) and see if A is reachable via blocks edges.
+      const hasCycle = await this.checkForCycle(targetId, taskId, 'blocks');
+      if (hasCycle) {
+        throw new ValidationError('Adding this dependency would create a cycle');
+      }
+    }
+
+    // Add the forward relationship
+    if (type === 'depends_on') {
+      if (!dependencies.depends_on) dependencies.depends_on = [];
+      if (!dependencies.depends_on.includes(targetId)) {
+        dependencies.depends_on.push(targetId);
+      }
+    } else {
+      if (!dependencies.blocks) dependencies.blocks = [];
+      if (!dependencies.blocks.includes(targetId)) {
+        dependencies.blocks.push(targetId);
+      }
+    }
+
+    // Add the reverse relationship
+    const reverseType = type === 'depends_on' ? 'blocks' : 'depends_on';
+    if (reverseType === 'depends_on') {
+      if (!targetDependencies.depends_on) targetDependencies.depends_on = [];
+      if (!targetDependencies.depends_on.includes(taskId)) {
+        targetDependencies.depends_on.push(taskId);
+      }
+    } else {
+      if (!targetDependencies.blocks) targetDependencies.blocks = [];
+      if (!targetDependencies.blocks.includes(taskId)) {
+        targetDependencies.blocks.push(taskId);
+      }
+    }
+
+    // Update both tasks inside file locks to prevent race conditions
+    // Update target first, then the task itself
+    await this.updateTask(targetId, { dependencies: targetDependencies });
+
+    // Re-check for cycle immediately before final write (race condition mitigation)
+    // This catches the case where another request added a conflicting dependency
+    // between our initial check and now
+    const finalCycleCheck =
+      type === 'depends_on'
+        ? await this.checkForCycle(targetId, taskId, 'depends_on')
+        : await this.checkForCycle(targetId, taskId, 'blocks');
+
+    if (finalCycleCheck) {
+      // Rollback the target task update
+      await this.updateTask(targetId, { dependencies: targetTask.dependencies });
+      throw new ValidationError(
+        'Adding this dependency would create a cycle (detected during final check)'
+      );
+    }
+
+    return (await this.updateTask(taskId, { dependencies })) as Task;
+  }
+
+  /**
+   * Remove a dependency relationship between two tasks
+   * Detects which relationship exists and removes it correctly
+   */
+  async removeDependency(taskId: string, targetId: string): Promise<Task> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError(`Task ${taskId} not found`);
+    }
+
+    const targetTask = await this.getTask(targetId);
+    if (!targetTask) {
+      throw new NotFoundError(`Target task ${targetId} not found`);
+    }
+
+    const dependencies = task.dependencies || { depends_on: [], blocks: [] };
+    const targetDependencies = targetTask.dependencies || { depends_on: [], blocks: [] };
+
+    // Detect which relationship exists
+    const taskDependsOnTarget = dependencies.depends_on?.includes(targetId);
+    const taskBlocksTarget = dependencies.blocks?.includes(targetId);
+
+    if (!taskDependsOnTarget && !taskBlocksTarget) {
+      // No relationship exists
+      return task;
+    }
+
+    // Remove from the correct arrays only
+    if (taskDependsOnTarget) {
+      // Task depends_on target → remove from task.depends_on and target.blocks
+      dependencies.depends_on = dependencies.depends_on?.filter((id) => id !== targetId) || [];
+      targetDependencies.blocks = targetDependencies.blocks?.filter((id) => id !== taskId) || [];
+    }
+
+    if (taskBlocksTarget) {
+      // Task blocks target → remove from task.blocks and target.depends_on
+      dependencies.blocks = dependencies.blocks?.filter((id) => id !== targetId) || [];
+      targetDependencies.depends_on =
+        targetDependencies.depends_on?.filter((id) => id !== taskId) || [];
+    }
+
+    // Update both tasks
+    await this.updateTask(targetId, { dependencies: targetDependencies });
+    return (await this.updateTask(taskId, { dependencies })) as Task;
+  }
+
+  /**
+   * Check if adding a dependency would create a cycle.
+   * Performs DFS following only edges of `direction` type (depends_on or blocks).
+   * Mixing relationship types during traversal produces false positives — e.g.
+   * C depends_on D and D blocks E is a valid DAG, but traversing C→D→E through
+   * mixed edge types would incorrectly report a cycle when checking E depends_on C.
+   * Uses batch loading to avoid N+1 queries.
+   */
+  private async checkForCycle(
+    startId: string,
+    targetId: string,
+    direction: 'depends_on' | 'blocks'
+  ): Promise<boolean> {
+    // Load all tasks once for batch processing (performance optimization)
+    const allTasks = await this.listTasks();
+    const taskMap = new Map(allTasks.map((t) => [t.id, t]));
+
+    const visited = new Set<string>();
+    const stack = [startId];
+
+    while (stack.length > 0) {
+      const currentId = stack.pop();
+      if (!currentId) continue;
+
+      if (currentId === targetId) {
+        return true; // Found a cycle
+      }
+
+      if (visited.has(currentId)) {
+        continue;
+      }
+
+      visited.add(currentId);
+
+      // Get task from in-memory map (no disk I/O)
+      const currentTask = taskMap.get(currentId);
+      if (!currentTask?.dependencies) {
+        continue;
+      }
+
+      // Only follow edges of the same relationship type being added.
+      // This prevents false positives from mixed depends_on/blocks traversal.
+      const nextIds = currentTask.dependencies[direction] || [];
+
+      for (const nextId of nextIds) {
+        if (!visited.has(nextId)) {
+          stack.push(nextId);
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Get all dependencies for a task (both directions)
+   * Uses batch loading to avoid N+1 queries
+   */
+  async getTaskDependencies(taskId: string): Promise<{
+    depends_on: Task[];
+    blocks: Task[];
+  }> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError(`Task ${taskId} not found`);
+    }
+
+    // Batch load all tasks once
+    const allTasks = await this.listTasks();
+    const taskMap = new Map(allTasks.map((t) => [t.id, t]));
+
+    const dependsOnIds = task.dependencies?.depends_on || [];
+    const blocksIds = task.dependencies?.blocks || [];
+
+    // Resolve from in-memory map (no disk I/O)
+    const dependsOn = dependsOnIds
+      .map((id) => taskMap.get(id))
+      .filter((t): t is Task => t !== undefined);
+
+    const blocks = blocksIds.map((id) => taskMap.get(id)).filter((t): t is Task => t !== undefined);
+
+    return {
+      depends_on: dependsOn,
+      blocks: blocks,
+    };
+  }
+
+  /**
+   * Get the full dependency graph for a task (recursive)
+   * Returns a tree structure showing all upstream and downstream dependencies
+   * Uses batch loading to avoid N+1 queries
+   */
+  async getTaskDependencyGraph(taskId: string): Promise<{
+    task: Task;
+    upstream: any[];
+    downstream: any[];
+  }> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError(`Task ${taskId} not found`);
+    }
+
+    // Batch load all tasks once for performance
+    const allTasks = await this.listTasks();
+    const taskMap = new Map(allTasks.map((t) => [t.id, t]));
+
+    const buildUpstream = (id: string, visited: Set<string>, depth = 0): any[] => {
+      if (visited.has(id) || depth > 10) return [];
+      visited.add(id);
+
+      const t = taskMap.get(id);
+      if (!t) return [];
+
+      const dependsOnIds = t.dependencies?.depends_on || [];
+      const children = dependsOnIds
+        .map((depId) => {
+          const depTask = taskMap.get(depId);
+          if (!depTask) return null;
+          return {
+            task: depTask,
+            children: buildUpstream(depId, visited, depth + 1),
+          };
+        })
+        .filter((c): c is any => c !== null);
+
+      return children;
+    };
+
+    const buildDownstream = (id: string, visited: Set<string>, depth = 0): any[] => {
+      // Add visited set to prevent diamond-dependency exponential blowup
+      if (visited.has(id) || depth > 10) return [];
+      visited.add(id);
+
+      const t = taskMap.get(id);
+      if (!t) return [];
+
+      const blocksIds = t.dependencies?.blocks || [];
+      const children = blocksIds
+        .map((blockId) => {
+          const blockTask = taskMap.get(blockId);
+          if (!blockTask) return null;
+          return {
+            task: blockTask,
+            children: buildDownstream(blockId, visited, depth + 1),
+          };
+        })
+        .filter((c): c is any => c !== null);
+
+      return children;
+    };
+
+    // Use separate visited sets for upstream and downstream traversal
+    const upstreamVisited = new Set<string>();
+    const downstreamVisited = new Set<string>();
+
+    const upstream = buildUpstream(taskId, upstreamVisited);
+    const downstream = buildDownstream(taskId, downstreamVisited);
+
+    return {
+      task,
+      upstream,
+      downstream,
+    };
+  }
+
+  /**
+   * Delete a time entry
+   */
+  async deleteTimeEntry(taskId: string, entryId: string): Promise<Task> {
+    const task = await this.getTask(taskId);
+    if (!task) {
+      throw new NotFoundError('Task not found');
+    }
+
+    const entries = (task.timeTracking?.entries || []).filter(
+      (e: { id: string; startTime: string; endTime?: string; duration?: number }) =>
+        e.id !== entryId
+    );
+    const totalSeconds = entries.reduce(
+      (sum: number, e: { duration?: number }) => sum + (e.duration || 0),
+      0
+    );
+
+    // If we deleted the active entry, stop the timer
+    const wasActive = task.timeTracking?.activeEntryId === entryId;
+
+    const timeTracking = {
+      entries,
+      totalSeconds,
+      isRunning: wasActive ? false : task.timeTracking?.isRunning || false,
+      ...(wasActive ? {} : { activeEntryId: task.timeTracking?.activeEntryId }),
+    };
+
+    return this.updateTask(taskId, { timeTracking }) as Promise<Task>;
+  }
+
+  /**
+   * Atomically move one task to an authoritative board position.
+   *
+   * Only the moved task is written: an exact rank between its destination neighbors
+   * preserves their revisions and makes status plus order one storage mutation.
+   */
+  async moveTask(id: string, input: MoveTaskInput): Promise<MoveTaskResult | null> {
+    return this.withBoardMoveMutex(async (commitStorage) => {
+      const current = await this.getTask(id);
+      if (!current) return null;
+
+      if (current.lastBoardMove?.operationId === input.operationId) {
+        if (!boardMoveReceiptMatches(current.lastBoardMove, input)) {
+          throw new ConflictError('Board move operation ID was reused with different input.', {
+            resourceType: 'task',
+            resourceId: id,
+            reason: 'OPERATION_ID_REUSED',
+            current,
+          });
+        }
+        commitStorage();
+        await this.reconcileBoardMoveTelemetry(current);
+        const currentColumn = sortTasksByBoardPosition(
+          (await this.listTasks()).filter((task) => task.status === current.status)
+        );
+        return {
+          task: current,
+          operationId: input.operationId,
+          orderedTaskIds: currentColumn.map((task) => task.id),
+          replayed: true,
+        };
+      }
+
+      if (current.lastBoardMove && !(await this.reconcileBoardMoveTelemetry(current))) {
+        throw new InternalError(
+          'The previous board move is committed but its telemetry is still pending. Retry shortly.'
+        );
+      }
+
+      const currentPosition = normalizedBoardPosition(current);
+      if (current.status !== input.sourceStatus || currentPosition !== input.sourcePosition) {
+        throw new ConflictError(`task ${id} moved since it was loaded. Reload and try again.`, {
+          resourceType: 'task',
+          resourceId: id,
+          expectedRevision: input.expectedRevision,
+          currentRevision: normalizedTaskRevision(current),
+          reason: 'BOARD_SOURCE_CHANGED',
+          current,
+        });
+      }
+
+      const destinationTasks = sortTasksByBoardPosition(
+        (await this.listTasks()).filter(
+          (task) => task.id !== id && task.status === input.destinationStatus
+        )
+      );
+      if (
+        !Number.isInteger(input.destinationIndex) ||
+        input.destinationIndex < 0 ||
+        input.destinationIndex > destinationTasks.length
+      ) {
+        throw new ValidationError('Destination index is outside the destination column', [
+          {
+            code: 'INVALID_DESTINATION_INDEX',
+            message: `destinationIndex must be between 0 and ${destinationTasks.length}`,
+            path: ['destinationIndex'],
+          },
+        ]);
+      }
+
+      const boardRank = taskBoardRankAtIndex(destinationTasks, input.destinationIndex);
+      const position = taskBoardPositionAtIndex(destinationTasks, input.destinationIndex);
+      const completedAt = new Date().toISOString();
+      const receipt: TaskBoardMoveReceipt = {
+        operationId: input.operationId,
+        sourceStatus: input.sourceStatus,
+        sourcePosition: input.sourcePosition,
+        destinationStatus: input.destinationStatus,
+        destinationIndex: input.destinationIndex,
+        completedAt,
+      };
+      const updated = await this.withTaskMutex(id, () =>
+        this.updateTaskMutation(
+          id,
+          {
+            status: input.destinationStatus,
+            position,
+            boardRank,
+            expectedRevision: input.expectedRevision,
+            updatedBy: input.updatedBy,
+            lastBoardMove: receipt,
+          } as TaskMutationInput,
+          true,
+          commitStorage
+        )
+      );
+      if (!updated) return null;
+
+      const orderedTaskIds = destinationTasks.map((task) => task.id);
+      orderedTaskIds.splice(input.destinationIndex, 0, updated.id);
+      return {
+        task: updated,
+        operationId: input.operationId,
+        orderedTaskIds,
+        replayed: false,
+      };
+    });
+  }
+
+  /**
+   * Reorder tasks within a status column.
+   * Accepts an ordered array of task IDs and assigns sequential position values.
+   */
+  async reorderTasks(orderedIds: string[]): Promise<Task[]> {
+    if (orderedIds.length > MAX_TASK_REORDER_ITEMS) {
+      throw new ValidationError(
+        `Cannot reorder more than ${MAX_TASK_REORDER_ITEMS} tasks in one request`
+      );
+    }
+    return this.withBoardMoveMutex(async () => {
+      const tasks = await this.listTasks();
+      const updated: Task[] = [];
+
+      const reorderCount = Math.min(orderedIds.length, MAX_TASK_REORDER_ITEMS);
+      for (let i = 0; i < reorderCount; i++) {
+        const task = tasks.find((candidate) => candidate.id === orderedIds[i]);
+        if (task && task.position !== i) {
+          const result = await this.withTaskMutex(task.id, () =>
+            this.updateTaskMutation(task.id, { position: i, boardRank: null }, true)
+          );
+          if (result) updated.push(result);
+        }
+      }
+
+      return updated;
+    });
+  }
+
+  /**
+   * Get time summary by project
+   */
+  async getTimeSummary(): Promise<{
+    byProject: { project: string; totalSeconds: number; taskCount: number }[];
+    total: number;
+  }> {
+    const tasks = await this.listTasks();
+
+    const projectMap = new Map<string, { totalSeconds: number; taskCount: number }>();
+    let total = 0;
+
+    for (const task of tasks) {
+      const seconds = task.timeTracking?.totalSeconds || 0;
+      if (seconds > 0) {
+        total += seconds;
+        const project = task.project || '(No Project)';
+        const existing = projectMap.get(project) || { totalSeconds: 0, taskCount: 0 };
+        projectMap.set(project, {
+          totalSeconds: existing.totalSeconds + seconds,
+          taskCount: existing.taskCount + 1,
+        });
+      }
+    }
+
+    const byProject = Array.from(projectMap.entries())
+      .map(([project, data]) => ({ project, ...data }))
+      .sort((a, b) => b.totalSeconds - a.totalSeconds);
+
+    return { byProject, total };
+  }
+}
+
+// Singleton instance
+let taskServiceInstance: TaskService | null = null;
+
+export function getTaskService(): TaskService {
+  if (!taskServiceInstance) {
+    taskServiceInstance = new TaskService();
+  }
+  return taskServiceInstance;
+}
+
+/** Dispose and reset the singleton (useful for tests and shutdown) */
+export function disposeTaskService(): void {
+  if (taskServiceInstance) {
+    taskServiceInstance.dispose();
+    taskServiceInstance = null;
+  }
+}

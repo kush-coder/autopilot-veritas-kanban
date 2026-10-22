@@ -1,0 +1,57 @@
+# .github/dependabot.yml
+version: 2
+updates:
+  # npm dependencies
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+      day: 'monday'
+    open-pull-requests-limit: 10
+    reviewers:
+      - 'BradGroux'
+    labels:
+      - 'dependencies'
+    ignore:
+      # jsdom 30 requires Node >=22.22.2 and currently breaks the Mantine UI suite.
+      # Keep receiving jsdom 29 patches until the runtime floor is deliberately raised.
+      - dependency-name: 'jsdom'
+        update-types:
+          - 'version-update:semver-major'
+    groups:
+      # Electron ships in the desktop app despite being a devDependency.
+      desktop-runtime:
+        patterns:
+          - 'electron'
+        update-types:
+          - 'minor'
+          - 'patch'
+      production-dependencies:
+        dependency-type: 'production'
+        patterns:
+          - '*'
+        update-types:
+          - 'minor'
+          - 'patch'
+
+      development-dependencies:
+        dependency-type: 'development'
+        patterns:
+          - '*'
+        exclude-patterns:
+          - 'electron'
+        update-types:
+          - 'minor'
+          - 'patch'
+
+  # GitHub Actions
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+      day: 'monday'
+    reviewers:
+      - 'BradGroux'
+    labels:
+      - 'dependencies'
+      - 'github-actions'

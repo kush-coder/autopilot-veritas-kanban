@@ -1,0 +1,767 @@
+# Troubleshooting
+
+Common issues and solutions for Veritas Kanban. Can't find your issue? [Open a Discussion](https://github.com/BradGroux/veritas-kanban/discussions) or [file an issue](https://github.com/BradGroux/veritas-kanban/issues).
+
+---
+
+## Table of Contents
+
+- [Installation & Build](#installation--build)
+- [macOS Desktop Upgrade](#macos-desktop-upgrade)
+- [Authentication & Rate Limiting](#authentication--rate-limiting)
+- [Networking & Proxies](#networking--proxies)
+- [WebSocket Issues](#websocket-issues)
+- [Docker](#docker)
+- [Agent Integration](#agent-integration)
+- [UI & Frontend](#ui--frontend)
+- [Data & Storage](#data--storage)
+- [Useful Commands](#useful-commands)
+- [Dev Reliability (ports, hangs, and restarts)](#dev-reliability-ports-hangs-and-restarts)
+
+---
+
+## macOS Desktop Upgrade
+
+### Homebrew upgraded the app but port 3001 refuses connections
+
+`brew upgrade --cask` replaces the app bundle but does not launch it. After
+`open -a "Veritas Kanban"`, LaunchServices can return several seconds before
+Electron starts the bundled server. One immediate failed health request is
+therefore not a startup verdict.
+
+From a Veritas Kanban checkout, require the server to report the version in the
+installed app bundle:
+
+```bash
+EXPECTED_VERSION="$(defaults read "/Applications/Veritas Kanban.app/Contents/Info" CFBundleShortVersionString)"
+open -a "Veritas Kanban"
+pnpm desktop:wait:ready -- --expected-version "$EXPECTED_VERSION"
+```
+
+For a Homebrew-only machine, use the bounded built-in-tools block in
+[Web To Mac Desktop Migration](WEB-TO-MAC-DESKTOP-MIGRATION.md#wait-for-the-desktop-server).
+It waits up to 30 seconds and rejects a stale server with the wrong version.
+
+If the bounded wait times out:
+
+```bash
+lsof -nP -iTCP:3001 -sTCP:LISTEN
+ps -o pid,ppid,pgid,command -p "$(lsof -tiTCP:3001 -sTCP:LISTEN)"
+pgrep -ifl 'Veritas Kanban|veritas-kanban|server/dist/index.js'
+tail -n 80 "$HOME/Library/Application Support/@veritas-kanban/desktop/profiles/default/workspaces/local/logs/server.log"
+```
+
+- No desktop process means app launch failed; open the app and inspect macOS
+  Console plus the desktop log.
+- An old source `node`, `tsx`, `vite`, or `pnpm dev` process on `3001` is a
+  competing writer. Stop it and its watchdog before relaunching the app.
+- A desktop process on another loopback port means `3001` was occupied during
+  launch. The renderer may work, but migration and upgrade verification should
+  fail until the packaged server owns `3001`.
+- If a quit is immediately followed by a reopen, wait for both port `3001` and
+  the Electron main process to exit first. LaunchServices can ignore a reopen
+  request while the prior instance is still shutting down.
+- Pause reopen heartbeats before quitting or upgrading. Resume them only after
+  exact-version readiness succeeds.
+
+The complete data-preserving procedure is in
+[Routine Mac Desktop Upgrade](V6-UPGRADE-INSTALL-ADMIN-GUIDE.md#routine-mac-desktop-upgrade).
+
+---
+
+## Dev Reliability (ports, hangs, and restarts)
+
+### Agent note: planning is NOT a status
+
+`planning` was removed entirely as a `TaskStatus` (process/UI heavy and overkill for an agent-first Kanban).
+
+Valid statuses are:
+
+- `todo`
+- `in-progress`
+- `blocked`
+- `done`
+
+If you need “planning”, put it in the task body/checklist or treat it as agent-internal planning — not a board column.
+
+### Quick fix: clean restart
+
+If the UI is acting hung or the API is returning unexpected 404s, run:
+
+```bash
+pnpm dev:clean
+```
+
+This:
+
+- frees ports **3001** (server) and **3000** (web)
+- kills stale dev watchers for this repo (`tsx watch`, `vite`, `concurrently`)
+- restarts `pnpm dev`
+
+### Check server health
+
+VK provides a canonical health endpoint for tooling:
+
+```bash
+curl -s http://localhost:3001/api/health
+```
+
+Expected: HTTP 200 JSON like:
+
+```json
+{ "ok": true, "service": "veritas-kanban", "version": "1.x.x" }
+```
+
+### Optional: auto-restart watchdog (dev)
+
+If you want VK to auto-restart when unhealthy during dev:
+
+```bash
+pnpm dev:watchdog
+```
+
+Environment variables:
+
+- `WATCHDOG_INTERVAL_SECONDS` (default 30)
+- `WATCHDOG_FAIL_THRESHOLD` (default 3)
+
+> Note: watchdog is for local dev convenience. For production, prefer a real supervisor (pm2/docker) with health checks.
+
+## Installation & Build
+
+### TypeScript errors during build
+
+TypeScript errors during initial `pnpm install` or `pnpm build` usually resolve on a second run. This happens when shared type packages aren't built yet.
+
+```bash
+# Clean build from scratch
+pnpm clean        # if available
+rm -rf node_modules
+pnpm install
+pnpm build
+```
+
+If errors persist, check your Node.js version. **Node 22.22.1+** is required:
+
+```bash
+node -v  # Must be v22.22.1 or higher
+```
+
+### `pnpm` not found
+
+Veritas Kanban uses pnpm workspaces. Activate the repository-pinned version:
+
+```bash
+corepack enable
+corepack prepare pnpm@11.1.1 --activate
+```
+
+Do not install this workspace with npm, Yarn, or Bun.
+
+### Port already in use
+
+```bash
+# Check what's using port 3001 (API) or 3000 (Web)
+lsof -i :3001
+lsof -i :3000
+
+# Change ports in server/.env
+PORT=3002  # API port
+```
+
+Update `CORS_ORIGINS` in `.env` if you change the web port.
+
+---
+
+## Authentication & Rate Limiting
+
+### "Too many authentication attempts"
+
+**This is the most common issue for local development and SSH tunnel users.**
+
+The auth rate limiter defaults to **10–15 requests per 15 minutes**. Normal UI usage (page loads, tab refreshes, WebSocket reconnections) can exhaust this quickly.
+
+**Fix 1: Update to the latest version**
+
+This was fixed — `authRateLimit` now exempts localhost requests automatically (same as `apiRateLimit`). Pull the latest and restart.
+
+> **Note:** If you're behind an SSH tunnel or reverse proxy, `req.ip` may not resolve to `127.0.0.1`. See [SSH Tunnel / Proxy Issues](#ssh-tunnel--proxy-requests-not-recognized-as-localhost) below.
+
+**Fix 2: Increase the auth rate limit**
+
+In `server/src/middleware/rate-limit.ts`, increase `max` for the auth limiter:
+
+```typescript
+max: 100; // default is 10-15, increase for development
+```
+
+**Fix 3: Restart the server**
+
+Rate limit counters are stored in-memory and reset on restart:
+
+```bash
+# Ctrl+C the running server, then:
+pnpm dev
+```
+
+**Fix 4: Disable auth entirely (development only)**
+
+In `server/.env`:
+
+```bash
+VERITAS_AUTH_ENABLED=false
+```
+
+⚠️ **Never disable auth in production.**
+
+### Weak admin key warning
+
+The server warns at startup if `VERITAS_ADMIN_KEY` is less than 32 characters. Generate a strong key:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+### Authentication not working
+
+Check the auth diagnostics endpoint:
+
+```bash
+curl -H "X-API-Key: your-admin-key" http://localhost:3001/api/auth/diagnostics
+```
+
+Verify your `.env` has the correct key format:
+
+```bash
+# API keys format: name:key:role,name2:key2:role2
+VERITAS_API_KEYS=my-agent:my-secret-key:agent
+```
+
+### Three ways to authenticate
+
+### Rate limit errors behind reverse proxy
+
+**Symptom:** `ValidationError: The 'X-Forwarded-For' header is set but the Express 'trust proxy' setting is false`
+
+**Cause:** Running behind a reverse proxy (nginx, Caddy, Traefik, Synology DSM) without configuring trust proxy.
+
+**Fix:** Set the `TRUST_PROXY` environment variable:
+
+```env
+TRUST_PROXY=1  # Trust one proxy hop (most common)
+```
+
+See [Deployment Guide](DEPLOYMENT.md#reverse-proxy-nginx) for full configuration options.
+
+```bash
+# 1. Authorization header (Bearer token)
+curl -H "Authorization: Bearer your-api-key" http://localhost:3001/api/tasks
+
+# 2. X-API-Key header
+curl -H "X-API-Key: your-api-key" http://localhost:3001/api/tasks
+
+# 3. Query parameter (useful for WebSocket connections)
+ws://localhost:3001/ws?api_key=your-api-key
+```
+
+---
+
+## Networking & Proxies
+
+### SSH tunnel / proxy requests not recognized as localhost
+
+When accessing Veritas Kanban through an SSH tunnel, your requests may appear as `::ffff:127.0.0.1` (IPv4-mapped IPv6) instead of `127.0.0.1`, causing localhost exemptions to fail.
+
+**Fix 1: Force IPv4 binding**
+
+```bash
+# In your .env or when starting the server:
+HOST=127.0.0.1 pnpm dev
+```
+
+**Fix 2: Verify your SSH tunnel binds to 127.0.0.1**
+
+```bash
+# Correct — binds to localhost explicitly
+ssh -L 127.0.0.1:3001:127.0.0.1:3001 user@server
+
+# May cause issues — binds to all interfaces
+ssh -L 3001:localhost:3001 user@server
+ssh -L 0.0.0.0:3001:127.0.0.1:3001 user@server
+```
+
+**Fix 3: Debug the detected IP**
+
+Add a temporary log to see what IP the server receives:
+
+```typescript
+// In your rate limiter or middleware:
+console.log('Client IP:', req.ip, req.connection.remoteAddress);
+```
+
+### CORS errors
+
+If you see CORS errors in the browser console, update `CORS_ORIGINS` in `server/.env`:
+
+```bash
+# Add your frontend URL (comma-separated, no trailing slashes)
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://your-ip:3000,http://your-hostname:5173
+```
+
+When using hostname access on LAN (for example `http://manfredclaw:5173`), include that hostname origin explicitly.
+
+### Vite: "Blocked request. This host is not allowed."
+
+If the web dev server rejects LAN hostname access, configure Vite host allowlist in `web/.env`:
+
+```bash
+VITE_HOST=0.0.0.0
+VITE_ALLOWED_HOSTS=your-hostname,your-hostname.local,your-ip
+```
+
+You can allow all hosts for trusted LAN-only environments:
+
+```bash
+VITE_ALLOWED_HOSTS=*
+```
+
+### Accessing from another machine on the network
+
+By default, the server binds to `localhost`. To access from other machines:
+
+```bash
+# In server/.env
+HOST=0.0.0.0
+```
+
+Update both CORS and Vite allowlist to include the IP/hostname you'll access from:
+
+```bash
+# server/.env
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://your-ip:3000,http://your-hostname:5173
+
+# web/.env
+VITE_HOST=0.0.0.0
+VITE_ALLOWED_HOSTS=your-hostname,your-hostname.local,your-ip
+```
+
+---
+
+## WebSocket Issues
+
+### WebSocket connection refused
+
+1. Verify `CORS_ORIGINS` includes your frontend URL
+2. If behind a reverse proxy, ensure WebSocket upgrade headers are forwarded:
+
+**nginx:**
+
+```nginx
+location /ws {
+    proxy_pass http://127.0.0.1:3001;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 86400;  # WebSocket connections are long-lived
+}
+```
+
+**Caddy:**
+
+```caddyfile
+reverse_proxy /ws 127.0.0.1:3001
+```
+
+Caddy handles WebSocket upgrades automatically.
+
+### WebSocket disconnects frequently
+
+- Check proxy timeout settings (must be longer than the WebSocket heartbeat interval)
+- The client automatically reconnects with exponential backoff
+- TanStack Query polling increases when WebSocket is disconnected, decreases when reconnected
+
+---
+
+## Docker
+
+### Container won't start
+
+```bash
+# Check logs
+docker compose logs veritas-kanban
+
+# Common causes:
+# - Port 3001 already in use → change port mapping in docker-compose.yml
+# - Permission denied on volume → check UID 1001 ownership
+```
+
+### Permission denied on data volume
+
+The container runs as non-root (UID 1001). Fix volume permissions:
+
+```bash
+# On the host machine
+sudo chown -R 1001:1001 ./data
+```
+
+### EACCES: permission denied on container startup (v2.1.2 fix)
+
+**Symptom:** Container starts but crashes immediately with `EACCES: permission denied` when trying to create `.veritas-kanban` directory.
+
+**Root cause:** Services use `process.cwd()/..` to resolve the project root. With `WORKDIR /app`, this resolves to `/` (filesystem root), which is not writable by the non-root user.
+
+**Fix:** Version 2.1.2 changed the production WORKDIR to `/app/server` and ensured `/app/tasks` and `/app/server` are writable. Update to v2.1.2+ to resolve:
+
+```bash
+git pull origin main
+docker compose build --no-cache
+docker compose up -d
+```
+
+If you've customized the Dockerfile, ensure:
+
+- `WORKDIR /app/server` (not `/app`)
+- Directories `/app/tasks` and `/app/server` are owned by UID 1001
+
+### Rebuilding after code changes
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
+---
+
+## Agent Integration
+
+### Agent can't connect to the API
+
+1. Verify the server is running: `curl http://localhost:3001/api/health`
+2. Check your agent's API key has the `agent` role:
+   ```bash
+   VERITAS_API_KEYS=my-agent:my-secret-key:agent
+   ```
+3. For agents running in Docker/containers, use `host.docker.internal:3001` instead of `localhost:3001`
+
+### `vk` command exists but fails to start
+
+The CLI depends on the built shared package. If `npm link` ran before the packages were built, rebuild and relink:
+
+```bash
+pnpm --filter @veritas-kanban/shared build
+pnpm --filter @veritas-kanban/cli build
+cd cli
+npm link
+```
+
+### Setup health looks wrong
+
+Run the deeper setup health command before collecting manual diagnostics:
+
+```bash
+vk doctor
+vk doctor --json
+vk snapshot --format markdown
+```
+
+`vk doctor` exits non-zero for critical blockers such as API/auth failures,
+duplicate task IDs, missing enabled agent executables, or routing rules that
+point at unavailable agents. JSON output is copy/paste safe by default: local
+paths and webhook delivery URLs are redacted. Use `--show-paths` only when local
+path details are needed for a private support handoff.
+
+Use `vk snapshot --format markdown` when the support handoff needs runtime
+context instead of pass/fail setup checks. It exports versions, API reachability,
+project/sprint lists, agent status/routing summaries, prompt registry counts,
+task counts by status/priority/type, duplicate ID diagnostics,
+notification/webhook enabled states, and maintenance health. Add
+`--output <path>` to write the snapshot to disk.
+
+### CLI or MCP can read but cannot write
+
+Localhost bypass commonly grants `read-only` access. Create an agent key in `server/.env`, restart the server, and pass the key to the CLI or MCP client:
+
+```bash
+VERITAS_API_KEYS=local-agent:replace-with-a-long-secret:agent
+```
+
+```bash
+export VK_API_URL=http://localhost:3001
+export VK_API_KEY=replace-with-a-long-secret
+```
+
+For MCP, put `VK_API_KEY` in the MCP server env block. Avoid using the admin key unless you need admin-only endpoints.
+
+### Assistant says OpenClaw is required
+
+OpenClaw is optional. Use the board-only path in [Setup Paths](SETUP-PATHS.md), then add OpenClaw only if you want OpenClaw to execute tasks, use the browser relay, or receive Squad Chat wake events.
+
+### Agent names/models — is it hardcoded?
+
+**No.** The agent system is platform-agnostic. The board doesn't call LLMs directly — it provides a REST API that any agent can call. Whether you're using Claude, GPT, Kimi, Gemini, Llama, or a custom model, if your agent can make HTTP requests, it can drive the board.
+
+The agent dropdown in the UI is for labeling/tracking purposes. It doesn't affect functionality.
+
+### MCP server connection issues
+
+Verify the MCP server config in your Claude Desktop settings:
+
+```json
+{
+  "mcpServers": {
+    "veritas-kanban": {
+      "command": "node",
+      "args": ["/path/to/veritas-kanban/mcp/dist/index.js"],
+      "env": {
+        "VK_API_URL": "http://localhost:3001",
+        "VK_API_KEY": "your-agent-key"
+      }
+    }
+  }
+}
+```
+
+Build the MCP server first: `cd mcp && pnpm build`
+
+#### Troubleshooting Checklist
+
+**1. Restart OpenClaw after MCP config changes**
+
+MCP servers are discovered at gateway startup, not dynamically. After adding or modifying the MCP server configuration in your `claude_desktop_config.json` or OpenClaw config, you **must** restart the OpenClaw gateway:
+
+```bash
+# Restart the OpenClaw gateway
+openclaw gateway restart
+
+# Verify gateway is running
+openclaw gateway status
+
+# Check gateway logs for MCP discovery errors (if any)
+tail -f ~/.openclaw/logs/gateway.log
+```
+
+**Common mistakes:**
+
+- Editing config but forgetting to restart → MCP server won't appear
+- Restarting just Claude Desktop/Cursor → doesn't reload OpenClaw's MCP registry
+- Config syntax errors → check logs for JSON parsing errors
+
+**2. Verify MCP discovery and tools after restart**
+
+After restarting, confirm that Veritas Kanban was successfully discovered and all tools are available:
+
+```bash
+# List all discovered MCP servers
+openclaw mcp list
+
+# Expected output should include:
+# veritas-kanban | 41 tools | http://localhost:3001
+
+# View available tools from Veritas Kanban
+openclaw mcp tools veritas-kanban
+
+# Test a specific tool (should return JSON schema)
+openclaw mcp describe veritas-kanban vk_list_tasks
+```
+
+**If Veritas Kanban doesn't appear in the list:**
+
+- Verify the MCP server config path is absolute (not relative): `/Users/you/path/to/veritas-kanban/mcp/dist/index.js`
+- Check that `mcp/dist/index.js` exists: `ls -la /path/to/veritas-kanban/mcp/dist/`
+- Build the MCP server if missing: `cd mcp && pnpm build`
+- Check OpenClaw logs for startup errors: `~/.openclaw/logs/mcp.log`
+
+**If the tool count is wrong (not 41 tools):**
+
+- MCP server may have started but failed to initialize properly
+- Check VK API is accessible: `curl http://localhost:3001/api/health`
+- Verify API key is set in MCP config env vars
+- Review MCP server logs for initialization errors
+
+**If reads work but write tools return `401` or `403`:**
+
+- Confirm `VK_API_KEY` is set in the MCP client env block
+- Confirm the same key is present in `VERITAS_API_KEYS` with the `agent` role
+- Restart both `pnpm dev` and the MCP client after env changes
+
+### Squad Chat posts save but no agent wakes
+
+Squad Chat stores local messages and streams them to connected UI clients. It does not wake an external process by itself. Configure Settings -> Notifications -> Squad Chat Webhook only when you want outbound delivery through a generic webhook or OpenClaw Direct.
+
+Use Settings -> Notifications -> Communication Health to separate three different states:
+
+- Configured: VK has a destination URL, channel, or OpenClaw gateway setting.
+- HTTP accepted: the last outbound delivery received an HTTP response such as `2xx`.
+- Visually verified: a human confirmed the message appeared in the destination. VK does not record this automatically.
+
+Smoke-test the path in this order:
+
+1. Local chat: verify the message exists in the Squad Chat UI or `GET /api/chat/squad`
+2. Generic webhook: configure a disposable receiver, post a human or agent Squad Chat message, and confirm VK records the outbound HTTP result
+3. Teams-style workflow: confirm the receiver or workflow returns HTTP success, then separately verify the message is visible in Teams
+4. OpenClaw Direct: confirm the gateway accepts `/tools/invoke`, then confirm the external orchestrator wakes an agent and posts any visible reply back to `/api/chat/squad`
+5. Failure alerts: configure Failure Webhook URL if you need immediate external delivery, trigger or use the configured test path, then verify both the HTTP result and the destination-visible alert
+
+Generic Squad Chat webhooks send a `squad.message` payload with `event`, `message.id`, `message.agent`, `message.message`, `message.timestamp`, and `isHuman`. If a webhook secret is configured, VK signs the request with `X-VK-Signature`. The Communication Health panel redacts webhook paths, query strings, secrets, and bearer tokens; avoid pasting full webhook URLs into screenshots or support notes.
+
+### Notification state cannot be loaded
+
+In file storage mode, `notifications.json` and `thread-subscriptions.json` in the configured runtime directory must contain JSON arrays. Missing files initialize normally. Malformed JSON and read failures stop the operation instead of resetting notification history. Preserve a copy of the affected file, restore a known-good copy or correct its read permissions, then retry. Writes replace the complete file atomically; a failed write leaves the previous file available.
+
+### Notifications do not send externally
+
+Notification delivery channels are optional. Local notifications, broadcasts, and Squad Chat can work while external webhook delivery is disabled. Use `/api/broadcasts` for durable system-wide messages and verify delivery-specific settings before expecting an external wake or push.
+
+**3. Gather diagnostics bundle when reporting issues**
+
+If MCP connection fails after following steps 1-2, collect this full diagnostics bundle to share when [reporting an issue](https://github.com/BradGroux/veritas-kanban/issues):
+
+```bash
+# === System & Version Info ===
+echo "=== OpenClaw Version ===" && openclaw --version
+echo "=== Node.js Version ===" && node -v
+echo "=== OS Info ===" && uname -a
+
+# === Veritas Kanban Health ===
+echo "=== VK Health Check ===" && curl -s http://localhost:3001/api/health | jq .
+echo "=== VK Version ===" && cat ~/Projects/veritas-kanban/package.json | jq -r '.version'
+
+# === MCP Discovery Status ===
+echo "=== MCP Server List ===" && openclaw mcp list
+echo "=== VK MCP Tools ===" && openclaw mcp tools veritas-kanban || echo "Server not discovered"
+
+# === OpenClaw Logs (MCP specific) ===
+echo "=== MCP Server Logs (last 50 lines) ==="
+# macOS/Linux:
+tail -n 50 ~/.openclaw/logs/mcp.log 2>/dev/null || echo "MCP log not found"
+
+# Windows (PowerShell):
+# Get-Content $env:USERPROFILE\.openclaw\logs\mcp.log -Tail 50
+
+# === Gateway Logs ===
+echo "=== Gateway Logs (last 50 lines) ==="
+tail -n 50 ~/.openclaw/logs/gateway.log 2>/dev/null || echo "Gateway log not found"
+
+# === MCP Config Validation ===
+echo "=== MCP Config (sanitized) ==="
+# macOS:
+cat ~/Library/Application\ Support/Claude/claude_desktop_config.json | jq '.mcpServers["veritas-kanban"]' || echo "Config not found"
+
+# Linux:
+cat ~/.config/claude/claude_desktop_config.json | jq '.mcpServers["veritas-kanban"]' 2>/dev/null || echo "Config not found"
+
+# === API Accessibility Test ===
+echo "=== VK API Access Test ==="
+curl -s -H "X-API-Key: test-key" http://localhost:3001/api/tasks | head -c 200
+
+# === MCP Server File Check ===
+echo "=== MCP Server Files ==="
+ls -lh ~/Projects/veritas-kanban/mcp/dist/index.js 2>/dev/null || echo "MCP server not built"
+```
+
+**When reporting an issue, include:**
+
+1. Full output from the diagnostics commands above
+2. Your sanitized MCP config (remove sensitive API keys)
+3. Steps to reproduce the connection failure
+4. Expected vs actual behavior
+
+**Privacy note:** The diagnostics bundle may contain local paths and usernames. Review and redact sensitive information before sharing publicly.
+
+---
+
+## UI & Frontend
+
+### Board not loading / blank page
+
+1. Check the browser console for errors (F12 → Console)
+2. Verify both services are running:
+   - Web: http://localhost:3000
+   - API: http://localhost:3001/api/health
+3. Try a hard refresh: `Ctrl+Shift+R` (Windows/Linux) or `Cmd+Shift+R` (Mac)
+
+### Drag and drop not working
+
+- Tooltips can interfere with drag detection — they're automatically suppressed during drag operations
+- If using a touch device, long-press to initiate drag
+- Check browser console for JavaScript errors
+
+### Dark mode / theme issues
+
+The UI follows your system theme preference. To force a theme, check Settings → Appearance.
+
+---
+
+## Data & Storage
+
+### Where are my tasks stored?
+
+Tasks are Markdown files with YAML frontmatter stored in the `tasks/` directory:
+
+```
+tasks/
+├── active/          # Current tasks (todo, in-progress, blocked)
+├── archive/         # Archived/completed tasks
+└── templates/       # Task templates
+```
+
+You can edit them directly with any text editor, grep them, or version them with git.
+
+### How to back up
+
+```bash
+# Simple backup
+cp -r tasks/ tasks-backup-$(date +%Y%m%d)/
+
+# Or use git (recommended)
+cd tasks && git init && git add -A && git commit -m "backup"
+```
+
+### Restoring from backup
+
+Copy your backed-up task files back into `tasks/active/` and restart the server. The in-memory cache rebuilds from disk on startup.
+
+### Reset to clean slate
+
+```bash
+# Remove all tasks
+rm tasks/active/task_*.md
+
+# Re-seed with examples (optional)
+pnpm seed
+```
+
+---
+
+## Useful Commands
+
+```bash
+# Development
+pnpm dev              # Start both web and API in dev mode
+pnpm build            # Production build
+pnpm test             # Run all tests
+pnpm test:e2e         # Run Playwright E2E tests
+
+# CLI
+pnpm cli list         # List tasks from terminal
+pnpm cli create       # Create a task
+pnpm cli update       # Update a task
+
+# Health checks
+curl http://localhost:3001/api/health          # Server health
+curl http://localhost:3001/api/auth/diagnostics # Auth diagnostics (needs admin key)
+
+# API docs
+open http://localhost:3001/api-docs            # Swagger UI
+```
+
+---
+
+## Still stuck?
+
+- 💬 [GitHub Discussions](https://github.com/BradGroux/veritas-kanban/discussions) — ask the community
+- 🐛 [GitHub Issues](https://github.com/BradGroux/veritas-kanban/issues) — report a bug
+- 📖 [Deployment Guide](DEPLOYMENT.md) — production setup
+- 📖 [Features Guide](FEATURES.md) — full feature documentation
+- 🔒 [Security Guide](security.md) — auth, rate limiting, API keys

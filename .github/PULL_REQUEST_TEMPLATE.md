@@ -1,0 +1,58 @@
+## Description
+
+A clear and concise description of what this PR does.
+
+## Scope
+
+**Linked issue:** Closes #
+
+**In scope:** One independently shippable behavior and the documentation needed
+to use it.
+
+**Linked follow-ups:** List separable UI, integration, refactor, or hardening
+work that was intentionally kept out of this PR, or write `None`.
+
+## Type of Change
+
+- [ ] Bug fix (non-breaking change which fixes an issue)
+- [ ] New feature (non-breaking change which adds functionality)
+- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+- [ ] Documentation update
+- [ ] Code refactor
+
+## Testing
+
+**How has this been tested?**
+Describe the tests you ran to verify your changes. Provide instructions so reviewers can reproduce.
+
+**Verification tier:**
+
+- [ ] Documentation or static checks only
+- [ ] Explicit focused diagnostic (manual workflow dispatch)
+- [ ] Full milestone gate (`ci:full`, critical security, integration, or release)
+
+**Why this tier is sufficient:** Explain the changed behavior, covered failure
+modes, and why broader gates are or are not required.
+
+**Test commands:**
+
+```bash
+# Add test commands here
+```
+
+**Desktop and release evidence (when relevant):**
+
+State each boundary as passed, failed, blocked, pending, or not applicable, with its evidence: browser; packaged macOS candidate; installed app; signing/notarization; refreshed documentation images/GIFs; publication. Include the native report path, candidate commit, package version/digest, tested themes, and window sizes. A browser-only or source-preflight pass cannot close a packaged/installed requirement. A manual exception cannot mark a failed native matrix passed.
+
+## Checklist
+
+- [ ] This PR contains one coherent, independently shippable behavior
+- [ ] Separable follow-up work is linked instead of folded into this PR
+- [ ] My code follows the style guidelines of this project
+- [ ] I have performed a self-review of my own code
+- [ ] I have added or updated coverage for the next declared test milestone
+- [ ] I have updated the documentation accordingly
+- [ ] My changes generate no new warnings
+- [ ] Any breaking changes have been documented in the PR description
+- [ ] I did not rerun unchanged passing gates after documentation or formatting-only edits
+- [ ] Optional desktop, artifact, and release workflows are marked relevant only when this PR touches their product boundary

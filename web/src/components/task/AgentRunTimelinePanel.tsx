@@ -1,0 +1,1830 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { UiModal as Modal, OverlayFooter } from '@/components/ui/UiOverlay';
+import { UiAction } from '@/components/ui/UiVocabulary';
+import {
+  Badge,
+  Button,
+  Code,
+  Group,
+  Loader,
+  Paper,
+  ScrollArea,
+  Select,
+  SimpleGrid,
+  Stack,
+  Text,
+  ThemeIcon,
+} from '@mantine/core';
+import {
+  AlertTriangle,
+  Bot,
+  CheckCircle2,
+  ClipboardCheck,
+  Code2,
+  FileDiff,
+  FileText,
+  GitBranch,
+  History,
+  KeyRound,
+  ListFilter,
+  Play,
+  ShieldCheck,
+  Terminal,
+  Timer,
+  Wrench,
+} from 'lucide-react';
+import { normalizeSafeHref } from '@veritas-kanban/shared';
+import type {
+  AgentRunTimelineEvent,
+  AgentRunTimelineEventSource,
+  AgentRunTimelineEventType,
+  AgentRunTrace,
+  AgentRunTraceStep,
+  AnyTelemetryEvent,
+  Deliverable,
+  Task,
+  TelemetryEventType,
+  WorkProductPreview,
+} from '@veritas-kanban/shared';
+import {
+  useDecideRunApproval,
+  useAgentPhase,
+  usePendingAgentApprovals,
+  useRunFileProvenance,
+  type AgentApprovalRequest,
+} from '@/hooks/useAgent';
+import { useAgentRunTraces, useTaskTelemetryEvents } from '@/hooks/useAgentRunTimeline';
+import { useTaskNotifications, type AgentNotification } from '@/hooks/useNotifications';
+import { useTaskWorkProducts } from '@/hooks/useWorkProducts';
+import { useActiveRuns, useRecentRuns, type WorkflowRun } from '@/hooks/useWorkflowStats';
+import { sanitizeText } from '@/lib/sanitize';
+import { ArtifactPreviewModal } from './ArtifactPreviewModal';
+import { RunAccessPanel } from './RunAccessPanel';
+
+type TimelineTabTarget = 'agent' | 'changes' | 'details' | 'review' | 'work-products';
+
+const BASE_PATH = (import.meta.env.BASE_URL || '/').replace(/\/$/, '');
+
+interface AgentRunTimelinePanelProps {
+  task: Task;
+  initialAttemptId?: string | null;
+  initialEventId?: string | null;
+  onOpenTab?: (target: TimelineTabTarget) => void;
+  onOpenWorkflow?: (runId?: string) => void;
+}
+
+const EVENT_TYPES: AgentRunTimelineEventType[] = [
+  'prompt',
+  'command',
+  'file',
+  'policy',
+  'approval',
+  'error',
+  'usage',
+  'tool',
+  'result',
+];
+
+const TIMELINE_PAGE_SIZE = 80;
+
+const EVENT_LABELS: Record<AgentRunTimelineEventType, string> = {
+  approval: 'Approval',
+  command: 'Command',
+  error: 'Error',
+  file: 'File',
+  policy: 'Policy',
+  prompt: 'Prompt',
+  result: 'Result',
+  tool: 'Tool',
+  usage: 'Usage',
+};
+
+const EVENT_COLORS: Record<AgentRunTimelineEventType, string> = {
+  approval: 'green',
+  command: 'blue',
+  error: 'red',
+  file: 'grape',
+  policy: 'yellow',
+  prompt: 'cyan',
+  result: 'green',
+  tool: 'indigo',
+  usage: 'orange',
+};
+
+const SOURCE_COLORS: Record<AgentRunTimelineEventSource, string> = {
+  derived: 'gray',
+  live: 'blue',
+  stored: 'green',
+};
+
+function phaseSourceLabel(kind: string): string {
+  if (kind === 'parent') return 'inherited';
+  if (kind === 'agent-profile') return 'profile';
+  return kind;
+}
+
+const EVENT_ICONS: Record<AgentRunTimelineEventType, React.ElementType> = {
+  approval: CheckCircle2,
+  command: Terminal,
+  error: AlertTriangle,
+  file: FileText,
+  policy: ShieldCheck,
+  prompt: Bot,
+  result: ClipboardCheck,
+  tool: Wrench,
+  usage: Timer,
+};
+
+const SECRET_PATTERNS: Array<[RegExp, string]> = [
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]'],
+  [/\bsk-[A-Za-z0-9_-]{12,}/g, 'sk-[REDACTED]'],
+  [/\bghp_[A-Za-z0-9_]{12,}/g, 'ghp_[REDACTED]'],
+  [/\bgithub_pat_[A-Za-z0-9_]{12,}/g, 'github_pat_[REDACTED]'],
+  [
+    /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY)[A-Z0-9_]*)\s*=\s*([^\s"'`]+)/gi,
+    '$1=[REDACTED]',
+  ],
+  [/\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s"'`,}]+)/gi, '$1=[REDACTED]'],
+];
+
+function isRunEvent(event: AnyTelemetryEvent): event is AnyTelemetryEvent & {
+  attemptId?: string;
+  agent?: string;
+  model?: string;
+  durationMs?: number;
+  success?: boolean;
+  error?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheTokens?: number;
+  totalTokens?: number;
+  cost?: number;
+} {
+  return event.type.startsWith('run.');
+}
+
+function formatDate(value?: string): string {
+  if (!value) return 'Not recorded';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Not recorded';
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date);
+}
+
+function formatDurationMs(value?: number): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'Not recorded';
+  if (value < 1000) return `${Math.max(0, Math.round(value))}ms`;
+  const seconds = Math.round(value / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes === 0) return `${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours === 0) return `${minutes}m ${remainingSeconds}s`;
+  return `${hours}h ${remainingMinutes}m`;
+}
+
+function formatTokenCount(value?: number): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'Not recorded';
+  return `${Math.round(value).toLocaleString()} tokens`;
+}
+
+function formatCost(value?: number): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'No cost recorded';
+  return `$${value.toFixed(2)}`;
+}
+
+function formatRunStatus(value?: string): string {
+  switch (value) {
+    case 'complete':
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+    case 'error':
+      return 'Failed';
+    case 'running':
+      return 'Running';
+    case 'pending':
+      return 'Pending';
+    default:
+      return 'Unknown';
+  }
+}
+
+function runStatusColor(value?: string): string {
+  switch (value) {
+    case 'complete':
+    case 'completed':
+      return 'green';
+    case 'failed':
+    case 'error':
+      return 'red';
+    case 'running':
+      return 'blue';
+    case 'pending':
+      return 'yellow';
+    default:
+      return 'gray';
+  }
+}
+
+function getEventAttemptId(event: AnyTelemetryEvent): string | undefined {
+  return isRunEvent(event) ? event.attemptId : undefined;
+}
+
+function safeString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const sanitized = sanitizeText(value.trim());
+  return sanitized.length > 0 ? sanitized : undefined;
+}
+
+function sourceRunIdFromRecord(source?: Record<string, unknown>): string | undefined {
+  return (
+    safeString(source?.attemptId) ?? safeString(source?.runId) ?? safeString(source?.sourceRunId)
+  );
+}
+
+function sourceRunMatches(selectedAttemptId: string | undefined, sourceRunId?: string): boolean {
+  return !selectedAttemptId || !sourceRunId || sourceRunId === selectedAttemptId;
+}
+
+function workflowTaskId(run: WorkflowRun): string | undefined {
+  return run.taskId ?? safeString(run.context?.taskId);
+}
+
+function workflowStartedAt(run: WorkflowRun): string {
+  return run.lastCheckpoint ?? run.completedAt ?? run.startedAt;
+}
+
+function workProductLink(product: WorkProductPreview): AgentRunTimelineEvent['link'] {
+  if (product.artifact) {
+    return {
+      label: 'Preview artifact',
+      href: product.id,
+      target: 'artifact-preview',
+    };
+  }
+  const sourceLink = product.sourceLinks?.find((link) => link.type === 'pr' || link.type === 'url');
+  const href = normalizeSafeHref(sourceLink?.href);
+  if (sourceLink && href) {
+    return {
+      label: sourceLink.label || 'Open source',
+      href,
+      target: 'external',
+    };
+  }
+  return { label: 'Work products', href: '#work-products', target: 'work-products' };
+}
+
+function deliverableLink(deliverable: Deliverable): AgentRunTimelineEvent['link'] {
+  const href = normalizeSafeHref(deliverable.path);
+  if (href) {
+    return { label: 'Open deliverable', href, target: 'external' };
+  }
+  return { label: 'Task details', href: '#details', target: 'details' };
+}
+
+export function redactTimelineText(value: string): string {
+  let redacted = sanitizeText(value);
+  for (const [pattern, replacement] of SECRET_PATTERNS) {
+    redacted = redacted.replace(pattern, replacement);
+  }
+  return redacted;
+}
+
+function redactValue(value: unknown): unknown {
+  if (typeof value === 'string') return redactTimelineText(value);
+  if (Array.isArray(value)) return value.map(redactValue);
+  if (!value || typeof value !== 'object') return value;
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => {
+      const sensitiveKey = /(token|secret|password|authorization|api[_-]?key)/i.test(key);
+      return [key, sensitiveKey ? '[REDACTED]' : redactValue(entry)];
+    })
+  );
+}
+
+function stringifyMetadata(metadata?: Record<string, unknown>): string {
+  if (!metadata || Object.keys(metadata).length === 0) return '';
+  const serialized = JSON.stringify(redactValue(metadata), null, 2);
+  if (serialized.length <= 4000) return serialized;
+  return `${serialized.slice(0, 4000)}\n...`;
+}
+
+function sourceForTrace(trace?: AgentRunTrace): AgentRunTimelineEventSource {
+  if (!trace) return 'derived';
+  return trace.status === 'running' ? 'live' : 'stored';
+}
+
+function eventText(metadata: Record<string, unknown> | undefined): string {
+  return [
+    safeString(metadata?.eventType),
+    safeString(metadata?.summary),
+    safeString(metadata?.tool),
+    safeString(metadata?.command),
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+export function getTimelineEventType(
+  stepType: AgentRunTraceStep['type'],
+  metadata?: Record<string, unknown>
+): AgentRunTimelineEventType {
+  const text = `${stepType} ${eventText(metadata)}`.toLowerCase();
+
+  if (
+    stepType === 'error' ||
+    stepType === 'abort' ||
+    /error|failed|failure|abort|exception/.test(text)
+  )
+    return 'error';
+  if (stepType === 'complete' || stepType === 'finalize') return 'result';
+  if (/approval|approve|denied|deny|permission request/.test(text)) return 'approval';
+  if (/policy|permission|sandbox|security|guard/.test(text)) return 'policy';
+  if (/file|diff|patch|write|edit|created|modified|deleted/.test(text)) return 'file';
+  if (/\b(command|shell|terminal|stdout|stderr)\b|exec[.:_-]/.test(text)) return 'command';
+  if (/token|usage|cost|input_tokens|output_tokens/.test(text)) return 'usage';
+  if (stepType === 'stream') return 'command';
+  if (/tool|function|mcp/.test(text)) return 'tool';
+  if (stepType === 'retry') return 'tool';
+  if (/completed|final|result|finish/.test(text)) return 'result';
+  return stepType === 'init' ? 'prompt' : 'tool';
+}
+
+function titleForStep(type: AgentRunTimelineEventType, step: AgentRunTraceStep): string {
+  const eventType = safeString(step.metadata?.eventType);
+  const summary = safeString(step.metadata?.summary);
+  const command = safeString(step.metadata?.command);
+  const tool = safeString(step.metadata?.tool);
+  const error = safeString(step.metadata?.error);
+  if (eventType) return eventType;
+  if (summary) return summary.length > 80 ? `${summary.slice(0, 77)}...` : summary;
+  if (command) return command.length > 80 ? `${command.slice(0, 77)}...` : command;
+  if (error) return error.length > 80 ? `${error.slice(0, 77)}...` : error;
+  if (tool) return tool;
+
+  switch (type) {
+    case 'prompt':
+      return 'Run initialized';
+    case 'result':
+      return 'Run completed';
+    case 'error':
+      return 'Run error recorded';
+    default:
+      return `${EVENT_LABELS[type]} event`;
+  }
+}
+
+function detailForStep(step: AgentRunTraceStep): string | undefined {
+  const summary = safeString(step.metadata?.summary);
+  if (summary) return summary;
+  const error = safeString(step.metadata?.error);
+  if (error) return error;
+  const command = safeString(step.metadata?.command);
+  if (command) return command;
+  const tool = safeString(step.metadata?.tool);
+  if (tool) return tool;
+  const files = Array.isArray(step.metadata?.files)
+    ? step.metadata.files.filter((file): file is string => typeof file === 'string')
+    : [];
+  if (files.length > 0) return files.slice(0, 3).join(', ');
+  return undefined;
+}
+
+function telemetryTitle(event: AnyTelemetryEvent): string {
+  if (event.type === 'run.started') return 'Run started';
+  if (event.type === 'run.completed') {
+    return isRunEvent(event) && event.success === false ? 'Run failed' : 'Run completed';
+  }
+  if (event.type === 'run.error') return 'Run error recorded';
+  if (event.type === 'run.tokens') return 'Token usage recorded';
+  return event.type;
+}
+
+function telemetryEventType(event: AnyTelemetryEvent): AgentRunTimelineEventType {
+  if (event.type === 'run.started') return 'prompt';
+  if (event.type === 'run.completed') {
+    return isRunEvent(event) && event.success === false ? 'error' : 'result';
+  }
+  if (event.type === 'run.error') return 'error';
+  if (event.type === 'run.tokens') return 'usage';
+  return 'tool';
+}
+
+function logLinkForEvent(
+  type: AgentRunTimelineEventType
+): AgentRunTimelineEvent['link'] | undefined {
+  if (type === 'command' || type === 'error' || type === 'result' || type === 'tool') {
+    return { label: 'Agent logs', href: '#agent', target: 'agent' };
+  }
+  return undefined;
+}
+
+function metadataForTaskPrompt(task: Task, trace?: AgentRunTrace): Record<string, unknown> {
+  return {
+    taskId: task.id,
+    title: task.title,
+    description: task.description,
+    project: task.project,
+    sprint: task.sprint,
+    type: task.type,
+    priority: task.priority,
+    runMode: task.runMode,
+    assignedAgent: task.agent,
+    selectedAgent: trace?.agent || task.attempt?.agent,
+    model: trace?.metadata?.model || task.attempt?.model,
+    provider: trace?.metadata?.provider || task.attempt?.provider,
+    repo: task.git?.repo,
+    branch: task.git?.branch,
+    baseBranch: task.git?.baseBranch,
+    worktreePath: task.git?.worktreePath,
+    policyProfile: trace?.metadata?.policyProfile,
+    capabilitySet: trace?.metadata?.capabilitySet,
+    workspaceId: trace?.metadata?.workspaceId,
+    sessionKey: trace?.metadata?.sessionKey,
+    runKey: trace?.metadata?.runKey || task.attempt?.id,
+  };
+}
+
+interface TimelineRunSummary {
+  status: string;
+  durationMs?: number;
+  totalTokens?: number;
+  cost?: number;
+  finalResult?: string;
+}
+
+function summarizeTimelineRun(
+  task: Task,
+  trace: AgentRunTrace | undefined,
+  telemetryEvents: AnyTelemetryEvent[],
+  selectedAttemptId: string | null
+): TimelineRunSummary {
+  const attempt =
+    task.attempt?.id === selectedAttemptId || (!selectedAttemptId && task.attempt)
+      ? task.attempt
+      : task.attempts?.find((candidate) => candidate.id === selectedAttemptId);
+  const relevantRunEvents = telemetryEvents.filter(isRunEvent).filter((event) => {
+    if (event.taskId !== task.id) return false;
+    return !selectedAttemptId || getEventAttemptId(event) === selectedAttemptId;
+  });
+  const completionEvent = [...relevantRunEvents]
+    .reverse()
+    .find((event) => event.type === 'run.completed' || event.type === 'run.error');
+  const usageEvent = [...relevantRunEvents].reverse().find((event) => event.type === 'run.tokens');
+  const traceResultStep = [...(trace?.steps ?? [])]
+    .reverse()
+    .find((step) => step.type === 'complete' || step.type === 'error');
+  const startedAt = attempt?.started ? new Date(attempt.started).getTime() : undefined;
+  const endedAt = attempt?.ended ? new Date(attempt.ended).getTime() : undefined;
+  const attemptDuration =
+    startedAt !== undefined && endedAt !== undefined && Number.isFinite(endedAt - startedAt)
+      ? endedAt - startedAt
+      : undefined;
+
+  return {
+    status:
+      trace?.status ||
+      attempt?.status ||
+      (completionEvent?.type === 'run.error' || completionEvent?.success === false
+        ? 'failed'
+        : completionEvent?.type === 'run.completed'
+          ? 'completed'
+          : undefined) ||
+      'unknown',
+    durationMs: trace?.totalDurationMs ?? completionEvent?.durationMs ?? attemptDuration,
+    totalTokens: usageEvent?.totalTokens,
+    cost: usageEvent?.cost,
+    finalResult:
+      safeString(traceResultStep?.metadata?.finalResult) ??
+      safeString(traceResultStep?.metadata?.summary) ??
+      safeString(traceResultStep?.metadata?.error) ??
+      completionEvent?.error,
+  };
+}
+
+function sortTimelineEvents(events: AgentRunTimelineEvent[]): AgentRunTimelineEvent[] {
+  return events
+    .sort((a, b) => {
+      const byTime = new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+      if (Number.isFinite(byTime) && byTime !== 0) return byTime;
+      return a.sequence - b.sequence;
+    })
+    .map((event, index) => ({ ...event, sequence: index + 1 }));
+}
+
+interface BuildTimelineOptions {
+  task: Task;
+  approvals?: AgentApprovalRequest[];
+  notifications?: AgentNotification[];
+  traces: AgentRunTrace[];
+  telemetryEvents: AnyTelemetryEvent[];
+  workflowRuns?: WorkflowRun[];
+  workProducts: WorkProductPreview[];
+  selectedAttemptId?: string | null;
+}
+
+export function buildAgentRunTimelineEvents({
+  task,
+  approvals = [],
+  notifications = [],
+  traces,
+  telemetryEvents,
+  workflowRuns = [],
+  workProducts,
+  selectedAttemptId,
+}: BuildTimelineOptions): AgentRunTimelineEvent[] {
+  const selectedTrace =
+    traces.find((trace) => trace.traceId === selectedAttemptId) ||
+    traces[0] ||
+    (selectedAttemptId ? undefined : null);
+  const attemptId = selectedAttemptId || selectedTrace?.traceId || task.attempt?.id;
+  const source = sourceForTrace(selectedTrace || undefined);
+  const events: AgentRunTimelineEvent[] = [];
+  let nextSequence = 1;
+  const startedAt = selectedTrace?.startedAt || task.attempt?.started || task.created;
+
+  events.push({
+    id: `prompt-${attemptId || task.id}`,
+    sequence: nextSequence++,
+    type: 'prompt',
+    source: selectedTrace ? source : 'derived',
+    timestamp: startedAt,
+    title: 'Prompt and task input prepared',
+    detail: task.title,
+    metadata: metadataForTaskPrompt(task, selectedTrace || undefined),
+  });
+
+  if (selectedTrace) {
+    for (const step of selectedTrace.steps) {
+      const eventType = getTimelineEventType(step.type, step.metadata);
+      events.push({
+        id: `trace-${selectedTrace.traceId}-${step.sequence ?? nextSequence}`,
+        sequence: step.sequence ?? nextSequence,
+        type: eventType,
+        source,
+        timestamp: step.startedAt,
+        title: titleForStep(eventType, step),
+        detail: detailForStep(step),
+        durationMs: step.durationMs,
+        metadata: {
+          traceStepType: step.type,
+          traceSequence: step.sequence,
+          ...step.metadata,
+        },
+        link: logLinkForEvent(eventType),
+      });
+      nextSequence += 1;
+    }
+  }
+
+  const relevantTelemetry = telemetryEvents.filter((event) => {
+    if (!attemptId) return event.taskId === task.id;
+    return event.taskId === task.id && getEventAttemptId(event) === attemptId;
+  });
+
+  for (const event of relevantTelemetry) {
+    const run = isRunEvent(event) ? event : undefined;
+    const type = telemetryEventType(event);
+    events.push({
+      id: `telemetry-${event.id}`,
+      sequence: nextSequence++,
+      type,
+      source: selectedTrace ? source : 'derived',
+      timestamp: event.timestamp,
+      title: telemetryTitle(event),
+      detail: run?.error,
+      durationMs: run?.durationMs,
+      metadata: {
+        telemetryType: event.type as TelemetryEventType,
+        agent: run?.agent,
+        model: run?.model,
+        attemptId: run?.attemptId,
+        success: run?.success,
+        inputTokens: run?.inputTokens,
+        outputTokens: run?.outputTokens,
+        cacheTokens: run?.cacheTokens,
+        totalTokens: run?.totalTokens,
+        cost: run?.cost,
+      },
+      link: logLinkForEvent(type),
+    });
+  }
+
+  const currentAttempt = task.attempt;
+  if (currentAttempt && (!attemptId || currentAttempt.id === attemptId)) {
+    if (
+      currentAttempt.started &&
+      !events.some((event) => event.id === `attempt-start-${currentAttempt.id}`)
+    ) {
+      events.push({
+        id: `attempt-start-${currentAttempt.id}`,
+        sequence: nextSequence++,
+        type: 'prompt',
+        source: 'derived',
+        timestamp: currentAttempt.started,
+        title: 'Task attempt started',
+        detail: currentAttempt.agent,
+        metadata: currentAttempt as unknown as Record<string, unknown>,
+        link: { label: 'Agent logs', href: '#agent', target: 'agent' },
+      });
+    }
+    if (currentAttempt.ended) {
+      events.push({
+        id: `attempt-end-${currentAttempt.id}`,
+        sequence: nextSequence++,
+        type: currentAttempt.status === 'failed' ? 'error' : 'result',
+        source: 'derived',
+        timestamp: currentAttempt.ended,
+        title: currentAttempt.status === 'failed' ? 'Task attempt failed' : 'Task attempt finished',
+        detail: currentAttempt.agent,
+        metadata: currentAttempt as unknown as Record<string, unknown>,
+        link: { label: 'Agent logs', href: '#agent', target: 'agent' },
+      });
+    }
+    if (currentAttempt.budget?.enabled) {
+      events.push({
+        id: `budget-${currentAttempt.id}`,
+        sequence: nextSequence++,
+        type: currentAttempt.budget.decision === 'allow' ? 'usage' : 'policy',
+        source: 'derived',
+        timestamp: currentAttempt.ended || currentAttempt.started || task.updated,
+        title: `Budget ${currentAttempt.budget.decision}`,
+        detail:
+          currentAttempt.budget.thresholdEvents.length > 0
+            ? currentAttempt.budget.thresholdEvents.map((event) => event.message).join(' ')
+            : 'No budget threshold events recorded',
+        metadata: currentAttempt.budget as unknown as Record<string, unknown>,
+        link: { label: 'Agent logs', href: '#agent', target: 'agent' },
+      });
+    }
+  }
+
+  if (task.git?.worktreePath) {
+    events.push({
+      id: `worktree-${task.id}`,
+      sequence: nextSequence++,
+      type: 'file',
+      source: 'derived',
+      timestamp: startedAt,
+      title: 'Worktree attached',
+      detail: task.git.branch || task.git.baseBranch,
+      metadata: {
+        repo: task.git.repo,
+        branch: task.git.branch,
+        baseBranch: task.git.baseBranch,
+        worktreePath: task.git.worktreePath,
+        prUrl: task.git.prUrl,
+        prNumber: task.git.prNumber,
+      },
+      link: { label: 'Changes', href: '#changes', target: 'changes' },
+    });
+  }
+
+  if (task.review?.decision) {
+    events.push({
+      id: `review-${task.id}`,
+      sequence: nextSequence++,
+      type: task.review.decision === 'approved' ? 'approval' : 'error',
+      source: 'derived',
+      timestamp: task.review.decidedAt || task.updated,
+      title: `Review ${task.review.decision}`,
+      detail: task.review.summary,
+      metadata: task.review as unknown as Record<string, unknown>,
+      link: { label: 'Review', href: '#review', target: 'review' },
+    });
+  }
+
+  for (const comment of task.reviewComments ?? []) {
+    events.push({
+      id: `review-comment-${comment.id}`,
+      sequence: nextSequence++,
+      type: 'file',
+      source: 'derived',
+      timestamp: comment.created,
+      title: `Review comment: ${comment.file}:${comment.line}`,
+      detail: comment.content,
+      metadata: comment as unknown as Record<string, unknown>,
+      link: { label: 'Changes', href: '#changes', target: 'changes' },
+    });
+  }
+
+  if (task.qaGate) {
+    events.push({
+      id: `qa-gate-${task.id}`,
+      sequence: nextSequence++,
+      type: task.qaGate.passed ? 'approval' : 'policy',
+      source: 'derived',
+      timestamp: task.qaGate.passedAt || task.updated,
+      title: task.qaGate.passed ? 'QA gate approved' : 'QA gate pending',
+      detail: task.qaGate.required
+        ? 'Task requires QA approval before completion'
+        : 'QA gate is not required',
+      metadata: task.qaGate as unknown as Record<string, unknown>,
+      link: { label: 'Task details', href: '#details', target: 'details' },
+    });
+  }
+
+  for (const approval of approvals) {
+    if (approval.taskId !== task.id) continue;
+    events.push({
+      id: `approval-request-${approval.id}`,
+      sequence: nextSequence++,
+      type: approval.status === 'rejected' ? 'error' : 'approval',
+      source: 'derived',
+      timestamp: approval.reviewedAt || approval.createdAt,
+      title: `Permission ${approval.status}: ${approval.action}`,
+      detail: approval.details,
+      metadata: approval as unknown as Record<string, unknown>,
+      link: { label: 'Agent', href: '#agent', target: 'agent' },
+    });
+  }
+
+  for (const run of workflowRuns) {
+    if (workflowTaskId(run) !== task.id) continue;
+    const workflowSourceRunId =
+      safeString(run.context?.attemptId) ?? safeString(run.context?.runId);
+    if (!sourceRunMatches(attemptId, workflowSourceRunId)) continue;
+    events.push({
+      id: `workflow-run-${run.id}`,
+      sequence: nextSequence++,
+      type:
+        run.status === 'blocked'
+          ? 'approval'
+          : run.status === 'failed'
+            ? 'error'
+            : run.status === 'completed'
+              ? 'result'
+              : 'tool',
+      source: 'derived',
+      timestamp: workflowStartedAt(run),
+      title: run.automation
+        ? `Automation ${run.status}: ${run.automation.automationVersionId}`
+        : `Workflow ${run.status}: ${run.workflowId}`,
+      detail: run.currentStep
+        ? `Current step: ${run.currentStep}`
+        : run.error || `${run.steps.length} step${run.steps.length === 1 ? '' : 's'}`,
+      durationMs:
+        run.completedAt && run.startedAt
+          ? new Date(run.completedAt).getTime() - new Date(run.startedAt).getTime()
+          : undefined,
+      metadata: {
+        runId: run.id,
+        workflowId: run.workflowId,
+        workflowVersion: run.workflowVersion,
+        status: run.status,
+        currentStep: run.currentStep,
+        automation: run.automation,
+        context: run.context,
+        steps: run.steps.map((step) => ({
+          stepId: step.stepId,
+          status: step.status,
+          agent: step.agent,
+          error: step.error,
+          retries: step.retries,
+        })),
+      },
+      link: { label: 'Workflow run', href: `#workflow:${run.id}`, target: 'workflow' },
+    });
+  }
+
+  for (const product of workProducts) {
+    if (attemptId && product.sourceRunId && product.sourceRunId !== attemptId) continue;
+    events.push({
+      id: `work-product-${product.id}`,
+      sequence: nextSequence++,
+      type: 'file',
+      source: 'derived',
+      timestamp: product.createdAt,
+      title: `Work product saved: ${product.title}`,
+      detail: product.snippet,
+      metadata: {
+        kind: product.kind,
+        version: product.version,
+        status: product.status,
+        sourceRunId: product.sourceRunId,
+        productId: product.id,
+        agent: product.agent,
+        model: product.model,
+        redacted: product.redacted,
+        artifact: product.artifact,
+        sourceLinks: product.sourceLinks,
+      },
+      link: workProductLink(product),
+    });
+  }
+
+  for (const deliverable of task.deliverables ?? []) {
+    if (!sourceRunMatches(attemptId, deliverable.sourceRunId)) continue;
+    events.push({
+      id: `deliverable-${deliverable.id}`,
+      sequence: nextSequence++,
+      type: 'file',
+      source: 'derived',
+      timestamp: deliverable.updated || deliverable.created,
+      title: `Deliverable attached: ${deliverable.title}`,
+      detail: deliverable.description || deliverable.path,
+      metadata: deliverable as unknown as Record<string, unknown>,
+      link: deliverableLink(deliverable),
+    });
+  }
+
+  for (const notification of notifications) {
+    if (notification.taskId !== task.id) continue;
+    const notificationRunId = sourceRunIdFromRecord(notification.source);
+    if (!sourceRunMatches(attemptId, notificationRunId)) continue;
+    const targetHref = normalizeSafeHref(notification.targetUrl);
+    events.push({
+      id: `notification-${notification.id}`,
+      sequence: nextSequence++,
+      type:
+        notification.type.includes('failure') || notification.type.includes('error')
+          ? 'error'
+          : notification.type.includes('approval') || notification.type.includes('review')
+            ? 'approval'
+            : 'tool',
+      source: 'derived',
+      timestamp: notification.deliveredAt || notification.createdAt,
+      title: notification.title || `Notification: ${notification.type}`,
+      detail: notification.content,
+      metadata: {
+        id: notification.id,
+        targetAgent: notification.targetAgent,
+        fromAgent: notification.fromAgent,
+        type: notification.type,
+        delivered: notification.delivered,
+        deliveredAt: notification.deliveredAt,
+        dedupeKey: notification.dedupeKey,
+        source: notification.source,
+      },
+      link: targetHref
+        ? { label: 'Notification target', href: targetHref, target: 'external' }
+        : { label: 'Agent', href: '#agent', target: 'agent' },
+    });
+  }
+
+  if ((task.verificationSteps?.length ?? 0) > 0) {
+    const checked = task.verificationSteps?.filter((step) => step.checked).length ?? 0;
+    events.push({
+      id: `verification-${task.id}`,
+      sequence: nextSequence,
+      type: checked === task.verificationSteps?.length ? 'approval' : 'result',
+      source: 'derived',
+      timestamp: task.updated,
+      title: 'Verification checklist updated',
+      detail: `${checked}/${task.verificationSteps?.length ?? 0} checks complete`,
+      metadata: {
+        checks: task.verificationSteps,
+      },
+    });
+  }
+
+  return sortTimelineEvents(events);
+}
+
+function getRunOptions(
+  task: Task,
+  traces: AgentRunTrace[],
+  telemetryEvents: AnyTelemetryEvent[],
+  workProducts: WorkProductPreview[],
+  notifications: AgentNotification[],
+  workflowRuns: WorkflowRun[]
+): Array<{ value: string; label: string }> {
+  const attempts = new Map<string, string>();
+  const addAttempt = (id: string | undefined, label: string) => {
+    if (!id || attempts.has(id)) return;
+    attempts.set(id, label);
+  };
+
+  const latestAttemptLabel =
+    task.attempt?.status === 'running' || task.attempt?.status === 'pending' ? 'Current' : 'Latest';
+  addAttempt(
+    task.attempt?.id,
+    `${latestAttemptLabel} | ${task.attempt?.id} | ${task.attempt?.status ?? 'unknown'}`
+  );
+  for (const trace of traces) {
+    addAttempt(trace.traceId, `Historical | ${trace.traceId} | ${trace.status}`);
+  }
+  for (const attempt of task.attempts ?? []) {
+    addAttempt(attempt.id, `Historical | ${attempt.id} | ${attempt.status}`);
+  }
+  for (const event of telemetryEvents) {
+    addAttempt(getEventAttemptId(event), `${getEventAttemptId(event)} (telemetry)`);
+  }
+  for (const product of workProducts) {
+    addAttempt(product.sourceRunId, `${product.sourceRunId} (work product)`);
+  }
+  for (const deliverable of task.deliverables ?? []) {
+    addAttempt(deliverable.sourceRunId, `${deliverable.sourceRunId} (deliverable)`);
+  }
+  for (const notification of notifications) {
+    const sourceRunId = sourceRunIdFromRecord(notification.source);
+    addAttempt(sourceRunId, `${sourceRunId} (notification)`);
+  }
+  for (const run of workflowRuns) {
+    addAttempt(run.id, `${run.id} (workflow run)`);
+    const sourceRunId = safeString(run.context?.attemptId) ?? safeString(run.context?.runId);
+    addAttempt(sourceRunId, `${sourceRunId} (workflow)`);
+  }
+
+  return Array.from(attempts.entries()).map(([value, label]) => ({ value, label }));
+}
+
+function typeFilterLabel(type: AgentRunTimelineEventType): string {
+  return EVENT_LABELS[type];
+}
+
+function governanceTraceHrefForEvent(event: AgentRunTimelineEvent): string | null {
+  if (event.type !== 'policy' && event.type !== 'approval') return null;
+
+  const query =
+    safeString(event.metadata?.taskId) ??
+    safeString(event.metadata?.task_id) ??
+    safeString(event.metadata?.actionType) ??
+    event.title;
+
+  return `${BASE_PATH}/decisions?mode=governance&q=${encodeURIComponent(query)}`;
+}
+
+function EventRow({
+  event,
+  highlighted,
+  onOpenTab,
+  onOpenWorkflow,
+  onPreviewArtifact,
+}: {
+  event: AgentRunTimelineEvent;
+  highlighted?: boolean;
+  onOpenTab?: (target: TimelineTabTarget) => void;
+  onOpenWorkflow?: (runId?: string) => void;
+  onPreviewArtifact?: (productId: string, version: number) => void;
+}) {
+  const Icon = EVENT_ICONS[event.type];
+  const metadata = stringifyMetadata(event.metadata);
+  const linkTarget = event.link?.target;
+  const canOpenInternal =
+    linkTarget &&
+    linkTarget !== 'external' &&
+    linkTarget !== 'workflow' &&
+    linkTarget !== 'artifact-preview' &&
+    onOpenTab;
+  const canOpenWorkflow = linkTarget === 'workflow' && onOpenWorkflow;
+  const previewProductId = safeString(event.metadata?.productId);
+  const previewVersion =
+    typeof event.metadata?.version === 'number' ? event.metadata.version : undefined;
+  const canPreviewArtifact =
+    linkTarget === 'artifact-preview' && previewProductId && previewVersion && onPreviewArtifact;
+  const canOpenExternal = linkTarget === 'external' && event.link?.href;
+  const governanceTraceHref = governanceTraceHrefForEvent(event);
+
+  return (
+    <Paper
+      withBorder
+      p="sm"
+      radius="md"
+      className={highlighted ? 'border-primary bg-primary/5 shadow-sm' : undefined}
+      data-highlighted={highlighted ? 'true' : undefined}
+    >
+      <Stack gap="xs">
+        <Group justify="space-between" align="flex-start" wrap="nowrap">
+          <Group gap="sm" align="flex-start" wrap="nowrap" className="min-w-0">
+            <ThemeIcon size="sm" radius="xl" color={EVENT_COLORS[event.type]} variant="light">
+              <Icon className="h-4 w-4" />
+            </ThemeIcon>
+            <div className="min-w-0">
+              <Group gap="xs" wrap="wrap">
+                <Text size="sm" fw={600}>
+                  {redactTimelineText(event.title)}
+                </Text>
+                <Badge size="xs" color={EVENT_COLORS[event.type]} variant="light">
+                  {EVENT_LABELS[event.type]}
+                </Badge>
+                <Badge size="xs" color={SOURCE_COLORS[event.source]} variant="outline">
+                  {event.source}
+                </Badge>
+              </Group>
+              <Text size="xs" c="dimmed">
+                {formatDate(event.timestamp)}
+                {event.durationMs !== undefined ? ` | ${formatDurationMs(event.durationMs)}` : ''}
+              </Text>
+            </div>
+          </Group>
+          <Text size="xs" c="dimmed" className="shrink-0 tabular-nums">
+            #{event.sequence}
+          </Text>
+        </Group>
+        {event.detail && (
+          <Text size="sm" c="dimmed">
+            {redactTimelineText(event.detail)}
+          </Text>
+        )}
+        {metadata && (
+          <Code block className="max-h-40 overflow-auto whitespace-pre-wrap break-words text-xs">
+            {metadata}
+          </Code>
+        )}
+        {(canOpenInternal ||
+          canOpenWorkflow ||
+          canOpenExternal ||
+          canPreviewArtifact ||
+          governanceTraceHref) && (
+          <Group gap="xs">
+            {canOpenInternal && linkTarget && event.link && (
+              <Button
+                size="compact-xs"
+                variant="subtle"
+                onClick={() => onOpenTab?.(linkTarget as TimelineTabTarget)}
+              >
+                {event.link.label}
+              </Button>
+            )}
+            {canOpenWorkflow && event.link && (
+              <Button
+                size="compact-xs"
+                variant="subtle"
+                onClick={() => onOpenWorkflow?.(safeString(event.metadata?.runId))}
+              >
+                {event.link.label}
+              </Button>
+            )}
+            {canPreviewArtifact && event.link && (
+              <Button
+                size="compact-xs"
+                variant="subtle"
+                onClick={() => onPreviewArtifact(previewProductId, previewVersion)}
+              >
+                {event.link.label}
+              </Button>
+            )}
+            {canOpenExternal && event.link && (
+              <Button
+                component="a"
+                href={event.link.href}
+                rel="noopener noreferrer"
+                size="compact-xs"
+                target="_blank"
+                variant="subtle"
+              >
+                {event.link.label}
+              </Button>
+            )}
+            {governanceTraceHref && (
+              <Button
+                component="a"
+                href={governanceTraceHref}
+                rel="noopener noreferrer"
+                size="compact-xs"
+                target="_self"
+                variant="subtle"
+              >
+                Governance Traces
+              </Button>
+            )}
+          </Group>
+        )}
+      </Stack>
+    </Paper>
+  );
+}
+
+export function AgentRunTimelinePanel({
+  task,
+  initialAttemptId,
+  initialEventId,
+  onOpenTab,
+  onOpenWorkflow,
+}: AgentRunTimelinePanelProps) {
+  const [previewArtifact, setPreviewArtifact] = useState<{
+    productId: string;
+    version: number;
+    title?: string;
+  } | null>(null);
+  const hasLiveAttempt = task.attempt?.status === 'running';
+  const { data: traces = [], isLoading: tracesLoading } = useAgentRunTraces(task.id, {
+    live: hasLiveAttempt,
+  });
+  const { data: telemetryEvents = [], isLoading: telemetryLoading } = useTaskTelemetryEvents(
+    task.id,
+    { live: hasLiveAttempt }
+  );
+  const { data: workProducts = [], isLoading: workProductsLoading } = useTaskWorkProducts(task.id);
+  const { data: notifications = [], isLoading: notificationsLoading } = useTaskNotifications(
+    task.id
+  );
+  const { data: approvals = [], isLoading: approvalsLoading } = usePendingAgentApprovals();
+  const decideApproval = useDecideRunApproval();
+  const [pendingDecision, setPendingDecision] = useState<{
+    approval: AgentApprovalRequest;
+    decision: 'approved' | 'rejected';
+  } | null>(null);
+  const decisionInFlight = useRef(false);
+  const [isDeciding, setIsDeciding] = useState(false);
+  const [decisionError, setDecisionError] = useState<string | null>(null);
+  const decisionErrorRef = useRef<HTMLParagraphElement | null>(null);
+
+  useEffect(() => {
+    if (decisionError) {
+      decisionErrorRef.current?.focus({ preventScroll: true });
+      decisionErrorRef.current?.scrollIntoView({ block: 'center', behavior: 'instant' });
+    }
+  }, [decisionError]);
+
+  const closeDecision = () => {
+    if (!decisionInFlight.current) {
+      setPendingDecision(null);
+      setDecisionError(null);
+    }
+  };
+
+  const confirmDecision = async () => {
+    if (!pendingDecision || decisionInFlight.current) return;
+    decisionInFlight.current = true;
+    setIsDeciding(true);
+    setDecisionError(null);
+    try {
+      await decideApproval.mutateAsync({
+        approvalId: pendingDecision.approval.id,
+        decision: {
+          decision: pendingDecision.decision,
+          expectedRevision: pendingDecision.approval.revision,
+          expectedActionHash: pendingDecision.approval.actionHash,
+        },
+      });
+      setPendingDecision(null);
+    } catch (error) {
+      setDecisionError(error instanceof Error ? error.message : 'Approval decision failed.');
+    } finally {
+      decisionInFlight.current = false;
+      setIsDeciding(false);
+    }
+  };
+  const { data: activeRuns = [], isLoading: activeRunsLoading } = useActiveRuns();
+  const { data: recentRuns = [], isLoading: recentRunsLoading } = useRecentRuns();
+  const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(
+    initialAttemptId ?? task.attempt?.id ?? null
+  );
+  const { data: phase, isLoading: phaseLoading } = useAgentPhase(
+    task.id,
+    selectedAttemptId ?? undefined,
+    hasLiveAttempt && selectedAttemptId === task.attempt?.id
+  );
+  const { data: fileProvenance, isLoading: fileProvenanceLoading } = useRunFileProvenance(
+    task.id,
+    selectedAttemptId ?? undefined,
+    hasLiveAttempt && selectedAttemptId === task.attempt?.id
+  );
+  const [filter, setFilter] = useState<AgentRunTimelineEventType | 'all'>('all');
+  const [visibleCount, setVisibleCount] = useState(TIMELINE_PAGE_SIZE);
+  const highlightedEventRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (initialAttemptId) {
+      setSelectedAttemptId(initialAttemptId);
+    }
+  }, [initialAttemptId]);
+
+  const runOptions = useMemo(
+    () =>
+      getRunOptions(task, traces, telemetryEvents, workProducts, notifications, [
+        ...activeRuns,
+        ...recentRuns,
+      ]),
+    [activeRuns, notifications, recentRuns, task, traces, telemetryEvents, workProducts]
+  );
+
+  useEffect(() => {
+    if (runOptions.length === 0) {
+      if (selectedAttemptId) setSelectedAttemptId(null);
+      return;
+    }
+    if (!selectedAttemptId || !runOptions.some((option) => option.value === selectedAttemptId)) {
+      setSelectedAttemptId(runOptions[0].value);
+    }
+  }, [runOptions, selectedAttemptId]);
+
+  const selectedTrace = useMemo(
+    () => traces.find((trace) => trace.traceId === selectedAttemptId),
+    [selectedAttemptId, traces]
+  );
+  const runSummary = useMemo(
+    () => summarizeTimelineRun(task, selectedTrace, telemetryEvents, selectedAttemptId),
+    [selectedAttemptId, selectedTrace, task, telemetryEvents]
+  );
+
+  const events = useMemo(
+    () =>
+      buildAgentRunTimelineEvents({
+        task,
+        approvals,
+        notifications,
+        traces,
+        telemetryEvents,
+        workflowRuns: [...activeRuns, ...recentRuns],
+        workProducts,
+        selectedAttemptId,
+      }),
+    [
+      activeRuns,
+      approvals,
+      notifications,
+      recentRuns,
+      task,
+      traces,
+      telemetryEvents,
+      workProducts,
+      selectedAttemptId,
+    ]
+  );
+  const highlightedEventId = useMemo(() => {
+    if (!initialEventId) return null;
+    if (events.some((event) => event.id === initialEventId)) return initialEventId;
+    const telemetryEventId = `telemetry-${initialEventId}`;
+    if (events.some((event) => event.id === telemetryEventId)) return telemetryEventId;
+    return initialEventId;
+  }, [events, initialEventId]);
+
+  const filteredEvents = useMemo(
+    () => (filter === 'all' ? events : events.filter((event) => event.type === filter)),
+    [events, filter]
+  );
+  const visibleEvents = filteredEvents.slice(0, visibleCount);
+  const canLoadMore = filteredEvents.length > visibleEvents.length;
+  const isLoading =
+    tracesLoading ||
+    telemetryLoading ||
+    workProductsLoading ||
+    notificationsLoading ||
+    approvalsLoading ||
+    phaseLoading ||
+    fileProvenanceLoading ||
+    activeRunsLoading ||
+    recentRunsLoading;
+  const phaseIdentity = phase?.effectiveEvidence.identity;
+  const source = sourceForTrace(selectedTrace);
+  const linkedWorkProducts = workProducts.filter(
+    (product) => !selectedAttemptId || product.sourceRunId === selectedAttemptId
+  );
+  const pendingTaskApprovals = approvals.filter((approval) => approval.taskId === task.id);
+  const selectedIsLatestAttempt = Boolean(
+    selectedAttemptId && selectedAttemptId === task.attempt?.id
+  );
+  const selectedIsLiveAttempt = hasLiveAttempt && selectedIsLatestAttempt;
+  const selectedAttemptScope = selectedIsLiveAttempt
+    ? 'Current attempt'
+    : selectedIsLatestAttempt
+      ? 'Latest attempt'
+      : selectedAttemptId
+        ? 'Historical attempt'
+        : 'Derived history';
+
+  useEffect(() => {
+    setVisibleCount(TIMELINE_PAGE_SIZE);
+  }, [filter, selectedAttemptId, events.length]);
+
+  useEffect(() => {
+    if (!highlightedEventId) return;
+    if (filter !== 'all') {
+      setFilter('all');
+    }
+
+    const eventIndex = events.findIndex((event) => event.id === highlightedEventId);
+    if (eventIndex >= visibleCount) {
+      setVisibleCount(Math.max(TIMELINE_PAGE_SIZE, eventIndex + 1));
+    }
+  }, [events, filter, highlightedEventId, visibleCount]);
+
+  useEffect(() => {
+    if (!highlightedEventId) return;
+    const highlightedElement = highlightedEventRef.current;
+    if (typeof highlightedElement?.scrollIntoView !== 'function') return;
+    highlightedElement.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [highlightedEventId, visibleEvents.length]);
+
+  return (
+    <Stack gap="md">
+      {selectedAttemptId && (
+        <RunAccessPanel
+          taskId={task.id}
+          attemptId={selectedAttemptId}
+          live={hasLiveAttempt && selectedAttemptId === task.attempt?.id}
+        />
+      )}
+      {phase && (
+        <Paper withBorder p="md" radius="md">
+          <Stack gap="sm">
+            <Group justify="space-between" align="flex-start">
+              <div>
+                <Group gap="xs">
+                  <ShieldCheck className="h-4 w-4" />
+                  <Text fw={700}>Effective phase authority</Text>
+                  <Badge color={phase.effectiveEvidence.status === 'blocked' ? 'red' : 'blue'}>
+                    {phaseIdentity?.mode === 'profile' ? phaseIdentity.phase : 'legacy'}
+                  </Badge>
+                </Group>
+                <Text size="xs" c="dimmed" mt={4}>
+                  Sequence {phase.transitionSequence} · evidence{' '}
+                  {phase.effectiveEvidence.digest.slice(0, 19)}
+                </Text>
+              </div>
+              {phase.current?.emergencyOverride && (
+                <Badge color="red" variant="light">
+                  Override until{' '}
+                  {new Date(phase.current.emergencyOverride.expiresAt).toLocaleString()}
+                </Badge>
+              )}
+            </Group>
+            <Group gap="xs" wrap="wrap">
+              {phase.launch.sourceReferences.map((reference) => (
+                <Badge key={`${reference.kind}:${reference.sourceDigest}`} variant="outline">
+                  {phaseSourceLabel(reference.kind)}: {reference.originScope}
+                </Badge>
+              ))}
+            </Group>
+            {phase.effectiveEvidence.blockers.map((blocker) => (
+              <Text key={`${blocker.code}:${blocker.dimension ?? ''}`} size="sm" c="red">
+                {blocker.code}: {blocker.message}
+              </Text>
+            ))}
+            {phase.history.length > 0 && (
+              <Stack gap={4}>
+                <Text size="sm" fw={600}>
+                  Transition history
+                </Text>
+                {phase.history.slice(0, 8).map((transition) => (
+                  <Text key={transition.id} size="xs" c="dimmed">
+                    #{transition.sequence} {transition.policyDecision} by{' '}
+                    {transition.actor.label ?? transition.actor.id}: {transition.reason}
+                  </Text>
+                ))}
+              </Stack>
+            )}
+          </Stack>
+        </Paper>
+      )}
+      {pendingTaskApprovals.map((approval) => (
+        <Paper key={approval.id} withBorder p="md" radius="md">
+          <Stack gap="xs">
+            <Group justify="space-between" align="flex-start">
+              <div>
+                <Text fw={700}>{approval.action}</Text>
+                <Text size="sm" c="dimmed">
+                  {approval.details ||
+                    `${approval.provider} requested ${approval.actionClass} approval.`}
+                </Text>
+              </div>
+              <Badge color={approval.riskClass === 'critical' ? 'red' : 'orange'} variant="light">
+                {approval.riskClass} risk
+              </Badge>
+            </Group>
+            <Text size="xs" c="dimmed">
+              Bound action {approval.actionHash.slice(0, 12)} · expires{' '}
+              {new Date(approval.expiresAt).toLocaleString()}
+            </Text>
+            {approval.phase && (
+              <Text size="xs" c="dimmed">
+                Phase{' '}
+                {approval.phase.identity.mode === 'profile'
+                  ? approval.phase.identity.phase
+                  : 'legacy'}{' '}
+                · sequence {approval.phase.transitionSequence} ·{' '}
+                {approval.phase.requirements.map((requirement) => requirement.dimension).join(', ')}
+              </Text>
+            )}
+            <Group justify="flex-end">
+              <Button
+                color="red"
+                variant="light"
+                onClick={() => setPendingDecision({ approval, decision: 'rejected' })}
+              >
+                Reject
+              </Button>
+              <Button
+                color="green"
+                onClick={() => setPendingDecision({ approval, decision: 'approved' })}
+              >
+                Approve once
+              </Button>
+            </Group>
+          </Stack>
+        </Paper>
+      ))}
+      <Modal
+        compound
+        opened={pendingDecision !== null}
+        onClose={closeDecision}
+        title={pendingDecision?.decision === 'approved' ? 'Approve exact action' : 'Reject action'}
+        centered
+      >
+        {pendingDecision && (
+          <>
+            <Stack gap="md" className="vk-overlay-scroll [&>*]:shrink-0">
+              <Text fw={700}>{pendingDecision.approval.action}</Text>
+              <Text size="sm">{pendingDecision.approval.details || 'No additional details.'}</Text>
+              {pendingDecision.approval.workingDirectory && (
+                <Text size="sm">
+                  Working directory: <Code>{pendingDecision.approval.workingDirectory}</Code>
+                </Text>
+              )}
+              {pendingDecision.approval.resourceScope.length > 0 && (
+                <Stack gap={4}>
+                  <Text size="sm" fw={600}>
+                    Resource scope
+                  </Text>
+                  {pendingDecision.approval.resourceScope.map((resource) => (
+                    <Code key={resource} block>
+                      {resource}
+                    </Code>
+                  ))}
+                </Stack>
+              )}
+              {pendingDecision.approval.policyReason && (
+                <Text size="sm">Policy reason: {pendingDecision.approval.policyReason}</Text>
+              )}
+              {pendingDecision.approval.phase && (
+                <Text size="sm">
+                  Phase-bound authority: sequence{' '}
+                  {pendingDecision.approval.phase.transitionSequence},{' '}
+                  {pendingDecision.approval.phase.requirements
+                    .map(
+                      (requirement) =>
+                        `${requirement.dimension}=${requirement.requestedScopes.join('|')}`
+                    )
+                    .join(', ')}
+                </Text>
+              )}
+              <Code block>{pendingDecision.approval.actionHash}</Code>
+              {decisionError && (
+                <Text
+                  ref={decisionErrorRef}
+                  role="alert"
+                  tabIndex={-1}
+                  size="sm"
+                  c="red"
+                  className="shrink-0"
+                >
+                  {decisionError}
+                </Text>
+              )}
+            </Stack>
+            <OverlayFooter>
+              <UiAction variant="quiet" onClick={closeDecision} disabled={isDeciding}>
+                Cancel
+              </UiAction>
+              <UiAction
+                variant={pendingDecision.decision === 'approved' ? 'primary' : 'destructive'}
+                loading={isDeciding}
+                disabled={isDeciding}
+                onClick={confirmDecision}
+              >
+                Confirm {pendingDecision.decision === 'approved' ? 'approval' : 'rejection'}
+              </UiAction>
+            </OverlayFooter>
+          </>
+        )}
+      </Modal>
+      <Paper withBorder p="md" radius="md">
+        <Stack gap="sm">
+          <Group justify="space-between" align="flex-start" gap="md" wrap="nowrap">
+            <div className="min-w-0">
+              <Group gap="xs" wrap="wrap">
+                <ThemeIcon size="sm" radius="xl" variant="light">
+                  <History className="h-4 w-4" />
+                </ThemeIcon>
+                <Text fw={700}>Attempt Timeline</Text>
+                <Badge variant="outline">{selectedAttemptScope}</Badge>
+                <Badge color={SOURCE_COLORS[source]} variant="light">
+                  {source === 'live' ? 'Live' : source === 'stored' ? 'Stored replay' : 'Derived'}
+                </Badge>
+                {selectedTrace && (
+                  <Badge
+                    color={selectedTrace.status === 'failed' ? 'red' : 'gray'}
+                    variant="outline"
+                  >
+                    {selectedTrace.status}
+                  </Badge>
+                )}
+              </Group>
+              <Text size="sm" c="dimmed" mt={6}>
+                {selectedAttemptId || 'No attempt selected'} | {events.length} events
+                {selectedIsLiveAttempt ? ' | live polling' : ''}
+              </Text>
+            </div>
+            {isLoading && (
+              <Group gap="xs" className="shrink-0">
+                <Loader size="xs" />
+                <Text size="xs" c="dimmed">
+                  Loading
+                </Text>
+              </Group>
+            )}
+          </Group>
+
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+            <Select
+              label="Attempt"
+              aria-label="Attempt"
+              value={selectedAttemptId}
+              onChange={setSelectedAttemptId}
+              data={runOptions}
+              placeholder="Derived task timeline"
+              size="xs"
+              checkIconPosition="right"
+              disabled={runOptions.length === 0}
+            />
+            <Group gap="xs" align="flex-end">
+              <Button
+                size="compact-xs"
+                variant="light"
+                leftSection={<Bot className="h-3 w-3" />}
+                onClick={() => onOpenTab?.('agent')}
+              >
+                Agent
+              </Button>
+              {task.git?.worktreePath && (
+                <Button
+                  size="compact-xs"
+                  variant="subtle"
+                  leftSection={<FileDiff className="h-3 w-3" />}
+                  onClick={() => onOpenTab?.('changes')}
+                >
+                  Changes
+                </Button>
+              )}
+              <Button
+                size="compact-xs"
+                variant="subtle"
+                leftSection={<ClipboardCheck className="h-3 w-3" />}
+                onClick={() => onOpenTab?.('review')}
+              >
+                Review
+              </Button>
+              <Button
+                size="compact-xs"
+                variant="subtle"
+                leftSection={<FileText className="h-3 w-3" />}
+                onClick={() => onOpenTab?.('work-products')}
+              >
+                Work Products
+              </Button>
+            </Group>
+          </SimpleGrid>
+        </Stack>
+      </Paper>
+
+      <Paper withBorder p="md" radius="md">
+        <Stack gap="sm">
+          <Group gap="xs">
+            <ListFilter className="h-4 w-4 text-muted-foreground" />
+            <Text fw={600} size="sm">
+              Event Filters
+            </Text>
+          </Group>
+          <Group gap="xs">
+            <Button
+              size="compact-xs"
+              variant={filter === 'all' ? 'filled' : 'light'}
+              onClick={() => setFilter('all')}
+            >
+              All
+            </Button>
+            {EVENT_TYPES.map((type) => (
+              <Button
+                key={type}
+                size="compact-xs"
+                color={EVENT_COLORS[type]}
+                variant={filter === type ? 'filled' : 'light'}
+                onClick={() => setFilter(type)}
+              >
+                {typeFilterLabel(type)}
+              </Button>
+            ))}
+          </Group>
+        </Stack>
+      </Paper>
+
+      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="sm">
+        <Paper withBorder p="sm" radius="md">
+          <Group gap="xs" wrap="nowrap">
+            <Code2 className="h-4 w-4 text-muted-foreground" />
+            <div className="min-w-0">
+              <Text size="xs" c="dimmed">
+                Agent / model
+              </Text>
+              <Text size="sm" fw={600} truncate>
+                {selectedTrace?.agent || task.attempt?.agent || task.agent || 'Unassigned'}
+                {selectedTrace?.metadata?.model || task.attempt?.model
+                  ? ` / ${selectedTrace?.metadata?.model || task.attempt?.model}`
+                  : ''}
+              </Text>
+            </div>
+          </Group>
+        </Paper>
+        <Paper withBorder p="sm" radius="md">
+          <Group gap="xs" wrap="nowrap">
+            <GitBranch className="h-4 w-4 text-muted-foreground" />
+            <div className="min-w-0">
+              <Text size="xs" c="dimmed">
+                Branch / worktree
+              </Text>
+              <Text size="sm" fw={600} truncate>
+                {task.git?.branch || task.git?.baseBranch || 'Not configured'}
+              </Text>
+            </div>
+          </Group>
+        </Paper>
+        <Paper withBorder p="sm" radius="md">
+          <Group gap="xs" wrap="nowrap">
+            <KeyRound className="h-4 w-4 text-muted-foreground" />
+            <div className="min-w-0">
+              <Text size="xs" c="dimmed">
+                Policy / capabilities
+              </Text>
+              <Text size="sm" fw={600} truncate>
+                {selectedTrace?.metadata?.policyProfile || task.runMode || 'Default'}
+              </Text>
+            </div>
+          </Group>
+        </Paper>
+      </SimpleGrid>
+
+      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="sm">
+        <Paper withBorder p="sm" radius="md">
+          <Group gap="xs" wrap="nowrap">
+            <ClipboardCheck className="h-4 w-4 text-muted-foreground" />
+            <div className="min-w-0">
+              <Text size="xs" c="dimmed">
+                Result
+              </Text>
+              <Group gap="xs" wrap="nowrap">
+                <Badge size="xs" color={runStatusColor(runSummary.status)} variant="light">
+                  {formatRunStatus(runSummary.status)}
+                </Badge>
+                <Text size="sm" fw={600} truncate>
+                  {runSummary.finalResult || 'No final result recorded'}
+                </Text>
+              </Group>
+            </div>
+          </Group>
+        </Paper>
+        <Paper withBorder p="sm" radius="md">
+          <Group gap="xs" wrap="nowrap">
+            <Timer className="h-4 w-4 text-muted-foreground" />
+            <div className="min-w-0">
+              <Text size="xs" c="dimmed">
+                Duration
+              </Text>
+              <Text size="sm" fw={600} truncate>
+                {formatDurationMs(runSummary.durationMs)}
+              </Text>
+            </div>
+          </Group>
+        </Paper>
+        <Paper withBorder p="sm" radius="md">
+          <Group gap="xs" wrap="nowrap">
+            <Terminal className="h-4 w-4 text-muted-foreground" />
+            <div className="min-w-0">
+              <Text size="xs" c="dimmed">
+                Usage / cost
+              </Text>
+              <Text size="sm" fw={600} truncate>
+                {formatTokenCount(runSummary.totalTokens)} / {formatCost(runSummary.cost)}
+              </Text>
+            </div>
+          </Group>
+        </Paper>
+      </SimpleGrid>
+
+      {linkedWorkProducts.length > 0 && (
+        <Paper withBorder p="md" radius="md">
+          <Stack gap="xs">
+            <Group gap="xs">
+              <FileText className="h-4 w-4 text-muted-foreground" />
+              <Text fw={600} size="sm">
+                Linked Work Products
+              </Text>
+              <Badge variant="light">{linkedWorkProducts.length}</Badge>
+            </Group>
+            {linkedWorkProducts.slice(0, 4).map((product) => (
+              <Group key={product.id} gap="xs" wrap="nowrap">
+                <FileText className="h-3 w-3 shrink-0 text-muted-foreground" />
+                <Text size="sm" truncate className="min-w-0">
+                  {product.title}
+                </Text>
+                <Badge size="xs" variant="outline">
+                  v{product.version}
+                </Badge>
+              </Group>
+            ))}
+          </Stack>
+        </Paper>
+      )}
+
+      {fileProvenance && (fileProvenance.records.length > 0 || fileProvenance.gaps.length > 0) && (
+        <Paper withBorder p="md" radius="md">
+          <Stack gap="xs">
+            <Group gap="xs">
+              <GitBranch className="h-4 w-4 text-muted-foreground" />
+              <Text fw={600} size="sm">
+                File Provenance
+              </Text>
+              <Badge variant="light">{fileProvenance.records.length}</Badge>
+            </Group>
+            {fileProvenance.records.slice(0, 4).map((record) => (
+              <Group key={record.id} gap="xs" wrap="nowrap" align="flex-start">
+                <FileText className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground" />
+                <div className="min-w-0">
+                  <Text size="sm" truncate>
+                    {record.location.root}/{record.location.relativePath}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    {record.source} · {record.operation} · {record.content.sha256.slice(0, 19)}
+                  </Text>
+                </div>
+              </Group>
+            ))}
+            {fileProvenance.gaps.slice(0, 3).map((gap, index) => (
+              <Group key={`${gap.code}:${gap.eventId ?? index}`} gap="xs" wrap="nowrap">
+                <AlertTriangle className="h-3 w-3 shrink-0 text-yellow-600" />
+                <Text size="xs" c="yellow">
+                  {gap.code}: {gap.message}
+                </Text>
+              </Group>
+            ))}
+          </Stack>
+        </Paper>
+      )}
+
+      <ScrollArea.Autosize mah={520} type="auto">
+        <Stack gap="xs" pr="xs">
+          {visibleEvents.length > 0 ? (
+            visibleEvents.map((event) => {
+              const highlighted = event.id === highlightedEventId;
+              return (
+                <div
+                  key={event.id}
+                  ref={highlighted ? highlightedEventRef : undefined}
+                  data-testid={highlighted ? 'highlighted-timeline-event' : undefined}
+                >
+                  <EventRow
+                    event={event}
+                    highlighted={highlighted}
+                    onOpenTab={onOpenTab}
+                    onOpenWorkflow={onOpenWorkflow}
+                    onPreviewArtifact={(productId, version) =>
+                      setPreviewArtifact({ productId, version, title: event.title })
+                    }
+                  />
+                </div>
+              );
+            })
+          ) : (
+            <Paper withBorder p="md" radius="md">
+              <Group gap="xs">
+                <Play className="h-4 w-4 text-muted-foreground" />
+                <Text size="sm" c="dimmed">
+                  No timeline events match this run and filter.
+                </Text>
+              </Group>
+            </Paper>
+          )}
+          {filteredEvents.length > TIMELINE_PAGE_SIZE && (
+            <Paper withBorder p="sm" radius="md">
+              <Group justify="space-between" gap="sm">
+                <Text size="xs" c="dimmed">
+                  Showing {visibleEvents.length} of {filteredEvents.length} filtered events.
+                </Text>
+                {canLoadMore && (
+                  <Button
+                    size="compact-xs"
+                    variant="subtle"
+                    onClick={() =>
+                      setVisibleCount((count) =>
+                        Math.min(count + TIMELINE_PAGE_SIZE, filteredEvents.length)
+                      )
+                    }
+                  >
+                    Load{' '}
+                    {Math.min(TIMELINE_PAGE_SIZE, filteredEvents.length - visibleEvents.length)}{' '}
+                    more
+                  </Button>
+                )}
+              </Group>
+            </Paper>
+          )}
+        </Stack>
+      </ScrollArea.Autosize>
+
+      <ArtifactPreviewModal
+        opened={Boolean(previewArtifact)}
+        productId={previewArtifact?.productId ?? null}
+        version={previewArtifact?.version}
+        title={previewArtifact?.title}
+        onClose={() => setPreviewArtifact(null)}
+      />
+    </Stack>
+  );
+}

@@ -1,0 +1,2822 @@
+# Changelog
+
+All notable changes to Veritas Kanban are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [6.2.1] - 2026-09-10
+
+### Fixed
+
+- Added server-owned native OpenClaw completion through authenticated gateway terminal replies. Launch readiness, persisted run bindings, restart observation, and idempotent completion replace unauthenticated child callbacks; native tasks require OpenClaw v2026.9.2 or later (#1587).
+
+- Restored Docker builds by moving browser/desktop command contracts into the shared package. The web build no longer depends on desktop source or test-only Node type declarations (#1578).
+
+### Changed
+
+- Updated Electron, Mantine, the Codex SDK, and related runtime libraries from the dependency refresh in #1547.
+
+### Security
+
+- Updated transitive Hono and js-yaml dependencies to patched versions for the four September dependency advisories.
+
+### Compatibility
+
+- All maintained packages move together to 6.2.1. Existing command payloads, REST API v1, and stored data remain compatible; no database migration is required.
+
+## [6.2.0] - 2026-09-07
+
+Veritas Kanban 6.2.0 improves Settings persistence, keyboard and native macOS interactions, and large-board behavior.
+
+### Changed
+
+- Made macOS Settings a reusable window with shared settings content, synchronized changes, and a pending-save check before quitting. Browser Settings remains a modal (#1525, #1542).
+- Added permission-aware Settings search and direct control links; added System appearance alongside Light and Dark; compacted secondary board filters on narrow screens (#1539–#1541).
+- Loaded compact card records and rendered a measured window for large columns. Full task details load on demand, full-text search remains available, and dependency checks share one index (#1537).
+- Updated SQLite notifications by affected row and moved filtering and pagination into repository queries. Extracted recovery scheduling, reconciliation and monitoring into one coordinator (#1536, #1543).
+
+### Fixed
+
+- Connected native menu commands to renderer actions, restored standard macOS menu commands, kept restored windows on available displays, and honored the title-bar double-click preference (#1524, #1529–#1531).
+- Preserved pending Settings edits across section changes and closing; retained failed saves for retry and waited for persistence before confirming an import (#1525).
+- Kept modified keys and IME composition out of board letter shortcuts. Keyboard selection follows visible order, brings tasks into view, and uses help derived from configured columns (#1526, #1533, #1534).
+- Corrected primary-action, filter and code-token contrast; separated browser onboarding from native desktop diagnostics (#1532, #1535).
+- Rejected empty or ambiguous task identifiers in CLI/MCP mutations; bounded API waits and retained structured errors. File notification writes preserve recoverable state and report malformed or unreadable data (#1527, #1528, #1538).
+- Kept authenticated context reads out of login throttling, prevented mixed legacy SQLite file families during migration, and preserved an open task when compact chat closes (#1571).
+
+### Security
+
+- Aligned permission overrides with route matching, protected managed attempt authority during task edits, bounded routing preview counts, and rejected redirected desktop verification requests (#1556–#1559).
+
+### Compatibility
+
+- All maintained package versions move together to 6.2.0. REST API `v1` and existing full-task/summary clients remain compatible. This release adds no database migration.
+- Existing explicit Light/Dark choices are retained. System appearance is an additional preference. Failed Settings writes need an explicit retry; closing the macOS Settings window keeps its pending edits alive.
+- CLI/MCP task suffixes must identify exactly one task. Use the complete task ID when several matches exist.
+
+## [6.1.7] - 2026-09-04
+
+Veritas Kanban 6.1.7 corrects desktop and compact-window layout, popout interactions, and task-editing failures found during the broader UI audit.
+
+### Changed
+
+- Standardized page headings, action controls, Settings navigation, popout padding, and dialog sizing. Settings units now stay inside uniformly sized fields, and policy action labels remain readable (#1391-#1395, #1405, #1406, #1454).
+- Removed bottom Workbench docking. Board, Squad, and Task Chat share a consistent surface, while compact layouts collapse sidebars and adapt Chat without discarding drafts (#1390, #1397, #1422, #1466).
+- Made PDF work products download-only through the authorized artifact path. The app no longer attempts inline PDF rendering or automatically opens a downloaded file (#1448, #1449, #1458).
+- Require candidate-bound native and documentation-media evidence before release upload. Reviewed media can be published unchanged in a later documentation-only commit; application changes require a fresh build and capture (#1387, #1388, #1456, #1489).
+
+### Fixed
+
+- Kept Create Task, template application, previews, conflict resolution, Settings, workflow, approval, Git, and review popouts in control while requests settle. Drafts and errors remain available for safe retries, partial blueprint creation cannot be blindly repeated, and visible controls regain focus after dismissal or responsive layout changes (#1383, #1424, #1436, #1444, #1445, #1503, #1505, #1507).
+- Prevented stale close cleanup from removing a rapidly reopened task workspace, and removed unintended reduced-motion layout transitions that changed footer geometry during resizing (#1482, #1490).
+- Contained mobile Board, Activity rows, tooltips, and enlarged-text navigation; kept status menus and Chat controls clear of task content (#1462, #1463, #1465, #1476, #1479).
+- Preserved template task fields, supported critical priority consistently in task creation, retained optional-field clearing, and protected configured workspace run budgets (#1410, #1419, #1429, #1431).
+- Drained active HTTP requests before disposing server storage during desktop shutdown (#1473).
+
+### Compatibility
+
+- All maintained packages move together to 6.1.7. The public REST API remains `v1`, with no new database migration; valid 6.1.6 workspaces remain compatible.
+- Legacy bottom-dock preferences resolve to supported Chat placement. PDF files remain downloadable deliverables and can be opened manually in the system viewer.
+
+## [6.1.6] - 2026-09-03
+
+Veritas Kanban 6.1.6 is a focused desktop reliability and interface consistency release based on issues found while exercising the compiled 6.1.5 macOS app.
+
+### Changed
+
+- Removed the redundant desktop wordmark while keeping the Veritas icon, aligned the Settings title and close control, and redesigned Command+K for clearer search, result hierarchy, selection, and keyboard guidance (#1362-#1364, #1370-#1372).
+- Standardized primary action sizing and purple treatment across feature pages, made the selected sidebar icon and label white on the brighter primary background, and aligned New Template with other page actions (#1366, #1369).
+- Refreshed maintained screenshots, desktop and mobile GIFs, social previews, and the demo video from a public-safe 6.1.6 workspace (#1374).
+
+### Fixed
+
+- Contained the app shell during chat-dock and drag interactions so the renderer no longer leaves a large blank region below the desktop UI (#1361, #1367).
+- Refreshed and retained the latest task revision after board mutations so consecutive valid card moves no longer fail as stale (#1365, #1368).
+
+### Security and compatibility
+
+- Updated patched transitive releases for `qs`, `@xmldom/xmldom`, and `postcss-selector-parser`; production and complete dependency audits report no known vulnerabilities (#1360, #1373).
+- The public REST API remains `v1`, and 6.1.6 adds no SQLite migration. Valid 6.1.5 workspaces remain compatible.
+- All maintained packages move together to 6.1.6. The macOS application bundles the matching server and web renderer and publishes through the signed/notarized arm64 channel.
+
+## [6.1.5] - 2026-09-03
+
+Veritas Kanban 6.1.5 publishes the integrated backlog completed after the
+6.1.4 security patch, including the redesigned Settings and task workspaces,
+board reliability and interaction fixes, dependency updates, and a public
+documentation boundary.
+
+### Added
+
+- Replaced thirteen peer task-detail tabs with progressive Overview, Plan,
+  Run, Results, and History modes, state-aware next actions, consolidated
+  status hierarchy, focused diagnostics, and an expanded workspace (#1299,
+  #1342-#1349).
+
+### Changed
+
+- Grouped all twenty Settings destinations by workflow and migrated every page
+  to shared page, section, row, field-grid, status, navigation, and danger-zone
+  contracts (#1297, #1321, #1323, #1325, #1327, #1329, #1331, #1333).
+- Improved Command+K viewport containment, scrolling, result density, keyboard
+  navigation, and focus recovery (#1295, #1318).
+- Replaced generic board edge highlighting with a semantic color language that
+  remains legible across themes, interaction states, and compact layouts
+  (#1301, #1319).
+- Aligned CodeQL action pins, refreshed the compatible production dependency
+  set, and upgraded the desktop runtime to Electron 44 (#1303-#1306,
+  #1311-#1313).
+- Separated public product, operator, contributor, architecture, release,
+  runtime, and test documentation from internal prompts, audits, handoffs, and
+  working notes. CI now classifies every tracked Markdown file and validates
+  local links (#1350, #1353-#1355).
+- Refreshed the maintained screenshots, desktop and mobile GIFs, social preview,
+  and demo video from an isolated public-safe 6.1.5 workspace. The complete
+  media set is reproducible with `pnpm docs:capture-media`.
+- Polished the native About panel with a concise build identity, familiar Mac
+  architecture naming, the project URL, and an explicit MIT license notice.
+
+### Fixed
+
+- Made cross-column task moves atomic across status and ordering persistence,
+  with rollback and authoritative reconciliation after partial failure (#1302,
+  #1314).
+- Deduplicated task-conflict notifications while preserving distinct conflicts
+  and adding task, action, revision, and recovery context (#1300, #1315).
+- Classified memory pressure against real process and host limits instead of
+  ordinary V8 heap reservation (#1298, #1316).
+- Made active Board Chat and Squad Chat header controls true toggles while
+  preserving switching, keyboard, compact-layout, and restored-state behavior
+  (#1296, #1317).
+- Isolated concurrent health-probe storage checks so simultaneous requests
+  cannot collide on the same temporary path and report a false failure (#1351,
+  #1352).
+
+### Security and compatibility
+
+- Retains the repository-publication boundary shipped in 6.1.4 and the patched
+  `fast-uri` 3.1.6 override.
+- The public REST API remains `v1`, and 6.1.5 adds no SQLite migration. Valid
+  6.1.4 workspaces remain compatible.
+- All maintained packages move together to 6.1.5. The macOS application bundles
+  the matching server and web renderer and publishes through the existing
+  signed/notarized arm64 channel.
+
+## [6.1.4] - 2026-09-02
+
+Veritas Kanban 6.1.4 is a focused security release that binds repository
+publication to the managed task worktree and its captured Git state.
+
+### Security
+
+- Validated task and pull-request branch inputs as canonical Git branch names.
+- Bound pull-request lookup, push, creation, and readback to the configured
+  repository, captured commit, exact head and base branches, and verified
+  origin.
+- Isolated publication transport from repository-controlled Git configuration
+  and rejected missing, stale, or mismatched publication authority.
+- Updated the `fast-uri` security override to patched version 3.1.6.
+
+## [6.1.3] - 2026-08-30
+
+Veritas Kanban 6.1.3 adds governed file artifacts, provenance-aware execution,
+operator Run Access controls, and recurring automation activation. It also
+closes the August Apple-design audit and hardens concurrent storage and provider
+teardown paths.
+
+### Added
+
+- Added governed downloadable artifacts to versioned Work Products with exact
+  run, request, size, digest, media, quarantine, deletion, and storage evidence
+  across file and SQLite backends (#1247, #1270).
+- Added bounded passive previews for text, JSON, image, audio, video, PDF,
+  archive, and opaque-origin HTML content without granting bridge or execution
+  authority (#1250, #1254, #1278, #1285).
+- Added digest-bound run file provenance for repository, agent, command, tool,
+  attachment, connector, downloaded, operator-provided, and unknown bytes
+  (#1251, #1277).
+- Added an effective Run Access summary and governed active-run transitions with
+  exact evidence, critical approval for authority expansion, and durable
+  reversal (#1248, #1252, #1275, #1279).
+- Added deterministic recurring automation drafts and bounded standing-authority
+  activation with exact readiness, target, expiry, budget, approval, claim, and
+  audit evidence (#1249, #1253, #1276, #1280).
+- Added standard Window and Help menus to the macOS application shell (#1258,
+  #1273).
+
+### Changed
+
+- Run-owned terminal execution now binds executable, script, loader,
+  configuration, archive, and load-path inputs to exact launch-baseline or
+  provenance evidence. External or unknown bytes require a fresh critical human
+  decision and all evidence is revalidated immediately before spawn (#1255,
+  #1286).
+- Authentication, setup, and recovery errors now expose field relationships and
+  concise announcements without unexpected focus movement (#1256, #1271).
+- Secondary task, review, and archive actions reveal on keyboard focus, remain
+  available on coarse pointers, and expose target-specific accessible names
+  (#1257, #1272).
+- Shared primitives and high-frequency board, task, activity, template, and chat
+  surfaces now use explicit transition properties and stable running or unread
+  feedback with deliberate reduced-motion behavior (#1259, #1274).
+- Updated the pinned Node setup action and audited production dependencies while
+  preserving the supported Node floor and package-manager contract (#1245,
+  #1246).
+
+### Fixed
+
+- Completed every admission snapshot append before synchronization and
+  serialized admission reads with concurrent writers (#1281-#1284).
+- Contained detached ACP reply-write failures during teardown without masking
+  awaited transport errors (#1287, #1288).
+- Retried bounded regular-file replacements during atomic workflow-run updates
+  while continuing to reject symbolic links and persistently unstable paths
+  (#1289, #1290).
+- Stabilized desktop fallback-port, workflow-recovery, mobile responsive, and
+  browser-navigation release gates (#1261, #1263-#1269).
+- Preserved the diagnostics ampersand in the packaged macOS Help menu instead
+  of exposing Electron's mnemonic marker as an empty label gap (#1291, #1292).
+
+### Security and compatibility
+
+- The public REST API remains `v1`; new routes and schemas are additive.
+- SQLite migration 34 creates governed work-product artifact storage and
+  indexes. Rollback to 6.1.2 after migration requires restoring the complete
+  stopped-writer 6.1.2 backup.
+- Unsupported indirect file execution and uncertified tool transports remain
+  fail closed. HTML previews remain passive, sandboxed, and restricted by
+  content security policy.
+
+## [6.1.2] - 2026-08-24
+
+Veritas Kanban 6.1.2 completes the repository-wide reliability, security,
+storage, provider-runtime, CI, container, and supportability audit tracked in
+#1174. It is a backward-compatible patch release for 6.1.1.
+
+### Added
+
+- Added deterministic, milestone-scoped CI selection so ordinary pull requests
+  keep test, coverage, E2E, desktop artifact, load, and Docker-contract jobs
+  dormant while `ci:full`, scheduled, and manual release milestones run the
+  complete gates (#1172, #1227, #1228).
+- Added risk-weighted critical-path coverage baselines and ratchets for provider
+  dispatch, attempt lifecycle, authentication, storage, web API/session, CLI,
+  MCP, and desktop trust boundaries (#1169, #1183).
+- Added continuous CodeQL, dependency, and secret-scanning policy enforcement,
+  immutable GitHub Actions references, and repository guards that prevent those
+  controls from silently regressing (#1167, #1168, #1179, #1180).
+- Triaged the initial CodeQL baseline, fixed validated request, logging,
+  persisted-key, file-handling, and sandbox-read findings, and documented the
+  evidence-backed disposition of non-exploitable alerts (#1231, #1232-#1235).
+- Added a production Docker runtime size contract with architecture-specific
+  ceilings, non-root runtime checks, health/auth/SQLite/static-web smoke
+  coverage, and a reduced build context (#1166, #1222).
+
+### Changed
+
+- Centralized `DATA_DIR` and `VERITAS_DATA_DIR` resolution, legacy-location
+  discovery, migration, backup, integrity, and Docker-mounted runtime behavior
+  behind the canonical path contract (#1162, #1184).
+- Restored the service/storage boundary across activity, progress, status
+  history, scheduled deliverables, workflows, broadcasts, conflicts,
+  delegation, ceremony, error analyses, permissions, lifecycle configuration,
+  scheduler, reflection, chat, task, telemetry, and managed-content persistence.
+  File and SQLite implementations retain their existing compatibility,
+  containment, locking, and atomic-write contracts (#1163, #1190-#1220).
+- Decomposed the provider control path into explicit launch compilation, Codex
+  event interpretation, runtime resolution, completion, attempt mutation, and
+  adapter-registry contracts. Executable providers remain explicit and unknown
+  or mismatched profiles continue to fail closed without an OpenClaw fallback
+  (#1164, #1223-#1230).
+- Routed frontend JSON, blob, and stream operations through credential-aware API
+  helpers, preserving cross-origin cookie authentication, base paths, and
+  server error envelopes (#1165, #1218).
+- Removed four verified unused direct dependencies, regenerated the workspace
+  dependency graph with pnpm 11.1.1, and reduced the server lint-warning budget
+  from 600 to 458 without broad suppressions (#1170, #1173, #1217, #1221).
+- Replaced loader-fragile Vite/Vitest path handling with native ESM-compatible
+  configuration and made root workspace test discovery deterministic (#1171,
+  #1172, #1175, #1177, #1178, #1181).
+
+### Fixed
+
+- Eliminated split runtime-state locations and service-layer persistence leaks
+  that could send live data, backups, health checks, or migrations to different
+  roots under custom data-directory configurations (#1162, #1163).
+- Hardened request rate limits, structured logging, persisted dynamic keys,
+  bounded file reads and writes, and sandbox metadata reads identified by the
+  initial CodeQL baseline (#1231, #1232-#1235).
+- Integrated coordinated validation hardening for a privately reported input
+  boundary. The repository security advisory was published after supported
+  6.1.2 artifacts were verified and disclosure was approved (#1236,
+  [GHSA-4r99-qpvh-wrqf](https://github.com/BradGroux/veritas-kanban/security/advisories/GHSA-4r99-qpvh-wrqf)).
+- Corrected recovery-key alphabet generation and WebSocket upgrade header
+  forwarding defects exposed by the final release validation (#1238, #1239).
+- Serialized complete same-task update and lifecycle operations before their
+  first read, preserving archive/restore invocation order under contention
+  (#1240, #1241).
+- Rejected digit-prefixed unsafe URI payloads in sanitized HTML while
+  preserving safe relative links (#1242, #1243).
+
+### Compatibility and operations
+
+- The public REST API remains `v1`. Package, CLI, MCP, desktop, provider-profile,
+  and configuration contracts remain backward compatible with 6.1.1.
+- SQLite migrations remain at 30 through 33; upgrading from 6.1.1 does not run a
+  new schema migration. Runtime path normalization may move legacy files into
+  the configured canonical data directory. Keep a complete stopped-writer
+  backup until the upgraded runtime is accepted.
+- Rollback is restore-first: stop every writer, reinstall the prior signed
+  application only when its data contracts remain compatible, and otherwise
+  restore the complete pre-upgrade workspace. Never copy an older database over
+  a running instance.
+
+## [6.1.1] - 2026-08-22
+
+Veritas Kanban 6.1.1 restores reliable Task Detail scrolling after the Mantine
+tabs migration and completes a security-audited dependency maintenance pass.
+
+### Changed
+
+- Clarified that independent review is owner-directed and optional rather than
+  a default delivery SOP or release gate (#1156).
+- Updated supported runtime and development dependencies across the workspace,
+  including Chalk 6, and refreshed transitive security override floors so both
+  production and full dependency audits resolve without known vulnerabilities
+  (#1149, #1155).
+- Deferred jsdom major updates in Dependabot while the current major requires a
+  higher Node.js patch floor and breaks the Mantine-backed web test environment;
+  jsdom 29 patch updates remain enabled (#1148).
+
+### Fixed
+
+- Restored the shared overlay flex-column contract so long Task Detail content
+  remains height-constrained and scrollable. Added a Chromium regression that
+  verifies layout, overflow, and real wheel scrolling through the drawer
+  (#1153, #1154).
+- Prevented interactive controls inside task cards from activating the card,
+  restoring reliable touch status selection in WebKit after the Mantine 9.5
+  update. Status-move browser coverage now waits for the visible save contract
+  before closing Task Detail (#1156).
+- Made file-backed workflow operations wait for their storage directory to be
+  ready, eliminating a startup race that could return `ENOENT` when the first
+  workflow request arrived immediately after service construction (#1156).
+
+## [6.1.0] - 2026-07-26
+
+### Added
+
+- Added complete workspace knowledge collections: immutable classified sources, cited and versioned derived pages, reviewed ingestion dry runs, atomic apply and reversal, cited keyword/QMD search, query promotion, and cited work-product export. Run launch evidence now restricts every agent read and mutation to the exact shared source and page resources in the persisted manifest, isolates QMD projections by manifest digest, and binds promoted or exported search evidence to the same run. Confidential and restricted previews withhold content and force redacted exports even when the collection otherwise allows full output. File and SQLite storage preserve the same workspace, digest, attribution, idempotency, contradiction, graph, and activity contracts (#867).
+- Added launch-scoped deterministic integrity linting for knowledge collections. Stable, digest-bound findings detect structural graph errors, invalid schemas and metadata, provenance gaps, changed source hashes, invalid citation locations, configurable freshness violations, orphan pages, missing canonical terms, and unanswered research questions without retaining source text in findings (#868).
+- Added explicit material-claim lifecycle controls for knowledge collections. Compare-and-set transitions are versioned, actor-attributed, evidence-linked, digest-bound, idempotent, and reversible through page history. Agents can flag claims as needs-review or disputed while only administrators can finalize supersession, retraction, or resolution, so conflicting claims remain visible instead of being silently overwritten (#868).
+- Added durable knowledge-integrity operations across file and SQLite storage. Bounded cursor-resumable lint chunks persist idempotently by run identity; optional semantic candidates flag contradictions, near-duplicates, supersession, and evidence gaps with both sides' page, claim, and source identities. Findings retain owner, status, severity, acknowledgement, due date, remediation links, occurrence history, and compare-and-set transitions, while a launch-scoped health endpoint exposes last observation, overdue work, and actionable status for scheduled workflows and operators (#868).
+- Added preview-first, attributable workspace checkpoint rewind for run-owned worktrees. Immutable content-addressed checkpoints capture Git, index, files, exclusions, ownership, conversation cursors, exact provider hunk ranges where explicit unified diffs exist, bounded retention, and direct comparisons; conflict-aware previews support digest-bound per-path `accept`, `reject`, and `leave-untouched` decisions, while recoverable storage transactions mutate only selected paths and preserve descendant state on failure. The production control route now quiesces an exact active Codex app-server turn and forks an earlier approved turn into a new live provider thread, while ambiguous cursors, external edits, unsupported providers, stale runtime evidence, and unresolved non-attribution conflicts fail closed (#872).
+- Added durable execution-tree cancellation and a provider-neutral fan-out
+  circuit breaker. Operators can cancel one queued launch or an entire root
+  objective through REST, `vk admission`, and Operations; root cancellation is
+  recorded before descendants drain so late resume, retry, fallback,
+  workflow-step, and child-agent launches fail closed. The breaker evaluates
+  durable descendant count, depth, active and queued work, capacity pressure,
+  and aggregate budget pressure before every expansion, persists bounded
+  evidence across restart, and requires a safe operator resume before the tree
+  can grow again (#1055).
+- Routed scheduled workflows, watcher continuations, conversation resume and
+  follow-up, retries, fallbacks, provider handoffs, recovery, and child-agent
+  starts through the same durable admission and queue contract used by direct
+  tasks and workflow steps. Every source preserves its causal execution-tree
+  identity, revalidates immutable launch evidence before dispatch, and rejects
+  hidden adapter-owned queues or bypass launches (#1054).
+- Added one bounded durable admission queue shared by direct tasks and
+  workflows. Atomic dequeue claims both a queue lease and capacity; restart
+  recovery expires abandoned claims without duplicate dispatch. The scheduler
+  combines explicit priority, capped age promotion, workspace fairness, and
+  deterministic tie-breaking while retaining redacted conditional selection
+  evidence. REST, `vk admission`, and Operations expose queue health,
+  readiness, limiting scopes, age, priority, and safe cancellation with file
+  and SQLite parity (#1053).
+- Added versioned execution-tree identities and aggregate budget reservations
+  to direct attempts, conversation continuations, retries, fallbacks, provider
+  handoffs, child agents, workflow roots, and workflow steps. Capacity and the
+  strictest applicable workspace, agent, workflow, run, and root-objective
+  budgets are now claimed atomically through the same file lock or SQLite
+  transaction. Idempotent usage events convert reservations into attributable
+  committed input/output/total tokens, cost, tool calls, runtime, idle time,
+  retries, and fan-out without counting descendant totals again. Terminal
+  release preserves committed usage and returns unused reservations. REST and
+  `vk admission tree` expose bounded totals, remaining policy capacity,
+  contributors, and the exact blocking policies (#1052).
+- Routed workflow roots and every provider-backed workflow step through the
+  durable admission controller. A root now reserves `workflow-control`
+  capacity before the run becomes active, while each executable step reserves
+  against its resolved provider and selected host before step-attempt
+  mutation or adapter dispatch. Retry and fallback attempts use new child
+  reservations only after the prior reservation releases. Terminal,
+  cancellation, and restart-reconciliation paths release idempotently, and
+  restart recovery reclaims only the exact persisted root binding. Workflow
+  run, step, and root-reservation filters are available through REST and
+  `vk admission`; file and SQLite storage preserve the same inspection
+  contract (#1051).
+- Added durable admission reservations for every direct agent task launch. File
+  and SQLite backends atomically enforce one active run per task plus optional
+  global, workspace, root-task, provider, and host ceilings for run slots,
+  process slots, and operator-estimated memory. Versioned decisions distinguish
+  retryable overload from terminal policy denial before attempt persistence or
+  provider dispatch. Lease recovery is bound to verified live supervisors,
+  terminal paths release idempotently, and file heartbeat history compacts
+  atomically. Operators can inspect active and recent reservations through
+  read-scoped REST and `vk admission` JSON commands (#1050).
+- Added a first-class workflow definition browser with deep-linked view, edit, and duplicate routes. Definition detail now exposes agents, ordered steps, phases, inputs, acceptance criteria, gates, loops, parallel branches, outputs, and provenance before execution. Server-owned access evidence distinguishes user-owned, shared, and built-in workflows; read-only definitions explain the restriction and offer duplication when permitted. User-owned edits save through Author with version-bound conflict protection that preserves the draft on failure. Starting a run is now a separate configuration step for optional task association and JSON context (#940).
+- Enforced active phase authority across run tool discovery, mediated
+  invocation, approvals, completion evidence, REST, CLI, and the task run
+  timeline. MCP `readOnlyHint` annotations now classify external reads while
+  unannotated tools fail closed as mutations; disallowed tools and credentials
+  stay out of launch catalogs, and hidden or stale calls are rejected against
+  the current transition evidence before dispatch. Approval decisions cannot
+  outlive or widen their bound phase, and completion records identify the
+  effective phase plus every authority-expanding transition. Redacted support
+  bundles include bounded phase identities, authority counts, source kinds,
+  transition expansions, and completion bindings without exporting exact
+  paths, credentials, or full digests. ACP stdio exposes the required
+  pre-execution mediation; adapters without equivalent command and
+  external-action controls return typed blockers for explicit phases. Legacy
+  attempts remain readable without invented transition state (#1033).
+- Propagated immutable phase authority through task previews and starts,
+  workflow steps, retries and fallbacks, provider changes, conversation resume,
+  follow-up and fork operations, and active-run controls. Every executable
+  entry now resolves the exact parent launch or current transition evidence
+  before attempt mutation, persists the compiled phase digest and source
+  references, intersects descendants monotonically, and returns typed blockers
+  when the selected sandbox, runtime, host, or tool policy cannot enforce a
+  required phase dimension. Legacy launches remain explicit and readable
+  without inventing restrictions (#1036).
+- Added the append-only `phase-transition-record/v1` journal for active runs.
+  Every transition is bound to the exact attempt, prior sequence, compiled
+  phase evidence, and launch-manifest digest. Narrowing transitions apply
+  immediately, while authority expansion uses the existing exact-action
+  approval broker. Administrators can apply an auditable emergency expansion
+  for at most 24 hours; expiry durably restores the prior evidence. File and
+  SQLite repositories preserve restart recovery and idempotency, and new REST
+  and CLI controls expose current state, history, transitions, and approval
+  decisions (#1035).
+- Added the provider-neutral `phase-capability-profile/v1` foundation with
+  strict schemas and built-in explore, plan, implement, verify, and publish
+  profiles. A pure compiler now intersects phase requests with parent, agent,
+  sandbox, tool-catalog, and launch-policy authority without ever widening a
+  scope. Required unsupported or unenforceable dimensions return typed
+  fail-closed blockers, legacy launches are explicit, and the optional plan
+  artifact is restricted to one normalized harness-owned exact path that
+  cannot grant general filesystem or indirect shell-write authority (#1034).
+- Added a provider-neutral workspace execution trust gate that scans the exact
+  task worktree for repository-controlled agent instructions, provider
+  configuration, MCP servers, hooks, language-server settings, workflows,
+  extensions, skills, and agent definitions before launch. Stable identity
+  combines canonical worktree, repository, Git common-directory, and
+  credential-redacted remote evidence so sibling, nested, moved, and linked
+  worktrees cannot borrow authorization. Append-only trusted, restricted,
+  denied, revoked, and expiring decisions bind to an exact inventory digest;
+  project policy can only narrow them. Executable configuration requires
+  explicit authorization, while model-only instructions can run provisionally
+  only under enforced read-only, no-network, credential-free restricted
+  controls. The immutable launch manifest records redacted inventory and
+  decision evidence, and a final pre-spawn rescan blocks any drift. Added
+  administrator REST and CLI scan, decide, and revoke controls (#878).
+- Added run-scoped filesystem sandbox enforcement for local ACP, Claude Code,
+  Codex app-server, Codex CLI, and Hermes processes. Required presets compile
+  explicit read, write, deny, dotfile, protected-metadata, temporary, and cache
+  rules into a version-bound `codex sandbox` wrapper before provider creation.
+  Workspace and home aliases fail closed on traversal or symlink escape, and
+  nested mount boundaries and pre-existing external hard-link aliases are
+  denied and rechecked before spawn. Failed or byte-changed backends block
+  launch. CLI package/virtual-environment roots, linked-worktree Git metadata,
+  and `.git`, `.agents`, `.codex`, and `.veritas-kanban` directly beneath
+  writable roots are bound read-only, while protected paths cannot themselves
+  be writable roots or symlinks. Ambient Git config is replaced with a
+  run-scoped identity-only environment. Immutable manifests retain only
+  canonical path hashes, the exact provider-runtime digest, backend
+  executable-content and conformance evidence, and durable cleanup state.
+  Local native and wrapped runs receive supervisor-owned temporary and cache
+  directories, while remote native enforcement must prove every active
+  filesystem and lifecycle capability. Cleanup rejects symlinked ancestors
+  (#862).
+- Added one durable `run-recovery/v1` state machine for production task
+  attempts and workflow steps. Only classified transient transport, provider
+  availability, rate-limit, timeout, and verification failures retry; policy,
+  configuration, cancellation, destructive partial-side-effect, and unknown
+  failures fail closed or require operator review. Recovery records preserve
+  causal parents, exponential jittered backoff, selected routes, launch
+  manifest digests, and cumulative budgets; compatible fallbacks are probed
+  through runtime capability and sandbox gates before launch. Pending recovery
+  survives restart, duplicate terminal callbacks cannot create multiple
+  branches, and exact task recovery can be cancelled through REST, CLI, or MCP
+  controls. Workflow recovery exposes the same exact-parent cancellation
+  through REST (#861).
+
+### Changed
+
+- Aligned contributor verification with the sustainable delivery cadence: each change now gets one risk-proportional review, focused checks for the affected product boundary, and runtime smoke tests only when runtime behavior changes. Complete workspace build, typecheck, test, security, integration, E2E, and artifact gates remain milestone-only, while the dependency-free cadence checker now rejects the retired per-commit multi-review, per-merge broad-gate, and unconditional browser-smoke language if it returns. Cadence checker changes are verified inside the CI scope-control job and no longer trigger an unrelated workspace unit suite (#1048).
+- Standardized focused Vitest verification on direct
+  `pnpm --filter <package> exec vitest run <exact-test-files>` invocation. The
+  dependency-free delivery cadence checker now rejects active guidance that
+  presents either of the ambiguous package `test -- <test-files>` or
+  `test -- --run <test-files>` wrappers as focused verification, preventing
+  an intended file slice from silently expanding into an entire package suite
+  (#1044, #1058).
+- Reworked GitHub release notes to use natural page-width prose and concise
+  lists instead of ragged hanging-indent blocks or unmarked stacks of bold-led
+  paragraphs. The release-format gate now rejects long wrapping list items,
+  nested headings, bold-led prose items, and consecutive sentence-sized blocks
+  in v6.0.2 and later release bodies (#1025).
+
+### Fixed
+
+- Completed append-only admission snapshot writes before sync so a short
+  `FileHandle.write()` cannot leave a truncated JSONL record that makes durable
+  reservation state unreadable (#1139).
+- Restored the complete `node:fs/promises` surface in filesystem test doubles
+  after centralized storage added `lstat`, clearing collateral concurrent-suite
+  failures without weakening production path checks (#1136).
+- Mapped the exact knowledge-collection router prefix to shared work-product
+  read/write permissions, restoring fail-closed client/server permission
+  coverage parity (#1141).
+- Updated the CLI native-fork regression coverage to validate the required
+  generated idempotency key before comparing the stable request payload,
+  clearing the release-branch related-test gate (#1143).
+- Separated live MCP-to-HTTP task and sprint integration groups from the
+  server-independent unit suite so focused CI no longer attempts localhost API
+  calls without a running server (#1144).
+
+## [6.0.2] - 2026-07-24
+
+Veritas Kanban 6.0.2 is a desktop recovery and supportability hotfix. It keeps
+Chat contained within a reversible Workbench dock, adds authoritative native
+version/build information, and makes CI verification proportional to the
+change while retaining full release gates.
+
+### Changed
+
+- Made CI test scope deterministic and path-aware. Documentation-only changes
+  skip workspace suites, ordinary code changes run Vitest related coverage for
+  affected packages, and CI, manifest, shared, storage, or desktop changes
+  conservatively select the full gate. A successful reviewed full-suite head is
+  reused after merge only when it is an ancestor of the merge commit, avoiding
+  a duplicate full run while scheduled and explicit release gates remain
+  authoritative. Dual-storage parity now invokes its exact Vitest file instead
+  of expanding through the package test wrapper, and job summaries retain exact
+  range and selection evidence (#1000).
+
+### Fixed
+
+- Updated QMD query scoping to pass one documented `-c` flag per collection.
+  Current QMD versions silently ignore the former unknown `--collections`
+  argument, which could broaden a supposedly scoped search (#867).
+- Replaced the desktop-only bottom Chat surface with a bounded dock that opens on
+  the right by default and can switch between Right and Bottom without remounting
+  the active conversation. Both dimensions are clamped against the live viewport,
+  chat scrolling cannot move the application shell, wheel input cannot resize the
+  dock, and Close, Escape, Back, or Reset Layout always preserve a visible board
+  and restore focus (#1004).
+- Added a native **About Veritas Kanban** panel and offline **Copy Version
+  Information** action using Electron's authoritative application version. The
+  same record now reports the embedded release commit, stable/beta/development
+  channel, OS, and architecture through About, clipboard support text, the
+  desktop bridge, and updater fallback without depending on the renderer or
+  network (#1005).
+
+## [6.0.1] - 2026-07-24
+
+Veritas Kanban 6.0.1 is the first supported stable v6 release. It supersedes
+the quarantined 6.0.0 prerelease after closing the post-publication desktop and
+workflow stabilization backlog tracked in #924.
+
+### Fixed
+
+- Kept desktop Chat in a bounded, reversible workbench panel; Escape and browser
+  Back now close it, obsolete persisted panel visibility is discarded, compact
+  window heights preserve the application shell, and the native Navigate menu
+  can reset layout state without deleting application data (#945).
+- Normalized omitted workflow and run collections in the task Workflow action,
+  preventing undefined length crashes and providing a recoverable load error
+  with Retry instead of replacing the task surface with an error boundary
+  (#936).
+- Made **New Profile** open a focused, validated scoring draft from both Profiles
+  and Score Explorer, with cancel returning to the originating tab without
+  creating an orphan profile (#943).
+- Let Archive cards grow with expanded content, clamp collapsed text by whole
+  lines with accessible full text, wrap long metadata safely, and keep Restore
+  reachable beside long task content (#939).
+- Established one bounded, keyboard-focusable scroll owner for task drawers and
+  shared overlays, kept drawer chrome fixed, and made task description editors
+  taller and vertically resizable (#935).
+- Preserved in-app route origins, scroll positions, and task return paths across
+  full-page navigation, added browser Back and `Cmd+[` support, and made direct
+  links fall back safely to Board (#937).
+- Reconciled Operations Digest totals with board inventory, exposed auditable
+  inclusion and exclusion reasons plus metadata quality findings, bounded
+  observed wall time to the selected window, and documented current-state
+  versus windowed metrics (#944).
+- Removed competing profile-editor and scorer-list scroll containers so Agent
+  Output Scoring uses the application page scrollbar at compact and full
+  desktop sizes (#938).
+- Expanded the template editor into a responsive authoring surface with one
+  bounded scroll region, fixed actions, a resizable Markdown editor, inline
+  validation, and unsaved-change protection (#941).
+- Made first-run setup version-neutral and sourced desktop bridge version
+  reporting from Electron's packaged application metadata (#986).
+
+## [6.0.0] - 2026-07-24
+
+> Quarantined prerelease. Use 6.0.1 or newer. The 6.0.0 artifacts remain
+> available only for investigation and historical release evidence.
+
+Each release entry below names its tracking issue. The complete issue-to-pull
+request mapping, including multi-PR fixes and release engineering, is retained
+in the [v6 Release Candidate Evidence Packet](docs/V6-RC-EVIDENCE-PACKET.md#issue-and-pull-request-traceability).
+
+### Changed
+
+- Tiered GitHub Actions so pull requests run changed test files with
+  lint/typecheck, security, and build gates, while the complete workspace suite
+  runs on `main`, nightly, by manual dispatch, or with the `ci:full` label.
+  Cross-platform unsigned desktop packaging now runs for desktop/package PRs,
+  after relevant changes merge to `main`, or by manual dispatch (#955).
+
+### Fixed
+
+- Prevented the packaged desktop updater from treating an older stable release
+  as downloadable. Stable, beta, and dev channel assignment now explicitly
+  restores `allowDowngrade=false` after the `electron-updater` channel setter
+  changes it internally (#983).
+- Deferred the default run-supervisor SQLite repository lookup until the first
+  supervisor operation. Packaged SQLite startup can now import and initialize
+  routes before storage bootstrap without crashing (#981).
+- Added bounded macOS desktop startup verification that retries through the
+  LaunchServices readiness window, requires the installed app and health
+  endpoint versions to agree, and reports process, port, and log diagnostics on
+  a real timeout. Updated web-to-desktop migration, routine Homebrew upgrade,
+  automation, troubleshooting, and release guidance to use the readiness gate
+  instead of an immediate health request (#927).
+
+### Added
+
+- Added a composed credential-free Buzz compatibility gate and complete
+  machine-readable seam evidence for the pinned Buzz `0.4.24` /
+  `710ed9fff57878a1d69f809b80a6ee0416c53fc4` baseline, plus trigger setup,
+  support dispositions, optional live-smoke boundaries, upgrade, and rollback
+  guidance (#912).
+- Added allowlisted Buzz root-message workflow triggers with bounded predicates,
+  provider-neutral pre-dispatch hooks, durable causal keys, replay and echo
+  suppression, restart reconciliation, API configuration, and audit history
+  (#911).
+- Added the provider-neutral `runtime-hook/v1` in-process hook bus with bounded
+  envelopes, deterministic scope ordering, explicit blocking pre-events,
+  passive post-events, timeout/reentrancy protection, side-effect-free dry-run,
+  and causal run-journal evidence. External executable and HTTP handlers remain
+  fail closed pending their sandbox and egress boundaries (#874).
+- Added `harness-compatibility-matrix/v1` for Buzz, Grok Build, OpenAI Codex
+  app-server, Claude Code, and GitHub Copilot CLI. One reviewed record now
+  drives exact builds, source caveats, capability and fixture digests,
+  invalidation policy, live support tiers, API, `vk doctor`, Settings, telemetry,
+  and operator guidance (#918).
+- Added `harness-conformance-suite/v1` and a deterministic runner for seeded,
+  repeated provider/model/profile/policy/sandbox comparisons. Explicit
+  assertions cover outcomes, files, tools, approvals, network, policy,
+  completion, and capability evidence; normalized results aggregate pass rate,
+  variance, latency, tokens, cost, retries, failure classes, immutable evidence
+  references, and versioned baseline regressions. A credential-free recorded
+  mock command provides the CI/local foundation while credential-gated lanes
+  require explicit opt-in (#859).
+- Composed the pinned `buzz-agent` ACP profile with the system-owned
+  `veritas-run` bridge. Buzz sessions now receive only that bridge for selected
+  run tools, so catalog allow, deny, approval, attribution, and cleanup remain
+  under the provider-neutral control plane without native server credentials
+  or a Buzz-specific MCP implementation. Provider capability evidence advances
+  to probe revision 14 (#909).
+- Added the system-owned `veritas-run` MCP bridge for credential-bound tools.
+  Opaque, in-memory authority binds the exact task, attempt, catalog, launch
+  manifest, and two allowed bridge methods. Codex CLI/SDK, Codex app-server,
+  Claude Code, and ACP stdio inject the same narrow bridge; Hermes and OpenClaw
+  fail closed before dispatch when a credential-bound catalog is selected
+  (#970).
+- Added exact-action credential lease consumption to mediated run-tool calls.
+  The server binds each operation to the active launch manifest, catalog,
+  server, tool, arguments digest, approval, and operation ID; resolves values
+  only inside a one-shot downstream MCP session; rejects replay, drift,
+  approval mismatch, unavailable sources, and credential-bearing results; and
+  relies on the existing terminal lifecycle reconciliation to revoke leases
+  (#969).
+- Added value-free credential boundary evidence to `run-tool-catalog/v1`.
+  Credential-bound definitions now require enabled MCP-scoped broker
+  definitions, exact source targets, and immutable definition/scope digests.
+  Discovery strips source environment and header values, native provider
+  configuration omits credential-bound servers, covered launch references
+  report a tool-control-plane boundary, and uncovered or drifted references
+  remain fail closed (#968).
+- Added `vk acp serve --stdio` and `vk acp status --json` to expose a
+  task-bound, provider-neutral ACP v1 server view over Veritas-managed
+  conversations. Fresh prompts retain the immutable task envelope, reconnect
+  replays the causal run journal by cursor, permission requests use the durable
+  approval broker, cancellation interrupts instead of stopping the task, and
+  disconnect leaves the supervised run active. Client-owned MCP catalogs and
+  mismatched worktrees fail closed (#960).
+- Added a disabled-by-default Grok Build profile under the generic ACP
+  provider, pinned to released `v0.2.111` build `94172f2aa4e5`. Veritas now
+  compiles a dedicated no-leader stdio launch, accepts only bounded model,
+  effort, deny, tool, sandbox, and feature-disable controls, classifies Grok
+  boot credentials separately from task credentials, and validates the exact
+  version, capability, and xAI extension handshake. Unknown builds, approval
+  bypass, reauthentication, leader/plugin/endpoint injection, and source
+  provenance claims fail closed. Provider probe evidence advances to revision
+  13 (#920).
+- Added a disabled-by-default GitHub Copilot CLI profile under the generic ACP
+  provider, pinned to the `Copilot 1.0.74` public-preview handshake. Veritas
+  now owns a safe stdio baseline, compiles bounded restrictive model/effort/
+  tool/URL/context/credit settings into immutable launch argv, classifies
+  Copilot boot credentials without probing authentication or inference, and
+  reports the incomplete-source and release-tag provenance limits truthfully.
+  Provider probe evidence advances to revision 12 (#917).
+- Added a disabled-by-default `buzz-agent` conformance profile under the generic
+  ACP provider, pinned to Buzz v0.4.24 commit
+  `710ed9fff57878a1d69f809b80a6ee0416c53fc4`. The profile validates exact ACP
+  identity, version, capabilities, known limitations, safe configuration and
+  boot-authentication environment keys, rejects `buzz-acp` and incompatible
+  capability drift,
+  and advances provider probe evidence to revision 11 (#907).
+- Added `run-launch-credential-plan/v1` to classify provider boot
+  authentication, broker-targeted task credentials, and explicit high-risk
+  environment passthrough in immutable launch evidence. Plans bind to provider
+  runtime evidence, remain value-free, ignore timestamp-only probe refreshes,
+  and block task credential launches until an accepted tool or egress boundary
+  proves brokered delivery (#932).
+- Added a generic stable ACP v1 stdio provider adapter with no-shell supervised
+  launch, initialize-time identity and capability evidence, fresh/resume/fork/
+  close session lifecycle, bounded bidirectional JSON-RPC, causal message,
+  thought, plan, and tool events, durable permission brokering, capability
+  drift rejection, explicit environment filtering, and immutable all-allow
+  run-scoped MCP session configuration. Provider capability evidence advances
+  to probe revision 10; the client-facing ACP server view is tracked separately
+  by #960 (#870).
+- Added the `tool-server-definition/v1`, `tool-server-discovery/v1`, and
+  `run-tool-catalog/v1` control-plane contracts with file and SQLite
+  persistence, version-bound discovery caching, required and optional server
+  posture, per-run allow/deny/approval decisions, bounded supervised stdio and
+  Streamable HTTP invocation, causal replay-safe events, REST/CLI/MCP operator
+  surfaces, and native run-scoped MCP injection for Codex app-server and
+  Claude Code. Credential-bound definitions remain fail-closed until the
+  provider launch credential broker lands (#857).
+- Added `conversation-lifecycle/v1` with durable provider conversation, turn,
+  item, parent, and fork identities; launch-manifest and worktree compatibility
+  checks; context-window posture; causal lifecycle events; attributed REST,
+  CLI, MCP, and web controls; and explicit unsupported delivery results.
+  Codex CLI and SDK can resume exact persisted sessions, Claude Code can resume
+  or fork with system-owned native flags, and Codex app-server can resume,
+  follow up, steer, fork, compact, archive, interrupt, and close through
+  schema-validated JSON-RPC methods. Generic process stdin is no longer treated
+  as a successful provider follow-up path, and capability evidence advances to
+  probe revision 8 (#856).
+- Added `run-supervisor/v1`, a durable provider-run ownership record with exact
+  provider, task-envelope, launch-manifest, and worktree bindings; persisted
+  process groups or remote-session handles; budget and event cursors; expiring
+  single-owner leases; typed recovery actions; and idempotent terminal
+  ownership. Startup now reattaches verified local provider processes, resumes
+  journal reconciliation strictly after the durable cursor, restores exact
+  completion results across crash races, and blocks unsafe recovery without
+  signaling reused PIDs or starting duplicate work. File and SQLite
+  repositories share the same compare-and-set contract, and provider capability
+  evidence advances to probe revision 7 (#853).
+- Added a provider-native `run-approval/v1` broker with file and SQLite
+  persistence, exact action hashes, atomic compare-and-set decisions,
+  auth-derived reviewer identity, critical-action authentication freshness,
+  expiry/cancellation, mobile two-layer safety, causal audit correlation, REST
+  and WebSocket delivery, task and shared-run review surfaces, and
+  non-persisted elicitation response values. Codex app-server now pauses and resumes its exact
+  command, file, permission, tool-question, legacy exec/patch, and MCP
+  elicitation request through pinned v0.145.0 response schemas; stale, changed,
+  duplicate, interrupted, unsupported, and failed requests deny safely (#852).
+- Added a first-class Codex app-server v2 task adapter pinned to
+  `codex-cli 0.145.0` and upstream commit
+  `25af12f7e61572b0bc18ddb1008be543b91519b0`. Veritas now owns a strict-stdio,
+  no-shell launch, validates checked-in exact-version JSON Schemas, persists
+  one task-bound thread and turn, streams item/usage/completion events into the
+  causal journal, supports cooperative `turn/interrupt`, and retries only
+  bounded overload `-32001` responses. Inherited MCP, hooks, plugins, apps,
+  browser/computer tools, elicitation, remote control, and unsandboxed
+  `thread/shellCommand` remain structurally disabled; approval, lifecycle, and
+  reattachment controls fail closed until their provider-neutral brokers land
+  (#921).
+- Added a first-class Claude Code v2.1.218 task adapter with a reproducible
+  no-shell bare-mode launch, static sandbox-derived permissions, explicit
+  environment authentication with provider credentials scrubbed from tool
+  subprocesses, bounded health and agent-discovery diagnostics,
+  immutable task/run manifests, drain-safe stream-json ingestion, causal event
+  mapping for partial text, thinking, tools, hooks, subagents, usage, cost, and
+  results, separate session identity persistence, artifact discovery, and
+  fail-closed capability evidence for lifecycle and broker controls that have
+  not landed yet. Legacy provider-less Claude records migrate only when command
+  identity matches, and the old permission-bypass default is removed (#916).
+- Added `run-event/v1`, a provider-neutral causal event journal for OpenClaw,
+  Codex CLI, Codex SDK, Codex app-server, Claude Code, and Hermes. Provider
+  mappers now durably append bounded,
+  redacted, deduplicated lifecycle, message, reasoning, command, file, tool,
+  approval, artifact, usage, error, and unknown events before projecting them
+  into legacy logs, traces, telemetry, budgets, and live output. File and SQLite
+  repositories allocate per-attempt monotonic cursors, REST and WebSocket
+  clients can replay after a cursor, and reconnect subscriptions merge replay
+  with concurrent live events without gaps. The published JSON Schema,
+  symlink-safe file storage, SQLite migration, provider fixtures, replay,
+  migration, redaction, and interleaved operator/provider tests define the v1
+  compatibility boundary (#850).
+- Added one-way Buzz persona/team definition import with signed bounded NIP-33
+  head queries, exact v0.4.24 field policy, preview/diff/collision actions,
+  same-author team resolution, disabled profile and roster materialization,
+  immutable provenance, source-status reporting, optimistic JSON/SQLite
+  mutations, audit history, Settings controls, and malicious-source coverage.
+  Runtime/model/provider preferences remain source-only, and import never
+  launches, enables, routes, fetches, installs, or writes back (#910).
+- Added a reference-only Buzz communication adapter with typed configuration,
+  host-preserving HTTP/WS normalization, SSRF-aware bounded relay probes,
+  NIP-11 software/version/community checks, NIP-98 identity and membership/read
+  diagnostics with built-in hexadecimal/`nsec` signing, stable machine-readable
+  reason codes, evidence invalidation, shell-free optional command discovery,
+  Settings controls, `vk doctor` reporting, and operator/API/security
+  documentation. The resulting compatibility evidence is the fail-closed gate
+  consumed by Buzz communication delivery (#906).
+- Added a native bidirectional Buzz channel bridge for Squad Chat with signed
+  Nostr root/reply events, channel mapping APIs and Settings controls, NIP-42
+  WebSocket subscriptions, source author/timestamp/deep-link metadata,
+  `(created_at,event_id)` cursors, overlap dedupe, out-of-order reply recovery,
+  loop prevention, non-destructive edit/delete auditing, delivery-unknown
+  reconciliation, runtime health facets, safe disable/rollback, fake-relay
+  contract coverage, and operator/API/security documentation (#906).
+- Added transactional, remote-safe worktree lifecycle management with
+  versioned manifests, exact fetched base commits, reasoned offline fallback,
+  task/attempt ownership leases, active-run locks, recovery states, and
+  preview-first stale cleanup. Dirty, untracked, unpushed, unmerged, and
+  externally held worktrees now require an admin-audited override. Attempt
+  leases use exclusive claims, legacy worktrees have a validated adoption path,
+  and restart recovery reconciles partial rebase, integration, push, and
+  cleanup states. Integration uses a dedicated temporary worktree and
+  non-force push without mutating the primary checkout. Task envelopes and run
+  launch manifests bind the exact worktree allocation and base evidence (#858).
+- Added the versioned credential-definition and run-bound lease core with
+  metadata-only admin APIs, canonical definition/scope/action fingerprints,
+  opaque hashed handles, exact launch-manifest and action binding, atomic TTL
+  and use-count enforcement, operation-level replay rejection,
+  refresh/revoke/expiry/reconciliation state, callback-only secret resolution,
+  terminal-run invalidation with revocation retry, live-owner file locking, and
+  bounded metadata audit records. Required brokered presets now reject advisory
+  or externally delegated credential handling until a controlled provider
+  boundary proves end-to-end support (#931).
+- Added the immutable `run-launch-manifest/v1` contract, a preflight preview API
+  and CLI command, per-field configuration provenance, fail-closed profile
+  tool/MCP/permission/health enforcement, parent-attempt material drift,
+  readiness/override evidence, governance traces, attempt/history/log
+  persistence, and completion-packet links to the exact launch and provider
+  capability evidence (#854).
+- Added immutable provider-owned task-envelope transports for OpenClaw, Codex
+  CLI, Codex SDK, Codex app-server, Claude Code, and Hermes. Each renderer
+  binds the exact envelope and runtime identity, commit policy, bounded
+  attributed profile/checkpoint context, workspace baseline, verification
+  gates, and completion evidence to the launched request. OpenClaw alone
+  receives a completion callback; process and stream providers return terminal
+  output through harness-owned capture, and mismatched provider/adapter
+  identities fail closed (#892).
+- Added digest-bound, idempotent `completion-result/v1` persistence for process,
+  stream, callback, remote-session, and operator-interruption terminal paths.
+  Provider claims are bounded, redacted, and untrusted while harness evidence
+  attributes post-launch files, commits, artifacts, verification, and side
+  effects without crediting pre-existing off-HEAD history.
+  Commit/output/evidence violations downgrade success to recoverable
+  partial completion; exact duplicate callbacks survive retry or restart and
+  conflicting terminal owners fail closed. Provider-owned transports cannot be
+  replaced by callbacks, completion writes use compare-and-swap retries, and
+  harness-owned restart reconciliation remains inside the same result contract
+  while OpenClaw stays eligible for its callback (#893).
+
+### Security
+
+- Removed the legacy Claude Code permission-bypass default. Every executable
+  provider now launches through an explicit adapter, immutable launch manifest,
+  bounded environment allowlist, capability evidence, exact-action approval
+  broker, and credential plan. Unsupported controls, adapter/profile drift,
+  stale evidence, and unknown provider-less records fail closed (#919, #916,
+  #852, #932).
+- Added value-free credential definitions and one-shot run-bound leases.
+  Credential values are resolved only inside the mediated downstream call and
+  are excluded from provider-native configuration, manifests, logs, telemetry,
+  fixtures, and API responses (#931, #968, #969, #970).
+- Added bounded, redacted causal protocol storage and supervised no-shell
+  process lifecycles for ACP, Codex app-server, Claude Code, and Buzz relay
+  integration. The deferred fine-grained HTTP egress proxy remains tracked in
+  #855; any required network rule that current runtime evidence cannot enforce
+  blocks launch.
+
+### Migration
+
+- Existing provider configurations are normalized to
+  `harness-support-profile/v1`. Only known legacy records whose command and
+  built-in type both identify Codex, Hermes, or Claude are migrated to their
+  matching adapter. Provider-less, ambiguous, disabled, or mismatched records
+  remain disabled or fail closed; no migration starts a provider.
+- The public API remains `v1`. New run, approval, lifecycle, tool, credential,
+  compatibility, Buzz, and conformance contracts are additive. Existing v5
+  board and desktop SQLite data remains in place; operators must back up before
+  upgrade and keep the v5.2.5 backup for rollback.
+- Buzz, Grok Build, GitHub Copilot CLI, Claude Code, and Codex app-server
+  support is exact-version and evidence-bound. Unknown builds do not inherit
+  certification. Grok Build and Copilot CLI retain source-provenance limits,
+  ACP lifecycle support varies by runtime, and credential-gated live smoke
+  remains separate from deterministic certification.
+
+## [5.2.5] - 2026-07-23
+
+### Added
+
+- Added a complete web/source-to-Mac migration runbook with a decision path for
+  already-populated desktop SQLite, coherent stopped-writer backups, isolated
+  file-to-SQLite staging, governed bundle replacement, watchdog discovery,
+  authenticated automation cutover, verification, rollback, and warning
+  remediation (#899).
+- Added the versioned `task-envelope/v1` and `completion-result/v1` contracts,
+  canonical envelope digests, immutable per-attempt persistence, launch HEAD and
+  dirty-file attribution with staged-blob and worktree SHA-256 fingerprints,
+  bounded evidence/output/verification/side-effect schemas, and explicit
+  `forbidden`, `allowed`, or `required` commit policy with run, task, and
+  legacy-setting precedence. Baseline capture retries unstable repositories,
+  path side effects are clamped to the effective sandbox, authoritative run
+  contracts reject generic task PATCH mutation, oversized legacy workspace IDs
+  normalize deterministically, and task create/update policy is available over
+  REST, CLI, and MCP. Agent start and status APIs, task storage, attempt history,
+  and logs now carry the exact envelope used for the run (#891).
+- Added versioned, evidence-backed provider runtime manifests for Codex CLI,
+  Codex SDK, Hermes, and OpenClaw with bounded identity and conformance probes,
+  race-safe version-skew cache invalidation, canonical immutable run snapshots
+  and digests, complete capability posture, and attempt/history/trace/log
+  persistence (#885).
+- Added validated runtime-manifest registration and heartbeat refresh, custom
+  provider discovery, manifest-authoritative host posture, and provider-neutral
+  required-capability routing with structured evidence for every attempted
+  primary, fallback, or rejected candidate (#886).
+- Added one provider-runtime control evaluator for launch requirements and
+  status, logs, completion, stop, steer, resume, reattach, tool, MCP, structured
+  output, token-usage, and artifact controls. Agent status now returns concrete
+  capability-derived availability, reasons, and remediation, and REST, CLI, and
+  MCP starts can declare additional required capabilities. Completion callbacks,
+  token budgets, and shared co-drive controls are attempt-bound; provider-native
+  approvals fail closed; OpenClaw task and workflow evidence are separated; and
+  workflow requirements account for standard MCP names and metric-specific
+  budgets (#887).
+- Added an admin-governed SQLite journal maintenance workflow with non-mutating
+  previews, restart-time exclusive conversion, verified backups, durable stage
+  journals, forward-only crash recovery, integrity verification, in-place mode
+  rollback while exclusive, single-host ownership locks, expiring/revocable
+  overrides, CLI commands, and redacted diagnostics (#882).
+
+### Changed
+
+- Added Hermes to normalized provider profiles and Settings selectors, and made
+  explicitly configured providers without an executable task adapter fail
+  closed instead of silently dispatching through OpenClaw (#885).
+- Made host provider, model, tool, and sandbox capability decisions consume
+  validated manifests. Legacy free-form registration posture remains visible
+  but cannot satisfy required runtime capabilities. Runtime evidence writes are
+  identity-bound, reject unredacted secrets and misspelled fields, expire with
+  heartbeat liveness, and invalidate when provider identity changes. Unresolved
+  sandbox presets fail closed instead of borrowing aggregate host signals
+  (#886).
+- Made active agent and workflow controls consume the exact persisted launch
+  manifest, reject invalid or mismatched snapshots, and fail closed before
+  unsupported work. Sandbox dry-runs now resolve live registered manifest
+  digests server-side, workflow manifests persist before provider execution,
+  and task, Work view, and shared co-drive controls expose accessible disabled
+  reasons when a runtime cannot stop or steer (#887).
+- Classified the authoritative SQLite filesystem before database open, limited
+  WAL to recognized durable local filesystems, refused known-unsafe and unknown
+  storage before creating database sidecars, and exposed redacted filesystem,
+  journal, and integrity posture through deep health and Maintenance diagnostics
+  (#881).
+
+### Fixed
+
+- Raised vulnerable transitive `fast-uri` and `js-yaml` ranges to patched
+  releases so the production dependency audit passes at the release gate
+  (#903).
+- Made startup, setup, password, recovery, and login surfaces draggable in the
+  frameless desktop window, and made first-run setup detect populated desktop
+  SQLite data, default to a non-destructive **Use Existing Data** path, show
+  concise migrated-data counts, and reserve backup restore for recovery (#901).
+- Serialized agent launch and terminalization ownership per task and attempt so
+  concurrent starts, stop requests, provider exits, and callbacks cannot launch
+  or finalize the same run twice (#887).
+- Restored packaged desktop agent controls after password login by granting the
+  verified loopback owner session the narrow `local-agent:run` capability while
+  keeping production localhost bypass disabled (#887).
+- Made packaged desktop port selection detect listeners on both IPv4 and IPv6
+  loopback and kept dev server/web fallback ports distinct, preventing Electron
+  from attaching to an unrelated local server or colliding with itself.
+- Kept mobile notifications above the safe-area-aware bottom navigation so
+  long-lived toasts cannot intercept touch input after Task Detail closes
+  (#869).
+
+## [5.2.4] - 2026-07-13
+
+### Fixed
+
+- Restored the native macOS Edit menu so Cut, Copy, Paste, Select All, and
+  their standard keyboard shortcuts work in desktop text and password fields
+  (#842).
+- Rebuilt the password-recovery actions as one full-width vertical stack with
+  consistent spacing, and added password-manager autocomplete metadata to the
+  login and recovery password fields (#842).
+
+## [5.2.3] - 2026-07-13
+
+### Changed
+
+- Enforced the tracked runtime security artifact guard in pre-commit and CI
+  security gates, with documented rotation and private-evidence handling
+  requirements (#836).
+
+### Fixed
+
+- Rebuilt the desktop login actions as a stable vertical Mantine stack with a
+  full-width primary action, centered recovery action, consistent spacing, and
+  regression coverage for the packaged layout (#839).
+
+## [5.2.2] - 2026-07-12
+
+### Added
+
+- Added append-only JSONL activity storage with recovery and compatibility
+  coverage for durable event history (#782, #808).
+
+### Changed
+
+- Added canonical repository guidance for Codex, OpenClaw, and Hermes and
+  documented validated provider behavior (#803).
+- Routed web API requests through the shared authenticated client and retired
+  the deprecated polling hook (#802).
+- Updated the Codex SDK integration to `0.144.1` and pinned patched transitive
+  development-tool dependencies (#792, #795).
+- Added `provider` and `command` fields to `WorkflowAgent` in
+  `@veritas-kanban/shared` to align with the server-side definition and prevent
+  silent contract drift (#786).
+- Added `max_reroutes` to `FailurePolicy` and `retryRouteCount` to `WorkflowRun`
+  in both the shared and server workflow type contracts (#780, #786).
+
+### Fixed
+
+- Hardened file-storage mutation ordering, rollback behavior, and integrity
+  recovery across concurrent writes (#804).
+- Fixed runtime lifecycle leaks, async registry persistence, attempt
+  reconciliation, and cross-platform path helpers (#774, #779, #781, #783,
+  #801).
+- Normalized security artifact paths before matching so mixed-case paths cannot
+  bypass expected classification (#807).
+- Reworked Scoring Profiles into a compact list/detail flow at phone widths,
+  preserved the selected profile across create and duplicate actions, and
+  guarded unsaved drafts when returning to the list, changing tabs, or leaving
+  the scoring surface (#813).
+- Replaced broad and layout-property dashboard transitions with instant chart
+  updates, explicit short hover feedback, and accessible immediate section
+  expansion, including intentional reduced-motion behavior (#814).
+- Made SQLite activity ordering deterministic for multiple events written in
+  the same millisecond, preserving the newest-first feed contract and stable
+  retention trimming (#823).
+- Removed untracked asynchronous directory creation from `AttachmentService`
+  construction; attachment and archive paths are now created lazily by the
+  operations that need them (#825).
+- Prevented compact bottom-navigation labels from overlapping, kept the mobile
+  header within 320 px, and restored a fixed, safe-area-aware Board Chat entry
+  point (#811).
+- Kept mobile Settings navigation visible and touch-sized in the dialog content
+  flow, and stacked the Product Mode summary and selector at compact widths
+  (#810).
+- Made dialog, sheet, alert, and Task Detail overlays honor reduced-transparency
+  and increased-contrast preferences, strengthened modal focus boundaries, and
+  dismissed task-card tooltips when opening Task Detail (#815).
+- Restored keyboard drag-and-drop parity on the Kanban board with spatial
+  cross-column movement, empty-column targeting, same-column reordering,
+  accurate screen-reader announcements, mutation rollback, and post-move focus
+  restoration (#812).
+- Kept Electron's runtime API external in Vite 8/Rolldown desktop builds,
+  preventing the npm executable-path shim from replacing `app`,
+  `BrowserWindow`, `contextBridge`, and related native APIs in emitted main and
+  preload artifacts; desktop builds now fail closed if the shim reappears
+  (#809).
+- Isolated QMD result normalization coverage from unrelated persistent search
+  collections and restored test environment state only after temporary search
+  roots are removed, eliminating the intermittent teardown race (#793).
+- Human-gate blocking (`on_false.escalate_to: human`) now transitions the run
+  to `blocked` instead of `failed` via the new `HumanGateBlockError` typed
+  exception; `approveGateStep` and `rejectGateStep` service methods replace the
+  unimplemented route stubs that previously discarded state (#778).
+- `retry_step` cross-step rerouts are now bounded by a persisted
+  `retryRouteCount` field; the default cap is 10 and is configurable via
+  `on_fail.max_reroutes`; exhaustion respects `on_exhausted` policy or fails
+  deterministically (#780).
+- `WorkflowRunService` private `NotFoundError` and `ValidationError` classes
+  replaced with the shared `AppError` hierarchy so workflow domain errors map
+  to stable 404/400 HTTP responses instead of HTTP 500 (#785).
+- `BlockingService` now enforces `dependencies.depends_on` (canonical
+  dependency model) in addition to legacy `blockedBy`; the tasks route
+  transition guard checks both fields so `depends_on` relationships block
+  in-progress transitions (#787).
+
+## [5.2.1] - 2026-06-29
+
+### Fixed
+
+- Blocked disabled communication adapters from ingesting inbound human replies
+  into Squad Chat (#760, #764).
+- Made delegated workspace intake recoverable when config persistence fails
+  after target task creation (#761, #764).
+- Verified queue monitor candidate selection already prioritizes runnable work
+  before the bounded candidate cap (#762).
+
+### Changed
+
+- Refreshed the static docs homepage to remove brittle launch-era star and test
+  count claims from current-release copy (#763, #764).
+- Bumped the source metadata from `5.2.0` to `5.2.1` across package manifests
+  and operator-facing version docs (#765).
+- Stabilized workflow run metadata coverage and file-backed ChatService startup
+  directory setup so release CI does not leak asynchronous test setup errors.
+
+## [5.2.0] - 2026-06-26
+
+### Added
+
+- Added workspace team roster manifests and capability routing rules for
+  capability-aware delegation (#734).
+- Added cross-workspace capability discovery and delegated work intake (#735).
+- Added policy-gated queue intake monitoring for GitHub issues and agent runs
+  (#736).
+- Added a unified recurring work scheduler for monitors, workflows, and digests
+  (#737).
+- Added Squad Chat threads, unread state, mentions, and search (#738).
+- Added bidirectional human reply adapters for Squad Chat and notifications
+  (#739).
+- Added ceremony enforcement for design reviews and failure retrospectives
+  (#740).
+- Added reflection-to-memory promotion for agent corrections and lessons (#741).
+- Added external tracker schema introspection for configurable work items
+  (#742).
+
+### Changed
+
+- Bumped the release from `5.1.0` to `5.2.0` across the root, shared, server,
+  web, CLI, MCP, and desktop package manifests.
+- Updated the README version badge, API reference, v5 release notes, and MCP
+  documentation footer for `5.2.0`.
+
+### Fixed
+
+- Fixed CLI/MCP compatibility smoke checks so missing `VK_API_KEY` records
+  explicit skip results after local package/build validation instead of failing
+  unrelated release gates (#753).
+- Removed vulnerable frontmatter dependencies from the server by using the
+  existing YAML parser and preserving malformed-prompt fallback behavior
+  (#754).
+- Upgraded DOMPurify and kept the Mantine QA gate below the initial bundle
+  budget by deferring drag/drop code outside the first page load (#754, #755).
+
+## [5.1.0] - 2026-06-18
+
+### Added
+
+- Added shared live run sessions with workspace-scoped view, co-drive, and fork
+  permissions. Shared viewers receive live output and run events, editors send
+  attributed messages and mobile-safe approval responses, and forks create
+  linked tasks without mutating parent run state (#721, #731).
+- Added reusable agent profile packages with YAML/JSON validation, import,
+  export, metadata editing, and profile-aware agent launch posture (#720).
+- Added enforceable agent run budgets for token, cost, tool-call, runtime,
+  retry, and fan-out limits with auditable enforcement decisions (#722).
+- Added sandbox policy presets for filesystem, network, environment, and
+  credential access with dry-run validation before launch (#723).
+- Added multi-participant decision review sessions with independent responses,
+  critique rounds, synthesis packets, work-product attachment, and decision
+  audit links (#724).
+
+### Changed
+
+- Bumped the release from `5.0.1` to `5.1.0` across the root, shared, server,
+  web, CLI, MCP, and desktop package manifests.
+- Updated the README version badge, API reference, release notes, permission
+  coverage manifest, and MCP documentation footer for `5.1.0`.
+
+### Fixed
+
+- Fixed Docker source builds by restoring required Dockerfile inputs to the
+  build context (#725).
+
+## [5.0.1] - 2026-06-12
+
+### Changed
+
+- Bumped the release from `5.0.0` to `5.0.1` across the root, shared, server,
+  web, CLI, MCP, and desktop package manifests.
+- Updated the README version badge and MCP documentation footer for `5.0.1`.
+
+### Fixed
+
+- Made MCP write tools return concise confirmations instead of echoing full task
+  JSON payloads with complete comment history, reducing token usage for
+  agent-heavy boards (#714, #715). Thanks to @Cob-AI for the report.
+- Stabilized the Mantine task detail Progress tab test under CI load.
+- Fixed the local macOS desktop packaging smoke check to follow the configured
+  app bundle name.
+
+## [5.0.0] - 2026-06-05
+
+### Added
+
+- Added v5 release readiness docs covering upgrade/install/admin paths,
+  compatibility matrix, release channels, rollback limits, release notes, and
+  deferred post-GA platform backlog.
+
+### Changed
+
+- Bumped the release from `4.3.2` to `5.0.0` across the root, shared, server,
+  web, CLI, MCP, and desktop package manifests.
+- Updated the README version badge and MCP documentation footer for `5.0.0`.
+- Expanded release validation to cover the desktop package version and required
+  v5 release documentation.
+
+## [4.3.2] - 2026-05-16
+
+### Added
+
+- Added `pnpm validate:release` to verify workspace version alignment, required release files, the README version badge, changelog headings, built artifacts, optional GitHub tag/release state, and optional production Docker image builds.
+- Added `.github/workflows/scheduled-qa.yml` so Playwright and k6 smoke/load checks can run on a scheduled cadence outside the fast pull request CI path.
+- Added the full codebase audit report at `docs/CODEBASE-AUDIT-2026-05-16.md`, including completed remediation notes and linked follow-up issues for the remaining larger work.
+- Added dedicated URL validation regression coverage for blocked localhost, private-network, and unsafe redirect webhook targets.
+
+### Changed
+
+- Bumped the release from `4.3.1` to `4.3.2` across the root, shared, server, web, CLI, and MCP package manifests.
+- Updated the README version badge and MCP documentation footer for `4.3.2`.
+- Expanded the root build script and CI artifact checks to include the CLI and MCP packages so release validation covers every published/runtime surface.
+- Split heavy web panels, chat, board, command palette, and task-detail surfaces out of the initial Vite bundle, removing oversized chunk warnings from the production build.
+- Centralized web view metadata and task-detail tab metadata to reduce navigation drift, feature-gate drift, and duplicated labels.
+- Added a lint warning budget gate after reducing current warning debt from 728 to 714, making future lint debt increases visible in CI.
+- Stabilized full-suite test execution by tightening async Codex provider assertions, isolating Docker path filesystem mocks, and giving slower jsdom/route-integration tests realistic timeouts.
+
+### Fixed
+
+- Hardened outbound webhook URL handling with shared validation, DNS/IP block checks, and redirect validation before webhook delivery.
+- Fixed board drag reordering persistence, dependency-blocked task transitions, checkpoint clearing semantics, CLI/MCP version reporting, API envelope handling, and setup guidance found during the audit.
+- Fixed Docker workspace dependency stages to include CLI and MCP package manifests before install/build steps.
+- Fixed failure-alert, hook, policy, squad webhook, and transition hook services to use the hardened URL validation path consistently.
+
+## [4.3.1] - 2026-05-11
+
+### Security
+
+- Restricted policy create, update, and delete routes to admin role only (#357).
+- Restricted tool policy create, update, delete, and validation routes to admin role only (#355).
+- Restricted agent permission level changes, permission field updates, and approval review to admin authority (#356).
+- Restricted task-to-agent routing configuration updates to admin role only (#354).
+
+### Changed
+
+- Updated workspace package versions, README badge, and MCP README footer from `4.3.0` to `4.3.1`.
+
+## [4.3.0] - 2026-05-09
+
+### Added
+
+- Veritas Cutover operating guide covering the authority model, HermesAgent roster, mandatory QA evidence gate, product/spec task template, research/revenue intake template, and Medik8 Cyprus-only task template.
+- Agent Registry references for active and on-demand Veritas Cutover HermesAgent owners.
+- Agent provider adapter contract for OpenClaw, Codex CLI, and Codex SDK start/stop/status/log/completion capabilities.
+- Codex event mapping into activity, trace, token telemetry, and task deliverable surfaces.
+- Mocked Codex JSONL fixture coverage for success, failure, malformed output, token usage, and file-change artifacts.
+
+### Changed
+
+- Updated workspace package versions and README badge from `4.2.5` to `4.3.0`.
+- Updated Codex roadmap docs from v4.2 tracking language to v4.3 completion language.
+- Bumped `zod` from v3 to v4.4.3 across the MCP, server, and web packages, including server schema compatibility updates.
+- Bumped safe chore dependencies: `@typescript-eslint/*` to `8.59.2`, `express-rate-limit` to `8.5.0`, `hono` to `4.12.18`, `postcss` to `8.5.14`, and `shadcn` to `4.7.0`.
+- Added dependency audit overrides for patched `fast-uri` and `ip-address` transitive versions.
+- Created the `dependencies` and `github-actions` GitHub labels expected by Dependabot.
+
+### Acknowledgements
+
+- Thanks to @asperty567 for the Veritas Cutover issue set and operating direction.
+
+## [4.2.5] - 2026-05-06
+
+### Added
+
+- Codex Settings health endpoint at `GET /api/settings/codex/health`.
+- Server-side checks for Codex CLI installation, CLI version, `codex login status`, Codex SDK import availability, and Codex CLI/SDK/Cloud agent profile readiness.
+- Settings Agents tab Codex Health panel with refresh, readiness badges, version/auth details, and actionable recommendations.
+- Frontend API and hook support for Codex health checks.
+- Route coverage for the Codex Settings health endpoint.
+
+### Changed
+
+- Updated workspace package versions and README badge from `4.2.4` to `4.2.5`.
+- Documented richer Codex Settings health checks as implemented, completing the requested v4.2 patch train.
+
+## [4.2.4] - 2026-05-06
+
+### Added
+
+- Codex review action for task branch diffs through `POST /api/diff/:taskId/codex-review`.
+- Codex SDK review runner that executes in read-only sandbox mode, asks for structured JSON findings, and maps findings to Veritas review comments.
+- Review summary/task comment persistence plus review decision metadata when review saving is enabled.
+- Frontend API and React Query hook support for triggering Codex reviews.
+- Route coverage for Codex review validation and service invocation.
+
+### Changed
+
+- Updated workspace package versions and README badge from `4.2.3` to `4.2.4`.
+- Documented Codex review actions as implemented while richer Settings health checks remain next in the v4.2 patch train.
+
+## [4.2.3] - 2026-05-06
+
+### Added
+
+- Workflow-engine Codex agent steps for workflow agents configured with Codex provider metadata or Codex agent naming.
+- Codex SDK streaming execution inside workflow step runs, including worktree-aware execution, final response capture, and persisted step output files.
+- Workflow session tracking for Codex thread IDs through `run.context._sessions`, enabling reuse-mode workflows to resume the same Codex thread.
+- Unit coverage for Codex-backed workflow step execution.
+
+### Changed
+
+- Updated workspace package versions and README badge from `4.2.2` to `4.2.3`.
+- Documented Workflow Codex steps as implemented while review actions and richer Settings checks remain next in the v4.2 patch train.
+
+## [4.2.2] - 2026-05-06
+
+### Added
+
+- Codex Cloud delegation through GitHub issue, issue-comment, and PR-comment workflows.
+- `POST /api/github/codex/delegate` for creating scoped `@codex` GitHub delegation prompts from Veritas tasks.
+- Disabled-by-default `codex-cloud` agent profile and `codex-cloud` provider metadata support.
+- Cloud delegation attempt metadata with `cloudUrl` and `cloudTarget` fields.
+- Task comments that link successful Codex Cloud delegations back to the GitHub artifact.
+- Frontend API hook for Codex Cloud delegation.
+
+### Changed
+
+- Updated workspace package versions and README badge from `4.2.1` to `4.2.2`.
+- Documented Codex Cloud delegation as implemented while workflow steps, review actions, and richer Settings checks remain next in the v4.2 patch train.
+
+## [4.2.1] - 2026-05-06
+
+### Added
+
+- Codex SDK session provider powered by `@openai/codex-sdk`, enabling durable local Codex threads for code-task attempts.
+- Disabled-by-default `codex-sdk` agent profile for teams that want SDK-backed sessions alongside the existing `codex` CLI profile.
+- Codex SDK attempt logging for streamed thread, turn, item, error, and usage events.
+- Codex SDK token telemetry mapping and stop support through abortable SDK turns.
+- `threadId` attempt metadata so SDK session IDs are preserved on active and completed attempts for follow-up workflows.
+
+### Changed
+
+- Updated workspace package versions and README badge from `4.2.0` to `4.2.1`.
+- Documented Codex SDK sessions as implemented while keeping Cloud delegation, workflow steps, review actions, and richer Settings checks in the v4.2 patch train.
+
+## [4.2.0] - 2026-05-06
+
+### Added
+
+- OpenAI Codex integration roadmap for v4.2, covering local Codex CLI execution, Codex SDK sessions, Codex Cloud delegation, MCP setup, workflow-engine execution, telemetry, review automation, and release QA (#310)
+- Codex Integration SOP with operational guidance for CLI, SDK, Cloud, MCP, telemetry mapping, reviews, workflow steps, escalation, and release validation (#310)
+- Codex workflow examples for local feature work, Codex review, SDK follow-up sessions, workflow pipelines, Cloud delegation, MCP-first board maintenance, and release QA (#310)
+- Codex-specific AGENTS.md guidance and MCP setup instructions for Veritas-aware Codex work (#310)
+- Codex feature reference in `docs/FEATURES.md`, updated to distinguish implemented CLI support from planned SDK, Cloud, review, and workflow modes (#310)
+- Built-in `codex` agent profile backed by local `codex exec --sandbox workspace-write --json`
+- Local Codex CLI execution path for code-task attempts, including process launch in the task worktree, attempt logs, final summary capture, completion handling, stop support, and run/token telemetry mapping
+- Config migration that appends missing built-in agents, including Codex, to existing configs without overwriting customized agents
+
+### Changed
+
+- Updated workspace package versions and README badge from `4.1.0` to `4.2.0` (#311)
+
+## [4.1.0] - 2026-05-04
+
+### Added
+
+- QMD-backed search foundation with keyword fallback across active tasks, archived tasks, and docs (#290)
+- In-app search dialog with backend and collection controls, fallback status, and task-result navigation (#291)
+- Duplicate detection hints in the create-task dialog using active and archived task retrieval (#292)
+- VERITAS chat context injection with compact, cited `<veritas_context>` blocks and per-message opt-out (#293)
+- QMD index maintenance commands and API refresh endpoint:
+  - `pnpm qmd:setup`
+  - `pnpm qmd:refresh`
+  - `POST /api/search/index/refresh` (#294)
+
+### Changed
+
+- Documented the v4.1 QMD setup, search UI, duplicate detection, VERITAS context injection, and index maintenance workflows
+- Updated package versions from `4.0.1` to `4.1.0`
+
+## [4.0.1] - 2026-05-04
+
+### Fixed
+
+- Restored task detail side-popout spacing after the shadcn/ui v4 sheet padding change
+- Prevented task detail tabs from being squeezed in code-task popouts by allowing horizontal tab overflow
+- Mass archive failure caused by missing `/api/tasks/bulk-archive-by-ids` endpoint
+- MIME validation test fixtures now use valid PNG IHDR chunks (#266)
+- Status history tests isolated from real state
+- Build order: shared package built before server and web (#244)
+
+### Changed
+
+- Batch file reads use bounded concurrency for improved task loading performance (#255)
+- Shared package exports governance, policy, and workflow types (#256)
+- Bumped pnpm/action-setup from v4 to v5 (#260)
+
+### Security
+
+- Required `N8N_WEBHOOK_SECRET` for unauthenticated n8n webhook requests
+- Hardened n8n webhook secret comparison, attachment type checks, filename sanitization, and path containment
+- Patched high and moderate dependency advisories for `@xmldom/xmldom`, `hono`, `postcss`, and `sanitize-html`
+- Hardened localhost bypass and broadcast frontmatter parsing (#242)
+- Startup init failures now fatal with shutdown timeouts (#241)
+- Config cache stampede prevention and corrupted activity file logging (#240)
+- WebSocket event listener leak fix and message rate limiting (#239)
+- Promise handling fixes preventing crashes and data loss (#238)
+- Enforced HS256 algorithm in JWT verification (#237)
+
+### Docs
+
+- v4.0 governance security audit (#265)
+- Comprehensive unit tests for v4.0 governance services (#263)
+- Feedback, chat, and system-health route tests (#257)
+
+## [4.0.0] - 2026-03-21
+
+### ✨ Highlights
+
+**Veritas Kanban 4.0 is the agent governance release.** This release adds a complete Agent Governance Layer — configurable policies, behavioral drift detection, decision audit trails, output evaluation, and user feedback analytics — alongside a fully customizable dashboard widget grid, a Prompt Template Registry with version control, and a real-time Global System Health Status Bar.
+
+All shadcn/ui components have been upgraded to v4 with Tailwind v4 integration. This release also adds MCP comment CRUD tools and project management tools, wires lifecycle hooks to the notification service, and ships seven new SOP guides plus updated API documentation.
+
+### Added
+
+- **Agent Policy & Guard Engine (#178)** — Configurable tool/action policies with guard rules
+  - Define policies with `allow`/`deny`/`require-approval` guard rules per tool and action
+  - Policy evaluation engine with configurable precedence (deny-first or allow-first)
+  - REST API: `GET/POST /api/policies`, `GET/PUT/DELETE /api/policies/:id`, `POST /api/policies/:id/evaluate`
+  - Per-agent and per-project policy scoping
+  - Built-in audit log for every policy decision
+
+- **Decision Audit Trail with Assumption Tracking (#179)** — Log agent decisions with assumptions and outcomes
+  - Structured decision records: decision text, confidence score, supporting evidence, assumptions
+  - Outcome tracking: record what happened after a decision and whether assumptions held
+  - Full-text search and filtering by agent, task, confidence range
+  - REST API: `GET/POST /api/decisions`, `GET/PUT/DELETE /api/decisions/:id`, `POST /api/decisions/:id/outcome`
+
+- **Agent Output Evaluation & Scoring Framework (#180)** — Quality scoring for agent outputs
+  - Scoring profiles with weighted criteria: `RegexMatch`, `KeywordContains`, `NumericRange`, `CustomExpression`
+  - Composite scoring methods: `weightedAvg`, `minimum`, `geometricMean`
+  - Evaluation history with per-scorer breakdown and per-dimension explanations
+  - REST API: `GET/POST /api/scoring/profiles`, `GET/PUT/DELETE /api/scoring/profiles/:id`, `POST /api/scoring/evaluate`, `GET /api/scoring/history`
+
+- **Behavioral Drift Detection & Alerting (#181)** — Detect and alert on agent behavior changes
+  - Metric tracking with configurable baselines and alert thresholds
+  - Drift status lifecycle: `ok` → `warning` → `alert` → `resolved`
+  - Automatic timestamp of detection and resolution events
+  - REST API: `GET/POST /api/drift`, `GET/PUT/DELETE /api/drift/:id`, `POST /api/drift/:id/resolve`
+
+- **User Feedback Loop with Sentiment Analytics (#182)** — Collect and analyze user feedback on agent outputs
+  - Feedback collection with sentiment (`positive`/`neutral`/`negative`) and category tagging
+  - Aggregate analytics: sentiment breakdowns, trends over time, category distributions
+  - REST API: `GET/POST /api/feedback`, `GET/DELETE /api/feedback/:id`, `GET /api/feedback/analytics`
+
+- **Draggable & Resizable Dashboard Widget Grid (#183)** — Customizable dashboard layouts
+  - Drag-and-drop widget repositioning with smooth animations
+  - Resizable widgets with snap-to-grid behavior
+  - Layout persistence via `settings.json`
+  - Add/remove widgets from the widget library
+
+- **Prompt Template Registry with Version Control (#184)** — Manage and version prompt templates
+  - Template CRUD with variable extraction (e.g., `{{agent_name}}`, `{{task_context}}`)
+  - Full version history with changelog entries; rollback to any version
+  - Usage tracking: model, tokens, rendered output (optional)
+  - Preview rendering with sample variable injection
+  - REST API: `GET/POST /api/prompt-registry/templates`, `GET/PUT/DELETE /api/prompt-registry/templates/:id`, `GET /api/prompt-registry/templates/:id/versions`, `POST /api/prompt-registry/templates/:id/versions`, `GET /api/prompt-registry/templates/:id/versions/:versionId`, `POST /api/prompt-registry/templates/:id/preview`, `GET /api/prompt-registry/templates/:id/stats`, `POST /api/prompt-registry/templates/:id/usage`
+
+- **Global System Health Status Bar (#185)** — Real-time system health monitoring
+  - Five health levels: `stable` → `reviewing` → `drifting` → `elevated` → `alert`
+  - Three signal categories: `system` (storage/disk/memory), `agents` (online/offline counts), `operations` (success rate, recent runs)
+  - Persistent header bar with expand/collapse for detail panel
+  - REST API: `GET /api/v1/system/health`
+
+- **MCP comment CRUD tools (PR #206)** — Full comment lifecycle from MCP
+  - New MCP tools: `add_comment`, `list_comments`, `get_comment`, `update_comment`, `delete_comment`
+  - Works with both task-level and sprint-level comments
+
+- **MCP project management tools (PR #227)** — Full project lifecycle from MCP
+  - New MCP tools: `list_projects`, `get_project`, `create_project`, `update_project`, `delete_project`, `get_project_stats`, `reorder_projects`
+
+- **Lifecycle hooks wired to notification service (PR #201)** — Hook outcomes now trigger real-time notifications
+  - Hooks with `notify: true` push events through the notification service
+  - Integrates with @mention notification system for addressable hook alerts
+
+- Comprehensive MCP server documentation at `docs/mcp/README.md` — architecture, quickstart, full tool catalog with examples, security model, troubleshooting playbook, and FAQ
+- Condensed root README MCP section with link to dedicated docs
+
+### Changed
+
+- **Upgraded shadcn/ui components to v4 (#186, PR #219)** — All UI components updated for shadcn/ui v4 compatibility with Tailwind v4 integration; breaking prop changes resolved across the component tree
+
+### Fixed
+
+- **Squad chat panel scroll (PR #225, #224)** — Panel now properly scrolls to latest message; overflow clipping bug in nested flex containers resolved
+- **False cycle detection in dependency API (PR #208, #188)** — DFS algorithm no longer flags valid multi-path dependencies as cycles when two nodes share a common ancestor
+- **TypeScript build errors (PR #207, #177)** — Resolved type mismatches introduced by shadcn/ui v4 and Zod 4 type inference changes
+- **SystemHealthBar successRate percentage display (PR #212, #211)** — `successRate` is now correctly formatted as a percentage (0–100) instead of a decimal (0–1)
+
+## [3.3.3] - 2026-03-01
+
+### ✨ Highlights
+
+**Veritas Kanban 3.3.3 is a patch correction release** delivering stability, security, and performance fixes on top of 3.3.2, plus full Zod 4 API migration completing the TypeScript compilation fix.
+
+### Fixed
+
+- **#162 — Complete Zod 4 API migration** — Resolved 50+ TypeScript compilation errors blocking CI/CD
+  - `ZodError.errors` → `ZodError.issues` across all route files and middleware
+  - `z.record(valueSchema)` → `z.record(z.string(), valueSchema)` for explicit key types
+  - Schema defaults corrected from string to proper numeric/boolean types (`PORT`, `VERITAS_AUTH_ENABLED`, `RATE_LIMIT_MAX`)
+  - `required_error` → `message` in number schemas (`agents.ts`, `agent-schemas.ts`)
+  - Affected: `validate.ts`, `agent-registry.ts`, `workflows.ts`, `lifecycle-hooks.ts`, `tasks.ts`, `reports.ts`, `env.ts`
+
+- **#165 — SSRF protection for webhook URLs** — Added server-side request forgery safeguards for all outbound webhook destinations (replaces #163)
+
+### Added
+
+- **Orchestrator Delegation Enforcement** — Full enforcement gate for orchestrator delegation
+  - Orchestrator agent selector in Settings → Enforcement (dropdown of enabled agents)
+  - Active/Inactive status badge showing enforcement state
+  - Warning banner when delegation enabled but no agent selected
+  - Section auto-disables when delegation toggle is off
+  - Zod-validated `orchestratorAgent` field (string, max 50 chars)
+  - `POST /api/agent/delegation-violation` endpoint for violation reporting
+  - Auto-posts violations to squad chat when squad chat enforcement is enabled
+
+- **Enforcement Gate Toast Notifications** — Enhanced error feedback for all enforcement gates
+  - Gate-specific titles and actionable guidance for REVIEW_GATE, CLOSING_COMMENTS_REQUIRED, DELIVERABLE_REQUIRED, ORCHESTRATOR_DELEGATION
+  - 10-second toast duration for enforcement messages (up from 5s)
+  - BulkActionsBar surfaces gate details on bulk move failures
+
+- **Dashboard Enforcement Indicator** — At-a-glance enforcement status
+  - Shows active/total gate count with color-coded shield icon (green/amber/gray)
+  - Individual gate dots (green = active, gray = off)
+  - Renders in dashboard status bar alongside refresh timestamp
+
+### Performance
+
+- **#167 — WebSocket broadcast batching** — Batch broadcasts to prevent event loop blocking under high-frequency update load (replaces #164/#166)
+
+---
+
+## [3.3.2] - 2026-03-01
+
+### ✨ Highlights
+
+**Veritas Kanban 3.3.2 delivers sprint management for CLI + MCP surfaces** alongside task↔agent state synchronization, security hardening of the sync auth boundary, and a circuit breaker test suite.
+
+### Added
+
+- **#161 — Sprint Management (CLI + MCP)** — Full sprint CRUD and task integration from the command line and MCP
+  - `vk sprint list` — list sprints with `--hidden` / `--json` flags
+  - `vk sprint create` — create sprints with optional description
+  - `vk sprint update` — update label, description, visibility
+  - `vk sprint delete` — delete sprints (with `--force` for non-empty)
+  - `vk sprint close` — archive completed tasks in a sprint
+  - `vk sprint suggestions` — show sprints ready to archive
+  - `vk list -S <sprint>` / `vk create -S <sprint>` / `vk update -S <sprint>` — task sprint integration
+  - MCP tools: `list_sprints`, `create_sprint`, `update_sprint`, `delete_sprint`, `close_sprint`, `sprint_suggestions`
+  - Sprint field surfaced on `list_tasks`, `create_task`, `update_task` MCP tools
+
+- **#155 — Task↔Agent State Sync + Reconciliation** — Bi-directional sync engine keeping task state consistent with agent execution state; reconciliation pass resolves diverged records
+
+- **#156 — Circuit Breaker Test Suite** — 18 new unit tests covering circuit breaker open/half-open/closed transitions, timeout behaviour, and error thresholds
+
+### Fixed
+
+- **#159 — Harden task-agent sync auth boundary** — Tightened authentication checks on sync routes to prevent unauthorized state manipulation (#157 #158)
+
+---
+
+## [3.3.1] - 2026-02-28
+
+### Fixed
+
+- **#153 — Express 5 wildcard route compatibility** — Updated route patterns for Express 5.x compatibility
+- **Security: upgrade hono to >=4.12.2** — Addressed GHSA-xh87-mx6m-69f3 vulnerability
+
+### Changed
+
+- **#148 — Bump vite from 6.4.1 to 7.3.1** — Major version upgrade with performance improvements
+- **#149 — Bump tailwindcss from 3.4.19 to 4.2.1** — Major version upgrade with new features
+- **#154 — Bump production dependencies (8 updates)** — Routine dependency maintenance
+
+---
+
+## [3.3.0] - 2026-02-15
+
+### ✨ Highlights
+
+**Veritas Kanban 3.3 delivers production-grade task intelligence** — four features that significantly improve task management capabilities, reliability, and accessibility. This release represents the culmination of rigorous cross-model development: all features authored by Sonnet, reviewed by Codex, and scored 10/10 across security, reliability, performance, and accessibility through our 4x10 review gate.
+
+**Key improvements:**
+
+- **Dependency graph** prevents circular dependencies through DFS cycle detection that traverses bidirectional relationships
+- **Crash-recovery checkpointing** protects credentials with auto-sanitization of 20+ secret patterns plus regex value detection
+- **Observational memory** preserves critical context across agent sessions with full-text search and importance scoring
+- **Agent filtering** enables precise task queries by agent name with proper input sanitization
+
+### Added
+
+- **#122 — Task Dependencies Graph**
+  - Bidirectional dependency model (depends_on / blocks) with cycle detection
+  - DFS algorithm traverses both directions to prevent dependency loops
+  - Dependency graph API with recursive tree traversal (`GET /api/tasks/:id/dependencies`)
+  - UI: DependenciesSection component with add/remove for both directions
+  - TaskCard badges showing dependency count
+  - Zod validation on dependency routes
+  - Batch-loaded graph traversal (eliminated N+1 queries)
+  - Full keyboard + ARIA accessibility
+
+- **#123 — Crash-Recovery Checkpointing**
+  - Save/resume/clear API (`POST/GET/DELETE /api/tasks/:id/checkpoint`)
+  - Auto-sanitization of secrets (20+ key patterns + regex value detection)
+  - 1MB size limit on checkpoint state with 24h expiry and automatic cleanup
+  - Resume counter tracks restart attempts
+  - Sub-agent checkpoint context injection into prompts
+  - Array sanitization (nested objects + primitive strings)
+  - NaN timestamp handling
+  - ARIA-accessible checkpoint UI in TaskCard + TaskDetailPanel
+
+- **#124 — Observational Memory**
+  - Add/view/delete observations per task (decision, blocker, insight, context types)
+  - Importance scoring (1-10) with visual badges
+  - Full-text search across all task observations (`GET /api/observations/search`)
+  - Paginated search results (limit/offset, max 200)
+  - Timeline view with type-colored badges
+  - Activity logging for audit trail
+  - XSS prevention via sanitizeCommentText()
+  - ARIA-accessible range slider + decorative icon handling
+
+- **#125 — Agent Filter**
+  - `GET /api/tasks?agent=name` query parameter
+  - Input sanitized (trim + 100 char cap)
+  - Works with existing pagination and filters
+  - JSDoc/OpenAPI documented
+
+### Technical Notes
+
+All features passed comprehensive security review:
+
+- Input sanitization on all user-facing fields
+- XSS prevention in observational memory comments
+- Secret detection and auto-sanitization in checkpoints
+- Cycle detection prevents infinite loops in dependency traversal
+
+## [3.2.1] - 2026-02-12
+
+### Fixed
+
+- **reviewGate enforcement** — Now only applies to code task types (code, bug, feature, automation, system) — research, content, and custom types no longer blocked
+- **Defensive settings access** — Prevents crash on missing config sections across all 8 settings tabs (General, Enforcement, Time Tracking, Agents, Projects, Sprints, Templates, Types)
+- **Settings toggle persistence** — Fixed deepMergeDefaults overwriting user changes; now uses proper patch merging to preserve toggle states
+- **SharedResources toggle persistence** — SharedResources and DocFreshness enabled/disabled states now correctly saved to `settings.json`
+- **Squad chat visibility** — System messages now render as gray message bubbles (previously invisible dividers)
+- **Time tracking telemetry** — Fixed corrupt 17K-hour entry, added 7-day (604,800,000 ms) cap on `durationMs` validation
+- **Archived task reappearance** — Tasks no longer reappear on board after archival (orphaned files from title changes now cleaned up via `findTaskFile`)
+- **EnforcementTab formatting** — reviewGate warning text properly formatted, "Quality Gates" duplicate header removed
+
+### Added
+
+- **PRD-Driven Autonomous Development guide** — Complete 961-line guide at `docs/features/prd-driven-development.md` covering setup, agent execution workflow, OAuth2 example, configuration tips, and troubleshooting
+- **Time tracking bugfix post-mortem** — Documented 17K-hour telemetry bug in `docs/bugfix-time-tracking-17k-hours.md`
+
+### Changed
+
+- **Consistent gray styling** — Squad chat system messages now use muted theme tokens for subtle gray appearance
+- **Theme token usage** — Settings UI updated to use Shadcn theme tokens instead of hardcoded Tailwind colors
+
+## [3.2.0] - 2026-02-11
+
+### Added
+
+- **Markdown Editor** — Rich markdown editing for task descriptions and comments with formatting toolbar, live preview, keyboard shortcuts (Ctrl+B/I/K), syntax highlighting, and dark mode support. Configurable via Settings → Tasks.
+- **Shared Resources Registry** — Define reusable resources (prompts, guidelines, skills, configs, templates) and mount them across projects. Full CRUD API with mount/unmount endpoints. Configurable via Settings → Shared Resources.
+- **Documentation Freshness Tracking** — Track document staleness with freshness scores, alerts, and optional auto-review task creation. API at `/api/doc-freshness`. Configurable via Settings → Doc Freshness.
+
+### Fixed
+
+- Persist runtime auth/config state to the Docker volume by routing `.veritas-kanban` paths through `getRuntimeDir()` and migrating legacy files on startup (`security.json`, agent registry, lifecycle hooks, error analyses, agent permissions).
+- Added Docker migration guidance for recovering auth state after rebuilding containers.
+- Dark mode Lessons Learned display bug fixed (text was unreadable in dark mode)
+- Plain text card previews for task descriptions (markdown rendering disabled on board cards for performance)
+- JWT rotation test flakiness fixed (timing issue resolved)
+
+## [3.1.0] - 2026-02-10
+
+### Added
+
+- **6 structural enforcement gates** (all disabled by default):
+  - `squadChat`, `reviewGate`, `closingComments`, `autoTelemetry`, `autoTimeTracking`, `orchestratorDelegation`
+- **Comprehensive enforcement documentation** with a dedicated "For AI Agents" section
+- **Agent SOP enforcement awareness** updates
+
+### Fixed
+
+- Enforcement gate logic (correct `=== true` checks)
+- TelemetryService supports backdated timestamps
+- TelemetryService respects `DATA_DIR` in Docker environments
+- Zod schema allows optional timestamp on telemetry events
+- Template YAML serialization (recursive `cleanForYaml`)
+- Case-insensitive agent color lookup in squad chat
+
+**Issue:** #115
+
+---
+
+## [3.0.0] - 2026-02-09
+
+### ✨ Highlights
+
+**Veritas Kanban 3.0 ships the workflow engine** — a deterministic multi-step agent orchestration system that transforms VK from an ad-hoc task board into a repeatable, observable, and reliable agent execution platform. Think GitHub Actions for AI agents.
+
+**14,079 lines of code shipped across 6 major phases:**
+
+- Phase 1: Core workflow engine (~7,091 lines)
+- Phase 2: Run state management (~1,409 lines)
+- Phase 3: Frontend + real-time updates (~3,069 lines)
+- Phase 4: Advanced orchestration (~2,255 lines)
+- Dashboard: Monitoring & health metrics (~2,050 lines)
+- Policies & Sessions: Tool policies + session isolation (~1,200 lines)
+
+### Added
+
+#### Core Workflow Engine (Phase 1 — #107)
+
+- **YAML workflow definitions** — Define multi-step agent pipelines as version-controlled YAML files
+- **Workflow CRUD API** — 9 REST endpoints for workflow management:
+  - `GET /api/workflows` — List all workflows
+  - `GET /api/workflows/:id` — Get workflow definition
+  - `POST /api/workflows` — Create workflow
+  - `PUT /api/workflows/:id` — Update workflow (auto-increment version)
+  - `DELETE /api/workflows/:id` — Delete workflow
+  - `POST /api/workflows/:id/runs` — Start a run
+  - `GET /api/workflow-runs` — List runs (filterable by workflow, task, status)
+  - `GET /api/workflow-runs/:id` — Get run details
+  - `POST /api/workflow-runs/:id/resume` — Resume blocked run
+- **Sequential step execution** — Execute workflow steps in order with retry routing
+- **Step types: agent** — Agent steps spawn OpenClaw sessions with prompts (Phase 1 placeholder)
+- **Template rendering** — Basic `{{variable}}` and `{{nested.path}}` substitution in step inputs
+- **Acceptance criteria validation** — Simple substring matching for step completion checks
+- **Retry routing** — Three strategies: retry same step, retry different step (`retry_step`), escalate to human
+- **Workflow snapshot** — YAML saved in run directory for version immutability
+- **RBAC** — Role-based access control with ACL files (`.acl.json`)
+- **Audit logging** — All workflow changes logged to `.audit.jsonl`
+- **Zod validation** — Schema validation for workflow definitions
+- **Storage structure** — File-based persistence in `.veritas-kanban/workflows/` and `.veritas-kanban/workflow-runs/`
+
+#### Run State Management (Phase 2 — #113, #110, #111, #108)
+
+- **Persistent run state** — Run state survives server restarts via checkpoint timestamps
+- **Progress file tracking** (#108) — Shared `progress.md` per run for context passing between steps
+- **Step output resolution** — Template variables like `{{steps.plan.output}}` resolve from previous step outputs
+- **Retry delays** — Configurable `retry_delay_ms` to prevent rapid retry loops
+- **Tool policies** (#110) — Role-based tool restrictions:
+  - 5 default roles: `planner`, `developer`, `reviewer`, `tester`, `deployer`
+  - Each role has allowed/denied tool lists
+  - Custom role CRUD via `/api/tool-policies` endpoints
+  - Tool filter passed to OpenClaw sessions (ready for Phase 3 integration)
+- **Fresh session per step** (#111) — Each workflow step can spawn a fresh OpenClaw session:
+  - Session modes: `fresh` (new session) or `reuse` (continue existing)
+  - Context injection: `minimal`, `full`, or `custom` (specify which steps to include)
+  - Cleanup modes: `delete` (terminate after step) or `keep` (leave running for debugging)
+  - Configurable timeout per step
+- **Session tracking** — Session keys stored in `run.context._sessions` per agent
+- **Backward compatible** — Legacy `fresh_session: false` maps to `session: reuse`
+
+#### Frontend + Real-Time Updates (Phase 3 — #107 frontend)
+
+- **WorkflowsPage** — Browse and start workflow runs:
+  - Grid view of all workflows with metadata (name, version, agents, steps)
+  - "Start Run" button → calls `POST /api/workflows/:id/run`
+  - Active run count badges per workflow
+  - Search filter
+  - Lazy-loaded in App.tsx
+- **WorkflowRunView** — Live step-by-step workflow run visualization:
+  - Real-time step progress display
+  - Each step shows status, agent, duration, retry count, output preview, errors
+  - Color-coded step status (green=completed, blue=running, red=failed, yellow=skipped, gray=pending)
+  - "Resume" button for blocked runs
+  - Overall progress bar (step X of Y)
+  - Auto-updates via WebSocket `workflow:status` events
+- **WorkflowRunList** — Filter and browse runs:
+  - Filter by status (all, running, completed, failed, blocked, pending)
+  - Click to open WorkflowRunView
+  - Progress bars, duration tracking
+- **WorkflowSection** — Run workflows from TaskDetailPanel:
+  - Shows available workflows
+  - Displays active runs for current task
+  - "Start" button with task context
+  - Dialog modal
+- **Navigation tab** — "Workflows" tab added to header with icon
+- **WebSocket integration** — Real-time updates via `workflow:status` events
+- **Polling fallback** — Aggressive polling (10-30s) when WebSocket disconnected, safety-net polling (120s) when connected
+- **~75% reduction in API calls** when WebSocket connected
+
+#### Advanced Orchestration (Phase 4 — #112, #113)
+
+- **Loop steps** (#112) — Iterate over collections with progress tracking:
+  - Configuration: `over`, `item_var`, `index_var`, `completion` policy, `fresh_session_per_iteration`
+  - Completion policies: `all_done`, `any_done`, `first_success`
+  - Loop state tracking: `totalIterations`, `currentIteration`, `completedIterations`, `failedIterations`
+  - Output per iteration saved to `step-outputs/<step-id>-<iteration>.md`
+  - Loop variables accessible in templates: `{{loop.index}}`, `{{loop.total}}`, `{{loop.completed}}`
+  - Max 1000 iterations safety limit
+  - `continue_on_error` flag to skip failed iterations
+  - `verify_each` and `verify_step` for post-iteration validation (wired in types, executor pending)
+- **Gate steps** — Conditional blocking with approval workflow:
+  - Boolean expressions: `{{test.status == "passed" and verify.decision == "approved"}}`
+  - Supports `==`, `and`, `or` operators with variable access
+  - Blocking behavior: run status changes to `blocked` if condition fails
+  - Approval API: `POST /api/workflow-runs/:runId/steps/:stepId/approve` and `/reject`
+  - Escalation policies: `escalate_to: human` blocks, timeout support
+- **Parallel steps** — Fan-out/fan-in execution:
+  - Execute multiple sub-steps concurrently via `Promise.allSettled()`
+  - Completion criteria: `all` (all must succeed), `any` (at least one), `N` (at least N sub-steps)
+  - `fail_fast` flag aborts remaining sub-steps on first failure
+  - Aggregated JSON output with per-sub-step status, outputs, errors
+  - Max 50 concurrent sub-steps (soft limit)
+- **Enhanced acceptance criteria** — Regex patterns and JSON path equality:
+  - Regex: `/^STATUS:\s*done$/i`
+  - JSON path: `output.decision == "approved"`
+  - Backward compatible substring matching
+- **Expression evaluator** — Safe variable access and boolean logic (no arbitrary code execution)
+
+#### Workflow Dashboard (#114)
+
+- **Summary cards** (6 metrics):
+  - Total workflows defined
+  - Active runs (currently executing)
+  - Completed runs (period-filtered: 24h/7d/30d)
+  - Failed runs (period-filtered)
+  - Average run duration
+  - Success rate (%)
+- **Active runs table** — Live-updating list of currently executing runs:
+  - Workflow ID, status badge, started time, duration, current step, progress (step X/Y)
+  - Click to open WorkflowRunView
+  - Real-time updates via WebSocket
+  - Visual progress bars
+- **Recent runs history** — Last 50 workflow runs:
+  - Sortable by status (all/completed/failed/blocked/pending)
+  - Run ID, status badge, start time, duration, steps completed
+  - Click to open WorkflowRunView
+- **Workflow health metrics** — Per-workflow stats:
+  - Success rate
+  - Average duration
+  - Run counts (total, completed, failed)
+  - Visual health indicators (green/yellow/red based on success rate)
+- **Real-time updates** — WebSocket-driven with polling fallback (30s when disconnected, 120s when connected)
+- **Backend endpoints**:
+  - `GET /api/workflow-runs/active` — Currently running workflows
+  - `GET /api/workflow-runs/stats?period=7d` — Aggregated statistics (total workflows, active, completed, failed, avg duration, success rate, per-workflow breakdown)
+- **Navigation** — "Dashboard" button in WorkflowsPage header
+
+### Changed
+
+#### WebSocket Refactor (Phase 3)
+
+- **All hooks now WebSocket-primary** — Polling is safety net only
+- **Connected behavior** — 120s polling intervals (safety net)
+- **Disconnected behavior** — Aggressive polling resumes (10-30s intervals)
+- **Events** — `task:changed`, `agent:status`, `telemetry:event`, `workflow:status`
+- **Broadcast service** — Centralized `broadcastWorkflowStatus()` function sends full run state (no extra HTTP fetches needed)
+- **13 hooks/components refactored** — All polling intervals updated
+
+### Security
+
+- **ReDoS protection** — Regex patterns validated with size/complexity limits
+- **Expression injection prevention** — Template evaluator only supports safe variable access and boolean operators
+- **Parallel DoS limits** — Max 50 concurrent sub-steps in parallel execution
+- **Gate approval validation** — Authentication and permission checks on approval endpoints
+- **Path traversal protection** — `sanitizeFilename` on all file writes
+
+### Performance
+
+- **~75% reduction in API calls** — When WebSocket connected, polling drops to 120s safety-net intervals
+- **Progress file size cap** — 10MB limit prevents unbounded growth
+- **Lazy-loaded frontend** — WorkflowsPage, WorkflowDashboard only render when navigated to
+- **Memoized filters** — `useMemo` for filtered workflows/runs
+- **Skeleton loading states** — Shimmer placeholders during data fetch
+
+---
+
+## [2.1.4] - 2026-02-09
+
+### Fixed
+
+- **Status Counter Accuracy** (#104) — Sidebar task counts now use a dedicated `GET /api/tasks/counts` endpoint that returns total counts by status, independent of time-range filters applied to the board view
+  - **New:** `server/src/routes/tasks.ts` — `/api/tasks/counts` endpoint returns `{ todo, in_progress, review, done, blocked, cancelled }`
+  - **New:** `web/src/hooks/useTaskCounts.ts` — dedicated React hook for sidebar counts
+  - **Updated:** `BoardSidebar.tsx` — uses `useTaskCounts()` instead of deriving from filtered task list
+  - Cache invalidation wired to task mutations so counts stay in sync
+
+- **Bulk Operation Timeouts** (#105) — Bulk archive, status update, and backlog demote operations now use single API calls instead of N individual requests
+  - **New:** `POST /api/tasks/bulk-update` — update status for multiple tasks in one call
+  - **New:** `POST /api/tasks/bulk-archive-by-ids` — archive multiple tasks by ID array
+  - **New:** `POST /api/backlog/bulk-demote` — demote multiple tasks to backlog in one call
+  - All bulk endpoints validate array size (max 100) to prevent abuse
+  - Operations run in parallel via `Promise.allSettled()` (~26× faster for large batches)
+  - **Updated:** `BulkActionsBar.tsx` — rewired to use bulk endpoints instead of sequential loops
+  - **Updated:** `useTasks.ts`, `useBacklog.ts` — new mutation hooks for bulk operations
+
+### Changed
+
+- **Squad Chat Documentation** (#106) — Updated `SQUAD_CHAT_IMPLEMENTATION.md` to clarify that the `model` field is a structural JSON field in the API, not a text instruction
+
+## [2.1.3] - 2026-02-07
+
+### Fixed
+
+- **Docker Path Standardization** (#102) — Comprehensive refactor: created shared `paths.ts` utility and migrated all 7 services to use it
+  - **New:** `server/src/utils/paths.ts` — single source of truth for all path resolution
+  - **Refactored:** task-service, activity-service, chat-service, audit-service, metrics/helpers, backlog-repository (7 files total)
+  - **Resolution priority:** `DATA_DIR` / `VERITAS_DATA_DIR` env var → project root auto-discovery → fallback
+  - **Safety:** Filesystem root guard prevents silent `/` resolution (the original EACCES bug)
+  - **Backwards compatible:** Existing `DATA_DIR` configurations continue to work unchanged
+  - **Cross-model reviewed:** 10/10/10/10 (GPT-5.1 authored, Claude Sonnet 4.5 reviewed)
+
+## [2.1.2] - 2026-02-07
+
+### Fixed
+
+- **Docker Path Resolution** (#102) — Fixed WORKDIR resolution so services correctly find `.veritas-kanban` in containerized deployments
+  - **Root cause:** Services use `process.cwd()/..` to locate project root; with `WORKDIR /app` this resolved to `/` (filesystem root), causing `EACCES: permission denied` on container startup
+  - **Fix:** Changed production WORKDIR to `/app/server`, ensured `/app/tasks` and `/app/server` are writable
+  - **Impact:** Resolves permission denied errors when starting VK in Docker containers
+  - Related: Issue #102 (Docker: Standardize .veritas-kanban path resolution across services)
+
+## [2.1.1] - 2026-02-07
+
+### Fixed
+
+- **Reverse Proxy Support** (#100) — Added `TRUST_PROXY` environment variable for deployments behind nginx, Caddy, Traefik, Synology DSM, and other reverse proxies. Fixes `express-rate-limit` ValidationError and WebSocket authentication loops caused by untrusted `X-Forwarded-For` headers.
+  - Supports hop counts (`TRUST_PROXY=1`), named values (`loopback`, `linklocal`), and subnet strings
+  - `TRUST_PROXY=true` is blocked by default (security hardening — logs warning, falls back to no trust)
+  - Disabled by default — no behavior change for existing deployments
+  - Documentation added for nginx, Caddy, and Docker Compose configurations
+
+### Security
+
+- Blocked `TRUST_PROXY=true` to prevent accidental trust-all-proxies misconfiguration on public-facing deployments
+
+## [2.0.0] - 2026-02-06
+
+### ✨ Highlights
+
+**Veritas Kanban 2.0 is the multi-agent release.** 18 features shipped across agent orchestration, dashboard analytics, lifecycle automation, and developer experience. This release transforms VK from a single-agent task board into a full multi-agent orchestration platform.
+
+### Added
+
+#### Multi-Agent System (#28, #29, #30, #31)
+
+- **Agent Registry** (#52) — Service discovery with heartbeat tracking, capabilities, live status, REST API for register/deregister/heartbeat/stats
+- **Multi-Agent Dashboard Sidebar** (#28) — Real-time agent status cards in board sidebar, expandable details, color-coded status indicators (green=working, purple=sub-agent, gray=idle, red=error)
+- **Multi-Agent Task Assignment** (#29) — Assign multiple agents to a single task, color-coded agent chips in task detail and board cards, shared helper utilities
+- **@Mention Notifications** (#30) — @agent-name parsing in comments, thread subscriptions, delivery tracking, notification bell
+- **Agent Permission Levels** (#31) — Intern / Specialist / Lead tiers with configurable approval workflows and autonomy boundaries
+
+#### Dashboard Analytics (#57, #58, #59, #60, #61)
+
+- **Where Time Went** (#57) — Time breakdown by project via telemetry data with color-coded project bars
+- **Activity Clock** (#58) — 24-hour donut chart showing agent work distribution, sourced from status-history transitions
+- **Hourly Activity Chart** (#59) — Bar chart with per-hour event counts, sourced from status-history
+- **Wall Time Toggle** (#60) — Total Agent Time + Avg Run Duration with explanatory tooltips
+- **Session Metrics** (#61) — Session count, success rate, completed/failed/abandoned tracking
+
+#### Lifecycle & Automation
+
+- **Task Lifecycle Hooks** (#72) — 7 built-in hooks (subtask-gate, assignee-required, blocked-reason, done-checklist, auto-archive, time-tracking, notification), 8 lifecycle events, custom hooks API
+- **Documentation Freshness** (#74) — Steward workflow with freshness headers (`fresh-days`, `owner`, `last-verified`), 3-phase automation plan
+- **Error Learning Workflow** (#91) — Structured failure analysis, similarity search for recurring issues, stats API. Inspired by @nateherk's Klouse dashboard concept.
+
+#### Developer Experience
+
+- **Markdown Rendering** (#63) — MarkdownText component for rich text in task descriptions and comments
+- **Cost Prediction** (#54) — Multi-factor cost estimation model (tokens, compute, overhead) for task budgeting
+- **CLI Usage Reporting** (#50) — `vk usage` command for token and cost reporting from the terminal
+- **Dashboard Widget Toggles** (#92) — Show/hide individual dashboard widgets with settings gear and localStorage persistence
+- **Production Binding** (#55) — `VK_HOST` and `VK_PORT` environment variables for flexible deployment
+- **Custom favicon** — Purple scales-of-justice SVG icon replacing the default Vite favicon
+
+### Changed
+
+- **Timezone-aware metrics** — Server reports its timezone dynamically in all API response `meta`; clients can request metrics in their local timezone via `?tz=<offset>` query parameter
+- **Activity data source** — Activity Clock and Hourly Activity Chart now pull from `status-history` (reliable state transitions) instead of `activity.json`
+- **Cost-per-task clickability** — Enhanced hover states, border effects, and arrow indicator
+- **Archive optimistic updates** — Archive mutations now remove tasks from cache immediately via `onMutate`, with rollback on error
+- **Agent naming convention** — Agent names use ALL CAPS for acronyms (VERITAS, TARS, CASE, K-2SO, R2-D2, MAX)
+
+### Fixed
+
+- **Daily Activity 100% bug** — Utilization was calculated using UTC dates but displayed in local timezone, causing incorrect percentages
+- **Feb 3 telemetry outlier** — 66-minute run normalized to 19min (p95 level)
+- **Feb 2 telemetry outliers** — 3 runs (15-19min range) normalized to 10min
+- **Registry stats interface mismatch** — Frontend expected `totalAgents`/`onlineAgents` but server sent `total`/`online`; interface updated to match server
+
+### Security
+
+- **MCP SDK vulnerability patched** — Updated `@modelcontextprotocol/sdk` from 1.25.3 to ^1.26.0 (GHSA-345p-7cg4-v4c7, cross-client data leak)
+- **Rate limiting documented** — README now warns that VK does not include built-in rate limiting; reverse proxy recommended for public deployments
+
+### Maintenance
+
+- **21 stale feature branches cleaned** — Down to `main` only
+- **README roadmap updated** — Reflects v2.0 shipped features, v1.6.0 and earlier history preserved
+- **Version bumped** across all packages (root, server, web, shared, mcp)
+
+### Credits
+
+- [@nateherk](https://github.com/nateherk) — Error learning workflow inspired by Klouse dashboard concept
+- [@mvoutov](https://github.com/mvoutov) — Documentation freshness inspired by BoardKit Orchestrator
+
+---
+
+## [1.6.0] - 2026-02-05
+
+### ✨ Highlights
+
+- **Activity Page Redesign** — Streamlined to focus on status history with full-width layout, clickable task navigation, and color-coded status badges
+- **Task Templates UI (#39)** — Full management interface for creating, editing, and instantiating task templates with blueprints
+- **Analytics API (#43)** — New endpoints for timeline visualization and aggregate metrics (parallelism, throughput, lead time)
+- **Status Transition Hooks** — Quality gates and automated actions for task status changes
+- **7 GitHub Issues Closed** — #47, #48, #49, #51, #53, #56, #82 verified complete and documented
+
+### Added
+
+#### Activity Page Improvements
+
+**Full-Width Status History:**
+
+- Removed activity feed column — status history now spans full width
+- Removed redundant "Status History" header label
+- Daily summary panel retained above status history
+- Cleaner, more focused interface for monitoring agent activity
+
+**Clickable Task Navigation:**
+
+- Status history entries now clickable to open task detail panel
+- Keyboard accessible (Enter/Space to activate)
+- Hover state indicates interactivity
+
+**Color-Coded Status Badges:**
+
+- Agent status colors:
+  - `working` / `thinking` — Green
+  - `sub-agent` — Purple
+  - `idle` — Gray
+  - `error` — Red
+- Task status colors (Kanban columns):
+  - `todo` — Slate
+  - `in-progress` — Amber
+  - `blocked` — Red
+  - `done` — Blue
+- Task titles colored to match their new status
+- Uniform badge width for visual consistency
+
+**Task Status Changes:**
+
+- Now shows both agent status changes AND task status changes
+- Task status changes display with kanban column colors
+- Unified timeline view of all activity
+
+**Files:**
+
+- `web/src/components/activity/ActivityFeed.tsx` — Redesigned component
+- `web/src/hooks/useStatusHistory.ts` — Updated color functions
+
+#### Task Templates UI (#39)
+
+Full management interface for task templates:
+
+**Templates Page (`/templates`):**
+
+- Grid view of all templates with category grouping
+- Search and filter by category
+- Quick actions: Edit, Preview, Delete, Create Task
+- Empty state with helpful onboarding
+
+**Template Editor Dialog:**
+
+- Create and edit templates
+- Configure task defaults (type, priority, project, agent)
+- Add subtask templates with ordering
+- Blueprint support for multi-task workflows
+- Validation and error handling
+
+**Template Preview Panel:**
+
+- Read-only preview of template configuration
+- Shows all defaults and subtasks
+- One-click task creation from template
+
+**Files:**
+
+- `web/src/components/templates/TemplatesPage.tsx`
+- `web/src/components/templates/TemplateEditorDialog.tsx`
+- `web/src/components/templates/TemplatePreviewPanel.tsx`
+- `server/src/routes/templates.ts`
+- `server/src/services/template-service.ts`
+
+#### Analytics API (#43)
+
+New endpoints for advanced metrics and visualization:
+
+**Timeline Endpoint:**
+`GET /api/analytics/timeline`
+
+- Returns task execution timeline data
+- Includes start/end times from time tracking
+- Task assignments and status history
+- Parallelism snapshots (concurrent tasks over time)
+- Query params: `from`, `to`, `agent`, `project`, `sprint`
+
+**Metrics Endpoint:**
+`GET /api/analytics/metrics`
+
+- Aggregate metrics for a time period:
+  - Parallelism factor (average concurrent tasks)
+  - Throughput (tasks completed per period)
+  - Lead time (creation to completion)
+  - Agent utilization (working time per agent)
+  - Efficiency metrics (tracked vs total time)
+- Query params: `sprint`, `from`, `to`, `project`
+
+**Files:**
+
+- `server/src/routes/analytics.ts`
+- `server/src/services/analytics-service.ts`
+- `server/src/schemas/analytics-schemas.ts`
+- `docs/API-analytics.md` — Swagger-style documentation
+
+#### Status Transition Hooks
+
+Quality gates and automated actions for task status changes:
+
+**Pre-Transition Gates:**
+
+- Must pass before status change is allowed
+- Examples: require description, require time logged, require code review
+
+**Post-Transition Actions:**
+
+- Fire after status change succeeds
+- Examples: notify channel, update external system, trigger automation
+
+**Configuration:**
+
+- Stored in `.veritas-kanban/transition-hooks.json`
+- Configurable per-transition (e.g., `in-progress` → `done`)
+- Enable/disable globally or per-rule
+
+**Files:**
+
+- `server/src/services/transition-hooks-service.ts`
+- `server/src/routes/transition-hooks.ts`
+- `shared/src/types/transition-hooks.ts`
+
+#### CLI Setup Wizard
+
+Interactive onboarding for new users:
+
+```bash
+vk setup
+```
+
+- Guided configuration of API URL and auth
+- Creates `.veritas-kanban/config.json`
+- Tests connection and validates setup
+- Shows next steps and helpful commands
+
+**Files:**
+
+- `cli/src/commands/setup.ts`
+
+#### Prompt Registry
+
+10 copy/paste prompt templates in `docs/prompt-registry/`:
+
+1. **task-breakdown.md** — Epic → subtasks decomposition
+2. **code-review.md** — Cross-model review prompt
+3. **bug-fix.md** — Structured debugging approach
+4. **documentation.md** — Doc writing guidelines
+5. **security-audit.md** — Security review checklist
+6. **research.md** — Research task structure
+7. **content-creation.md** — Content production workflow
+8. **sprint-planning.md** — Sprint setup prompt
+9. **standup-report.md** — Daily standup generation
+10. **lessons-learned.md** — Post-task reflection
+
+### Fixed
+
+#### Security
+
+**SEC-001: Path Traversal Vulnerability**
+
+- Added validation to trace and template services
+- Prevents `../` path injection in file operations
+- All file paths now resolved and validated against allowed directories
+
+#### Performance
+
+**Telemetry Streaming:**
+
+- Large telemetry reads now streamed instead of loaded into memory
+- Pagination pushed to service layer
+- Optimized lookups for common queries
+
+#### Quality
+
+**React Strict Mode Compliance:**
+
+- Replaced `Math.random()` with `crypto.randomUUID()` for keys
+- Fixed type alignment issues
+- Resolved React warning about duplicate keys
+
+### Changed
+
+#### Dashboard
+
+- Sidebar task counts now show current state, not time-filtered counts
+- Archive/delete/restore operations now correctly find files on disk
+- Metrics cache invalidation on status changes
+
+### Closed Issues
+
+| Issue | Title                                         | Implementation                 |
+| ----- | --------------------------------------------- | ------------------------------ |
+| #82   | Dev reliability (health, dev:clean, watchdog) | Health endpoints + dev scripts |
+| #56   | Dashboard filter bar with presets             | DashboardFilterBar component   |
+| #53   | Per-model cost tables & calculation           | Cost tracking in telemetry     |
+| #51   | Standup summary with model usage              | /api/summary/standup           |
+| #49   | Dashboard Model Usage & Cost panel            | Tokens Card + Cost per Task    |
+| #48   | Global usage aggregation service & API        | /api/metrics/\* endpoints      |
+| #47   | Model Usage schema, types & API               | Full telemetry system          |
+
+---
+
+## [1.5.0] - 2026-02-04
+
+### ✨ Highlights
+
+- **Comprehensive SOP Documentation Suite** — 8 new guides covering agent workflows, sprint planning, multi-agent orchestration, code review, best practices, examples, and power user tips
+- **Cross-Model Code Review Enforcement** — Claude ↔ GPT review gate now fully documented with RF-002 91% accuracy validation
+- **Bulk Archive Error Handling** — Fixed silent failures in Done column archival with per-task error tracking and user feedback toasts
+- **Sidebar Metrics Sync** — Fixed stale task counts in board sidebar by invalidating metrics cache on status changes
+
+### Added
+
+#### Documentation (#US-1600)
+
+Complete SOP Sprint with 8 new markdown files in `docs/`:
+
+- **GETTING-STARTED.md** — 5-minute quickstart from zero → agent-ready, includes:
+  - Prerequisites, manual setup wizard, UI/CLI task creation
+  - Agent pickup checklist with agent-requests folder flow
+  - Sanity checks section (API health, UI health, agent pickup verification)
+  - Prompt registry guidance (shared resources pattern from BoardKit)
+  - Documentation freshness SOP (AGENTS.md, CLAUDE.md, BEST-PRACTICES.md)
+  - Multi-repo/multi-agent notes with consistent naming conventions
+  - OpenClaw Browser Relay integration notes for auth-required workflows
+  - Credited Neal (@nealmummau) for asking the triggering question
+
+- **SOP-agent-task-workflow.md** — Complete lifecycle (claim → work → complete):
+  - Roles table (PM, Worker, Human Lead)
+  - Lifecycle overview with 6 stages
+  - API/CLI examples for each step (start timer, status change, completion)
+  - Prompt template for consistent agent instructions
+  - Lessons Learned expectations + notification patterns
+  - Escalation paths for blocked tasks, tooling failures, reviewer disputes
+
+- **SOP-sprint-planning.md** — Epic → Sprint → Task → Subtask hierarchy:
+  - Hierarchy table with real examples (MessageMeld, US-1600)
+  - Sprint planner agent prompt template
+  - Bulk API payload for creating entire sprints at once
+  - Estimation pattern (subtasks × 0.5d = effort)
+  - Assignment workflow (leave unassigned for agent pickup)
+  - Example sprint (US-1600 docs sprint + RF-002 bug fix sprint)
+  - After-planning checklist (recap docs, GitHub milestones, standup scheduling)
+
+- **SOP-multi-agent-orchestration.md** — PM + Worker roles:
+  - PM checklist (plan, assign, track, review, report)
+  - Worker handoff template with clear acceptance criteria
+  - Status reporting cadence (daily updates, standup summaries)
+  - Error escalation paths
+  - Opus-as-PM / Codex-as-worker walkthrough example
+
+- **SOP-cross-model-code-review.md** — Non-negotiable opposite-model gate:
+  - Enforcement rule: If Claude wrote it, GPT reviews; if GPT wrote it, Claude reviews
+  - When to trigger reviews (application code required, docs optional, research optional)
+  - Review workflow (create task, opposite model audits, findings as subtasks, fixes tracked)
+  - Reviewer checklist (Security, Reliability, Performance, Accessibility, Docs)
+  - Prompt template for consistent audits
+  - Escalation paths for disagreements
+  - RF-002 reference (91% accuracy validates the approach)
+
+- **BEST-PRACTICES.md** — Patterns that work + anti-patterns to avoid:
+  - 10 "Do This" rules (time tracking, subtasks, acceptance criteria, atomic scope, SOP updates, etc.)
+  - 10 "Don't Do This" anti-patterns (no acceptance, skipping timers, grab-bag tasks, etc.)
+  - Based on real-world usage with agents
+
+- **EXAMPLES-agent-workflows.md** — 6 copy/pasteable recipes:
+  - Feature development (BrainMeld Lessons Learned)
+  - Bug fix (GH-86 bulk archive)
+  - Documentation update (sanity checks in Getting Started)
+  - Security audit (RF-002 style)
+  - Content production (podcast clip → LinkedIn post)
+  - Research & report (Champions dossiers)
+  - Each includes goal, task creation, prompt, workflow steps, and deliverables
+
+- **TIPS-AND-TRICKS.md** — Power user features:
+  - CLI shortcuts (vk begin/done/block/unblock/time/summary)
+  - Keyboard shortcuts (Cmd+K palette, arrow nav, Esc)
+  - Command palette power moves
+  - WebSocket awareness and polling fallback
+  - MCP server setup for Claude Desktop
+  - Git worktree integration patterns
+  - Obsidian/Brain mirroring with brain-write.sh
+  - Dev helpers (dev:clean, dev:watchdog)
+
+- **README.md** — Added "Documentation Map" section listing all new guides with descriptions
+
+#### Fixes
+
+##### GH-86: Bulk Archive Silent Failure (#86)
+
+**Root Cause:** `BulkActionsBar.handleArchiveSelected()` used `Promise.all()` with no error handling. When any single archive failed, the entire batch would silently reject with zero user feedback.
+
+**Fix:**
+
+- Import `useToast` hook
+- Replace `Promise.all()` with per-task error tracking loop
+- Show success toast (e.g., "Archived 5 tasks")
+- Show error toast on partial/full failure with counts
+- Log individual failures to console for debugging
+- Clear selection regardless of outcome
+- **File:** `web/src/components/board/BulkActionsBar.tsx` (+38 lines)
+
+##### GH-87: Sidebar Task Counts Out of Sync (#87)
+
+**Root Cause:** The sidebar uses `useMetrics('24h')` which polls every 30 seconds with 10-second staleTime. Meanwhile, `useUpdateTask` mutations did NOT invalidate the metrics cache, causing up to 30 seconds of stale data after status changes.
+
+**Fix:**
+
+- Add metrics query invalidation to `useUpdateTask.onSuccess()`
+- Only invalidate when task status changes (prevents over-invalidation)
+- Preserves timer state handling (no aggressive blanket invalidation)
+- **File:** `web/src/hooks/useTasks.ts` (+9 lines)
+
+### Scripts
+
+- **scripts/dev-clean.sh** — Added explicit `pnpm` path resolution for launchd sessions (fixes "command not found" in automated restarts)
+- **scripts/dev-watchdog.sh** — Improved restart storm prevention with lock file + PID checking; fixed pnpm path resolution
+
+### CLI
+
+- **`vk setup`** — New guided onboarding wizard that validates environment and helps new users get started:
+  - Checks Node version (requires ≥18)
+  - Verifies server is running and reachable
+  - Tests API authentication
+  - Optionally creates a welcome task with next steps
+  - Supports `--json` output for automation and `--skip-task` to skip sample task
+  - Credit: BoardKit Orchestrator (Monika Voutov) for the wizard pattern inspiration
+
+### Fixed
+
+- **Archive/Delete/Restore** — Fixed "Archive failed" errors caused by filename mismatch when task titles changed after creation. Now uses `findTaskFile()` to locate actual file on disk by task ID prefix instead of computing filename from current title
+- **Sidebar Task Counts** — Fixed metrics showing time-filtered counts (e.g., 33 todo) instead of current board state (e.g., 124 todo). `/api/metrics/all` now returns current task status counts regardless of period filter; period only applies to telemetry metrics (runs, tokens, duration)
+- **Backlog Count API** — Fixed double-wrapped response (`{data: {success, data: {count}}}`) by letting `responseEnvelopeMiddleware` handle wrapping
+
+### Security
+
+- **SEC-001 Extended** — Added path traversal validation to `trace-service.ts` (attemptId, taskId, traceId) and `template-service.ts` (templateId) using `validatePathSegment()` + `ensureWithinBase()`
+
+### Changed
+
+- Version bumped from 1.4.1 → 1.5.0
+
+---
+
+## [1.4.1] - 2026-02-02
+
+### Security
+
+- **SEC-001 Path Traversal Prevention** — added strict path segment validation + base directory enforcement in server utilities; applied to file-based services that join paths from user-controlled ids
+- **SEC-007 Admin Authorization** — enforced admin (or admin+agent where appropriate) on mutating settings/config/activity/status-history/notifications endpoints
+
+### Fixed
+
+- **Agent Status Panel** now uses real-time WebSocket updates (`useRealtimeAgentStatus`) and correctly handles `activeAgents` payloads
+- Improved proxy/IP trust behavior for rate limiting (`X-Forwarded-For` only trusted when `trust proxy` is configured)
+
+## [1.4.0] - 2026-02-01
+
+### ✨ Highlights
+
+- **CLI Workflow Commands** — Two-command task lifecycle (`vk begin` / `vk done`) plus time tracking, comments, agent status, and project management from the terminal
+- Inspired by Boris Cherny's (Claude Code creator) "automate everything you do twice" philosophy
+
+### Added
+
+#### CLI Workflow Commands (#44)
+
+- **Composite workflows** — Complete task lifecycle in single commands:
+  - `vk begin <id>` — Sets in-progress + starts timer + updates agent status to working
+  - `vk done <id> "summary"` — Stops timer + sets done + adds comment + sets agent idle
+  - `vk block <id> "reason"` — Sets blocked + adds comment with reason
+  - `vk unblock <id>` — Sets in-progress + restarts timer
+- **Time tracking CLI** — Full time management from terminal:
+  - `vk time start <id>` — Start time tracker
+  - `vk time stop <id>` — Stop time tracker
+  - `vk time entry <id> <seconds> "description"` — Add manual time entry
+  - `vk time show <id>` — Display time tracking summary (total, running status, entries)
+- **Comments CLI** — `vk comment <id> "text"` with optional `--author` flag
+- **Agent status CLI** — Manage agent presence:
+  - `vk agent status` — Show current agent status
+  - `vk agent working <id>` — Set to working (auto-fetches task title)
+  - `vk agent idle` — Set to idle
+  - `vk agent sub-agent <count>` — Set sub-agent mode with count
+- **Project management CLI** — `vk project list` and `vk project create "name"` with `--color` and `--description` flags
+- All commands support `--json` for scripting and automation
+- 5 new command modules, 18 subcommands, 651 lines added
+
+---
+
+---
+
+## [1.3.0] - 2026-02-01
+
+### ✨ Highlights
+
+- **GitHub Issues Bidirectional Sync** — Import issues with the `kanban` label and push status changes back to GitHub
+- **Activity Feed** — Full-page chronological activity feed with filtering, real-time updates, and compact/detailed toggle
+- **Daily Standup Summary** — Generate standup reports via API or CLI with completed, in-progress, blocked, and upcoming sections
+
+### Added
+
+#### GitHub Issues Sync (#21)
+
+- `GitHubSyncService` (464 lines) with polling, label-based field mapping, and circuit breaker
+- Inbound: import issues with `kanban` label as tasks
+- Outbound: push status changes (done → close issue, reopen on todo/in-progress/blocked) and comments
+- Label mapping: `priority:high` → priority field, `type:story` → type field
+- Config: `.veritas-kanban/integrations.json`, state: `.veritas-kanban/github-sync.json`
+- `TaskGitHub` interface in shared types: `{issueNumber, repo, syncedAt?}`
+- New API endpoints:
+  - `POST /api/github/sync` — trigger manual sync
+  - `GET /api/github/sync/status` — last sync info
+  - `GET /api/github/sync/config` — get config
+  - `PUT /api/github/sync/config` — update config
+  - `GET /api/github/sync/mappings` — list issue↔task mappings
+- New CLI commands: `vk github sync`, `vk github status`, `vk github config`, `vk github mappings`
+
+#### Activity Feed (#33)
+
+- Full-page chronological activity feed accessible from header nav (ListOrdered icon)
+- `agent` field added to Activity interface
+- `ActivityFilters` for combinable filtering (agent, type, taskId, since, until)
+- `GET /api/activity` enhanced with query params: `?agent=X&type=Y&taskId=Z&since=ISO&until=ISO`
+- `GET /api/activity/filters` — distinct agents and types for filter dropdowns
+- `ActivityFeed.tsx` component with day grouping, 15 activity type icons, filter bar, compact/detailed toggle
+- Infinite scroll via IntersectionObserver
+- Real-time WebSocket updates
+- `ViewContext` for board ↔ activity navigation
+
+#### Daily Standup Summary (#34)
+
+- `GET /api/summary/standup?date=YYYY-MM-DD&format=json|markdown|text`
+- Sections: completed, in-progress, blocked, upcoming, stats
+- `generateStandupMarkdown()` and `generateStandupText()` in SummaryService
+- CLI: `vk summary standup` with `--yesterday`, `--date YYYY-MM-DD`, `--json`, `--text` flags
+- 12 new tests
+
+### Changed
+
+- MAX_ACTIVITIES increased from 1,000 to 5,000
+
+---
+
+## [1.2.0] - 2026-02-01
+
+### ✨ Highlights
+
+- **Standardized API Response Envelope** — All endpoints return a consistent `{success, data, meta}` format with typed error classes
+- **Abstract File Storage** — Repository pattern decouples services from the filesystem
+- **Blocked Task Status** — Full support for blocked tasks across MCP, CLI, and board
+
+### Added
+
+#### Standardize API Response Envelope (#2)
+
+- 4 new error classes: `UnauthorizedError`, `ForbiddenError`, `BadRequestError`, `InternalError` (in `middleware/error-handler.ts`)
+- `sendPaginated(res, items, {page, limit, total})` helper for pagination metadata in envelope
+- Response envelope format:
+  - Success: `{success: true, data, meta: {timestamp, requestId}}`
+  - Error: `{success: false, error: {code, message, details?}, meta}`
+  - Pagination: `meta` includes `{page, limit, total, totalPages}` on paginated endpoints
+
+#### Abstract File Storage (#6)
+
+- 5 new repository interfaces: `ActivityRepository`, `TemplateRepository`, `StatusHistoryRepository`, `ManagedListRepository`, `TelemetryRepository`
+- `StorageProvider` extended with new repositories
+- `fs-helpers.ts` — centralized filesystem access (only file that imports `fs`)
+
+#### Blocked Task Status (#32)
+
+- MCP tools Zod/JSON schema definitions updated for blocked status
+- MCP active tasks filter updated to include blocked
+- CLI help text updated
+- CLI status color: blocked = red
+
+### Changed
+
+- All 11 route files standardized — zero ad-hoc `{error: "..."}` patterns
+- Auth middleware errors standardized to use typed error classes
+- All 10 services migrated off direct `fs` imports to use `fs-helpers.ts`
+
+---
+
+## [1.1.0] - 2026-01-31
+
+### ✨ Highlights
+
+- **Built-in Chat Interface** — Talk to AI agents directly from the board or any task, with streaming responses and markdown rendering
+- **Agent Routing Engine** — Tasks auto-route to the best available agent based on type, project, and capabilities
+- **Agent Selection on Task Creation** — Choose which agent handles a task when you create it
+- **Hardened Infrastructure** — Rate limiting, circuit breakers, file locking, request timeouts, data integrity checks, and more
+
+### Added
+
+#### Chat Interface (#18)
+
+- Full chat panel accessible from any task or the board header
+- Streaming AI responses with real-time WebSocket delivery
+- Floating chat bubble with pulse indicator for new messages
+- Chat sessions stored as markdown files with YAML frontmatter
+- Gateway integration for AI responses via Clawdbot
+- Chat export as markdown (download icon in header)
+- Clear chat history with confirmation dialog
+- Mode toggle: Ask (read-only queries) vs Build (changes, files, commands)
+- Keyboard shortcut support
+- Auto-focus input after sending messages
+- Tool call display with expandable input/output sections
+
+#### Agent Routing Engine (#16)
+
+- Task-aware routing that matches tasks to agents by type, project, and capabilities
+- Routing rules configurable per agent in Settings → Agents
+- API endpoints for routing queries and rule management
+- Full test coverage (17 tests)
+
+#### Agent Selection on Task Creation (#17)
+
+- Agent dropdown in the Create Task dialog
+- Auto-routes to best agent based on task type, or allows manual override
+- Agent field displayed in task metadata section
+
+#### Agent CRUD Management
+
+- Full Add/Edit/Remove for agents in Settings → Agents
+- Add Agent form with name, type slug (auto-generated), command, and args
+- Edit/Remove via inline icons (default agent protected from deletion)
+- `AgentType` loosened from fixed enum to any string slug — fully custom agents
+
+#### Board Filter: Agent
+
+- Filter board by assigned agent in the FilterBar
+- Agent indicator dots on task cards match filter state
+
+#### Infrastructure & Security
+
+- **Rate Limiting** — Per-route tiered thresholds (auth, API reads, writes, uploads)
+- **Circuit Breaker** — Automatic failure detection for external service calls with configurable thresholds
+- **File Locking** — FIFO queue prevents race conditions on concurrent file writes
+- **Request Timeouts** — Middleware kills hung connections before they pile up
+- **Data Integrity** — Hash-chain verification + automatic backup on startup with rotation
+- **Audit Log** — Immutable hash-chain audit trail for sensitive operations
+- **Health Endpoint** — Liveness, readiness, and deep checks (storage, disk, task file)
+- **API Envelope** — Standardized `{ success, data, meta }` response format across all endpoints
+- **Schema Validation** — Zod schemas on all mutating API routes
+- **Metrics** — Prometheus-compatible `/metrics` endpoint for monitoring
+- **WebSocket Heartbeat** — Connection keep-alive with automatic reconnection and connection limits
+- **Error Boundaries** — React error boundaries with graceful fallback UI
+- **Dependency Audit** — Automated vulnerability scanning in CI
+
+#### Storage & Architecture
+
+- Abstract file storage behind repository interface (prep for future database backends)
+- Structured logging with pino (replaced all `console.*` calls)
+
+#### First-Run Experience
+
+- Example tasks auto-populate the board on first run (4 sample tasks)
+- Manual seed script: `pnpm seed`
+- Task data `.gitignore`d — your data stays private
+
+#### Dark/Light Mode
+
+- Settings → General → Appearance toggle (moon/sun icon)
+- Persists to localStorage; default is dark mode
+- Inline script prevents flash of wrong theme on load
+
+#### UI Theme
+
+- Primary color: purple (`270° 50% 40%`) with white text
+- Focus rings, switches, and accents updated to match
+
+#### Documentation
+
+- TROUBLESHOOTING.md with common issues and solutions
+- Comprehensive FEATURES.md reference
+- Agentic AI Safety best practices guide
+- Roadmap section linking to v1.1 milestone
+- Competitive comparison table
+- OpenClaw (formerly Moltbot/Clawdbot) attribution updated
+
+#### Per-Status Selection (#24)
+
+- Select All checkbox per column header
+- Toolbar buttons for bulk operations scoped to selected status
+- Column checkboxes for quick multi-select
+
+### Fixed
+
+- **Chat delete not clearing UI** — React Query kept stale cached data after session file was deleted; now uses `removeQueries` to nuke cache
+- **Chat send broken after delete** — Server now recreates task-scoped sessions instead of throwing 404
+- **Cross-column drag-and-drop** — Tasks reliably move between columns with local state management during drag
+- **Dashboard agent comparison** — Fixed broken data fetch (raw `fetch` → `apiFetch` for envelope unwrapping)
+- **Dashboard drill-down** — Removed duplicate X button, fixed focus ring clipping, wired up `open-task` event
+- **Localhost auth rate limit** (#25) — Exempted localhost from rate limiting
+- **Numeric inputs** — Clean inputs without browser spinners (#19)
+- **Timer start/stop** — Optimistic UI toggle + cache patch for instant feedback
+- **Task cache fragmentation** — All routes now use TaskService singleton
+- **Sprint/Agent label alignment** — Fixed form layout in task detail panel
+- **Sticky header** — Fixed positioning + matched indicator dot sizes
+- **Keyboard test infinite loop** — Resolved render loop in `useKeyboard` + memoized context
+- **Agent idle timeout** — Increased from 5 to 15 minutes to reduce false resets
+- **File lock ordering** — Added in-process FIFO queue for deterministic write ordering
+- **Search filters** — Added task ID to board and archive search
+
+### Changed
+
+- Agent status popover: moved idle description to bottom, added activity history link
+- WebSocket indicator: click popover with connection status explanation
+- Dashboard layout: Daily Activity (75%) + Recent Status Changes (25%) side-by-side
+- Rolling average line: cyan-teal to contrast purple theme
+- Bar chart hover: subtle muted fill instead of white flash
+- All repo links updated to BradGroux (primary repo)
+- All contact emails standardized to contact@digitalmeld.io
+- Test suite: 72 files, **1,270 tests** (up from 61 files / 1,143 tests)
+
+---
+
+## [1.0.0] - 2026-01-29
+
+### 🎉 Initial Public Release
+
+Veritas Kanban is an AI-native project management board built for developers and autonomous coding agents.
+
+### Features
+
+#### Core Board
+
+- Kanban board with drag-and-drop between columns (Backlog, To Do, In Progress, Review, Done)
+- Task detail panel with full editing (title, description, priority, status, type, project, sprint)
+- Subtasks with progress tracking on cards
+- Task type system with icons and color-coded borders
+- Sprint management with auto-archive
+- Bulk operations and keyboard shortcuts
+
+#### Code Workflow
+
+- Git worktree integration for code tasks
+- Diff viewer for code review
+- Line-level review comments
+- Approval workflow with review decisions
+- Merge and close integration
+
+#### AI Agent Integration
+
+- Agent orchestration system for autonomous task execution
+- Agent status tracking (idle, working, sub-agent mode)
+- Time tracking per task with automatic and manual entries
+- REST API designed for AI agent consumption
+- MCP (Model Context Protocol) server for LLM tool integration
+- CLI for headless task management
+
+#### Dashboard & Analytics
+
+- Sprint velocity tracking
+- Cost budget tracking with daily digest
+- Task-level metrics and telemetry
+- Status history timeline
+
+#### Security
+
+- JWT authentication with secret rotation
+- Admin key + API key authentication
+- CSP headers with Helmet
+- Rate limiting with express-rate-limit
+- CORS origin validation
+- WebSocket origin validation
+- Server-side MIME type validation for uploads
+- Markdown sanitization (XSS prevention)
+- Timing-safe credential comparison
+- Credential redaction from task data
+
+#### Performance
+
+- In-memory task caching with file watchers
+- Config caching with write invalidation
+- Gzip response compression
+- Lazy-loaded dashboard with vendor chunk splitting (69% bundle reduction)
+- Pagination and summary mode for large datasets
+- Reduced polling when WebSocket connected
+- Telemetry retention and automatic cleanup
+
+#### Infrastructure
+
+- Production Dockerfile with multi-stage build (runs as non-root)
+- GitHub Actions CI pipeline
+- Pre-commit hooks with husky + lint-staged
+- Structured logging with pino
+- Request ID middleware for tracing
+- Graceful shutdown with service disposal
+- Unhandled rejection and exception handlers
+
+#### Documentation
+
+- OpenAPI/Swagger API documentation
+- Deployment guide (Docker, bare metal, nginx, Caddy, systemd)
+- Security audit reports
+- Contributing guide with conventional commits
+- Code of Conduct (Contributor Covenant v2.1)
+
+#### Testing
+
+- 61 test files, 1,143 unit tests (server + frontend) with Vitest
+- End-to-end tests with Playwright (19/19 passing)
+- Gitleaks pre-commit hook for secret scanning
+
+### Technical Details
+
+- **Frontend:** React 19, Vite 6, TypeScript 5.7, Tailwind CSS 3.4, Shadcn UI
+- **Backend:** Express 4.21, TypeScript, file-based storage
+- **Testing:** Playwright 1.58, Vitest 4
+- **Runtime:** Node.js ≥ 22.22.1, pnpm ≥ 11.0.0
+
+---
+
+_Built by [Digital Meld](https://digitalmeld.io) — AI-driven enterprise automation._
+
+[unreleased]: https://github.com/BradGroux/veritas-kanban/compare/v6.1.6...HEAD
+[6.1.6]: https://github.com/BradGroux/veritas-kanban/compare/v6.1.5...v6.1.6
+[6.1.5]: https://github.com/BradGroux/veritas-kanban/compare/v6.1.4...v6.1.5
+[6.1.4]: https://github.com/BradGroux/veritas-kanban/compare/v6.1.3...v6.1.4
+[6.1.3]: https://github.com/BradGroux/veritas-kanban/compare/v6.1.2...v6.1.3
+[6.1.2]: https://github.com/BradGroux/veritas-kanban/compare/v6.1.1...v6.1.2
+[6.1.1]: https://github.com/BradGroux/veritas-kanban/compare/v6.1.0...v6.1.1
+[6.1.0]: https://github.com/BradGroux/veritas-kanban/compare/v6.0.2...v6.1.0
+[6.0.2]: https://github.com/BradGroux/veritas-kanban/compare/v6.0.1...v6.0.2
+[6.0.1]: https://github.com/BradGroux/veritas-kanban/compare/v6.0.0...v6.0.1
+[6.0.0]: https://github.com/BradGroux/veritas-kanban/compare/v5.2.5...v6.0.0
+[5.2.5]: https://github.com/BradGroux/veritas-kanban/compare/v5.2.4...v5.2.5
+[5.2.4]: https://github.com/BradGroux/veritas-kanban/compare/v5.2.3...v5.2.4
+[5.2.3]: https://github.com/BradGroux/veritas-kanban/compare/v5.2.2...v5.2.3
+[5.2.2]: https://github.com/BradGroux/veritas-kanban/compare/v5.2.1...v5.2.2
+[5.2.1]: https://github.com/BradGroux/veritas-kanban/compare/v5.2.0...v5.2.1
+[5.2.0]: https://github.com/BradGroux/veritas-kanban/compare/v5.1.0...v5.2.0
+[5.1.0]: https://github.com/BradGroux/veritas-kanban/compare/v5.0.1...v5.1.0
+[5.0.1]: https://github.com/BradGroux/veritas-kanban/compare/v5.0.0...v5.0.1
+[5.0.0]: https://github.com/BradGroux/veritas-kanban/compare/v4.3.2...v5.0.0
+[4.1.0]: https://github.com/BradGroux/veritas-kanban/compare/v4.0.1...v4.1.0
+[4.0.1]: https://github.com/BradGroux/veritas-kanban/compare/v4.0.0...v4.0.1
+[4.0.0]: https://github.com/BradGroux/veritas-kanban/compare/v3.3.3...v4.0.0
+[3.3.3]: https://github.com/BradGroux/veritas-kanban/compare/v3.3.2...v3.3.3
+[1.4.1]: https://github.com/BradGroux/veritas-kanban/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/BradGroux/veritas-kanban/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/BradGroux/veritas-kanban/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/BradGroux/veritas-kanban/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/BradGroux/veritas-kanban/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/BradGroux/veritas-kanban/releases/tag/v1.0.0

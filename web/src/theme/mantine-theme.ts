@@ -1,0 +1,285 @@
+import { createTheme, defaultVariantColorsResolver, type MantineColorsTuple } from '@mantine/core';
+import { VERITAS_UI_METRICS } from './ui-contract';
+
+export const veritasPrimary: MantineColorsTuple = [
+  '#f4f1ff',
+  '#e6dcff',
+  '#cab8ff',
+  '#aa8eff',
+  '#8d68f8',
+  '#754fe8',
+  '#6541d5',
+  '#5132b4',
+  '#412996',
+  '#37267a',
+];
+
+export const veritasStatusColors = {
+  blocked: '#f59f00',
+  needsReview: '#228be6',
+  running: '#7950f2',
+  done: '#2f9e44',
+  failed: '#fa5252',
+  warning: '#f08c00',
+  policyDenied: '#e03131',
+  destructive: '#e03131',
+} as const;
+
+export const veritasMantineTheme = createTheme({
+  primaryColor: 'veritas',
+  // Filled surfaces need a darker swatch than accent text on dark backgrounds.
+  variantColorResolver: (input) => {
+    const resolved = defaultVariantColorsResolver(input);
+    if (input.variant === 'filled' && (input.color ?? input.theme.primaryColor) === 'veritas') {
+      return {
+        ...resolved,
+        background: 'var(--primary-action)',
+        hover: 'var(--primary-action-hover)',
+        color: '#ffffff',
+      };
+    }
+    return resolved;
+  },
+  primaryShade: { light: 6, dark: 4 },
+  colors: {
+    veritas: veritasPrimary,
+  },
+  fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+  fontFamilyMonospace:
+    "'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, ui-monospace, monospace",
+  headings: {
+    fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    fontWeight: '650',
+  },
+  defaultRadius: 'sm',
+  radius: {
+    xs: '3px',
+    sm: '5px',
+    md: '7px',
+    lg: '10px',
+    xl: '14px',
+  },
+  spacing: {
+    xs: '0.375rem',
+    sm: '0.5rem',
+    md: '0.75rem',
+    lg: '1rem',
+    xl: '1.5rem',
+  },
+  fontSizes: {
+    xs: '0.75rem',
+    sm: '0.8125rem',
+    md: '0.875rem',
+    lg: '1rem',
+    xl: '1.125rem',
+  },
+  lineHeights: {
+    xs: '1.25',
+    sm: '1.35',
+    md: '1.45',
+    lg: '1.5',
+    xl: '1.55',
+  },
+  shadows: {
+    xs: '0 1px 2px rgba(0, 0, 0, 0.2)',
+    sm: '0 4px 12px rgba(0, 0, 0, 0.18)',
+    md: '0 10px 30px rgba(0, 0, 0, 0.22)',
+    lg: '0 20px 50px rgba(0, 0, 0, 0.28)',
+    xl: '0 28px 70px rgba(0, 0, 0, 0.32)',
+  },
+  breakpoints: {
+    xs: '36em',
+    sm: '48em',
+    md: '62em',
+    lg: '75em',
+    xl: '88em',
+  },
+  focusRing: 'always',
+  respectReducedMotion: true,
+  cursorType: 'pointer',
+  autoContrast: true,
+  other: {
+    density: {
+      controlHeight: VERITAS_UI_METRICS.actionMinHeight,
+      compactControlHeight: 30,
+      panelRadius: VERITAS_UI_METRICS.surfaceRadius,
+      cardRadius: VERITAS_UI_METRICS.surfaceRadius,
+    },
+    statusColors: veritasStatusColors,
+  },
+  components: {
+    Button: {
+      defaultProps: {
+        radius: 'sm',
+      },
+      styles: {
+        // Reduced-motion Transition omits styles, including loader positioning.
+        // Normal-motion transition styles override this static layout fallback.
+        loader: {
+          transform: 'translate(-50%, -50%)',
+        },
+        root: {
+          minHeight: `${VERITAS_UI_METRICS.actionMinHeight}px`,
+          minWidth: `${VERITAS_UI_METRICS.actionMinHeight}px`,
+          fontWeight: 650,
+        },
+      },
+    },
+    ActionIcon: {
+      defaultProps: {
+        radius: 'sm',
+        variant: 'subtle',
+      },
+      styles: {
+        root: {
+          minHeight: `${VERITAS_UI_METRICS.iconActionSize}px`,
+          minWidth: `${VERITAS_UI_METRICS.iconActionSize}px`,
+        },
+      },
+    },
+    Badge: {
+      defaultProps: {
+        radius: VERITAS_UI_METRICS.pillRadius,
+        size: 'sm',
+        tt: 'none',
+      },
+      styles: {
+        root: {
+          minHeight: `${VERITAS_UI_METRICS.pillMinHeight}px`,
+          height: 'auto',
+          paddingInline: '0.5rem',
+          lineHeight: 1.2,
+          whiteSpace: 'normal',
+        },
+      },
+    },
+    CloseButton: {
+      styles: {
+        root: {
+          minHeight: '2rem',
+          minWidth: '2rem',
+        },
+      },
+    },
+    Select: {
+      defaultProps: {
+        radius: 'sm',
+        // Portaled menus must not expand the mobile document while positioning.
+        comboboxProps: { floatingStrategy: 'fixed' },
+      },
+      styles: {
+        input: {
+          minHeight: '2rem',
+        },
+      },
+    },
+    Tooltip: {
+      defaultProps: {
+        // Portaled hints must not expand the mobile document while positioning.
+        floatingStrategy: 'fixed',
+      },
+      styles: {
+        tooltip: {
+          maxWidth: 'calc(100vw - 1rem)',
+          whiteSpace: 'normal',
+          overflowWrap: 'anywhere',
+        },
+      },
+    },
+    TextInput: {
+      defaultProps: {
+        radius: 'sm',
+      },
+      styles: {
+        input: {
+          minHeight: '2rem',
+        },
+      },
+    },
+    PasswordInput: {
+      styles: {
+        input: {
+          minHeight: '2rem',
+        },
+      },
+    },
+    Textarea: {
+      defaultProps: {
+        radius: 'sm',
+      },
+      styles: {
+        input: {
+          minHeight: '2rem',
+        },
+      },
+    },
+    Tabs: {
+      styles: {
+        tab: {
+          minHeight: '2rem',
+        },
+      },
+    },
+    Modal: {
+      defaultProps: {
+        radius: 'md',
+        centered: true,
+        lockScroll: false,
+        trapFocus: true,
+        returnFocus: true,
+        closeButtonProps: { 'aria-label': 'Close dialog' },
+        overlayProps: { blur: 2, opacity: 0.45 },
+      },
+      styles: {
+        content: {
+          display: 'flex',
+          maxHeight: 'calc(100dvh - 2rem)',
+          minHeight: 0,
+          flexDirection: 'column',
+          overflow: 'hidden',
+        },
+        body: {
+          minHeight: 0,
+          overflowY: 'auto',
+          overscrollBehavior: 'contain',
+          scrollbarGutter: 'stable',
+        },
+      },
+    },
+    Drawer: {
+      defaultProps: {
+        lockScroll: false,
+        trapFocus: true,
+        returnFocus: true,
+        closeButtonProps: { 'aria-label': 'Close panel' },
+        overlayProps: { blur: 2, opacity: 0.35 },
+      },
+      styles: {
+        content: {
+          display: 'flex',
+          maxHeight: '100dvh',
+          minHeight: 0,
+          flexDirection: 'column',
+          overflow: 'hidden',
+        },
+        body: {
+          minHeight: 0,
+          flex: '1 1 auto',
+          overflowY: 'auto',
+          overscrollBehavior: 'contain',
+          scrollbarGutter: 'stable',
+        },
+      },
+    },
+    Popover: {
+      styles: {
+        dropdown: {
+          maxHeight: 'min(70dvh, 32rem)',
+          overflowY: 'auto',
+          overscrollBehavior: 'contain',
+          scrollbarGutter: 'stable',
+        },
+      },
+    },
+  },
+});

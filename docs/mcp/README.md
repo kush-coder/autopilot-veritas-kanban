@@ -1,0 +1,897 @@
+# MCP Server — Veritas Kanban
+
+> **42 tools · 9 categories · stdio transport · zero external dependencies**
+
+The Veritas Kanban MCP server lets any [Model Context Protocol](https://modelcontextprotocol.io/) client — Claude Desktop, OpenClaw, Cursor, Cline, Codex, or your own tooling — manage tasks, sprints, projects, comments, agents, automation, notifications, and summaries through a single stdio process.
+
+MCP is optional. The board, REST API, and CLI do not require MCP or OpenClaw. Use MCP only when an assistant needs typed tool access instead of direct REST/CLI calls.
+
+| Mode                   | What works                                                                                    | Required auth                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Local read-only        | Tool discovery, task reads, summaries, resources, and other read operations against localhost | `VK_API_URL`; `VK_API_KEY` can be omitted when localhost bypass grants reads    |
+| Local or remote writes | Creating/updating tasks, comments, agents, automation, notifications, sprints, and projects   | `VK_API_KEY` with an `agent` or `admin` role, or localhost role `agent`/`admin` |
+| External runners       | MCP tools can create agent requests or update task state                                      | A separate runner/provider still has to execute the agent work                  |
+
+---
+
+## Table of Contents
+
+- [When to Use the MCP Server](#when-to-use-the-mcp-server)
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+  - [Local Development](#local-development)
+  - [Production](#production)
+- [Configuration Reference](#configuration-reference)
+- [Tool Catalog](#tool-catalog)
+  - [Task Management (6 tools)](#task-management-6-tools)
+  - [Agent Control (4 tools)](#agent-control-4-tools)
+  - [Automation (4 tools)](#automation-4-tools)
+  - [Notifications (3 tools)](#notifications-3-tools)
+  - [Summaries (2 tools)](#summaries-2-tools)
+  - [Sprint Management (9 tools)](#sprint-management-9-tools)
+  - [Project Management (7 tools)](#project-management-7-tools)
+  - [Comment Management (3 tools)](#comment-management-3-tools)
+- [Resources](#resources)
+- [Security Model](#security-model)
+- [Error Handling & Troubleshooting](#error-handling--troubleshooting)
+- [Observability & Telemetry](#observability--telemetry)
+- [Versioning & Compatibility](#versioning--compatibility)
+- [FAQ](#faq)
+
+---
+
+## When to Use the MCP Server
+
+Use the MCP server when:
+
+- Your AI assistant (Claude Desktop, Cursor, etc.) needs **structured tool access** to VK — not raw HTTP calls.
+- You want **one process** that exposes all 42 VK operations with typed inputs and validated outputs.
+- You're building **agent orchestration** and need task/sprint/automation lifecycle management over MCP.
+
+Don't use it when:
+
+- You just need a quick REST call — use the [REST API](../API-WORKFLOWS.md) directly.
+- You're building a web frontend — use the HTTP API with the TypeScript client.
+- You need WebSocket streaming — the MCP server uses stdio, not SSE/WS.
+- You expect MCP itself to run agents — it can request work, but execution belongs to Codex, OpenClaw, or another configured runner.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  MCP Client (Claude Desktop / OpenClaw / etc.)  │
+└──────────────────────┬──────────────────────────┘
+                       │ stdio (JSON-RPC)
+                       ▼
+┌──────────────────────────────────────────────────┐
+│  MCP Server Process  (mcp/dist/index.js)         │
+│                                                  │
+│  ┌────────────┐  ┌────────────┐  ┌───────────┐  │
+│  │ Tool       │  │ Resource   │  │ Transport  │  │
+│  │ Registry   │  │ Provider   │  │ (stdio)    │  │
+│  │ (42 tools) │  │ (kanban:// │  │            │  │
+│  │            │  │  URIs)     │  │            │  │
+│  └──────┬─────┘  └──────┬─────┘  └───────────┘  │
+│         │               │                        │
+│         └───────┬───────┘                        │
+│                 ▼                                 │
+│         ┌──────────────┐                         │
+│         │ HTTP Client  │                         │
+│         │ → VK Server  │                         │
+│         └──────┬───────┘                         │
+└────────────────┼─────────────────────────────────┘
+                 │ HTTP (localhost:3001)
+                 ▼
+┌──────────────────────────────────────────────────┐
+│  Veritas Kanban Server (Express/Hono)            │
+│  REST API · Task Store · Sprint Engine           │
+└──────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+
+- **Stdio transport only** — the MCP server is a child process of the client. No network ports opened.
+- **Stateless proxy** — every tool call translates to one or more HTTP requests to the VK server. The MCP process holds no state.
+- **Zod validation** — all tool inputs are validated with Zod schemas before hitting the API.
+- **@modelcontextprotocol/sdk v1.29.0** — uses the official TypeScript SDK.
+
+---
+
+## Quickstart
+
+### Prerequisites
+
+- Node.js ≥ 22.22.1
+- The Veritas Kanban server running (`pnpm dev` or production)
+- pnpm (for building from source)
+- No OpenClaw requirement unless OpenClaw is the MCP client or agent runner you choose
+
+### Local Development
+
+```bash
+# 1. Start the VK server
+cd veritas-kanban
+pnpm dev                          # Server on http://localhost:3001
+
+# 2. Build shared code and the MCP server
+pnpm --filter @veritas-kanban/shared build
+pnpm --filter @veritas-kanban/mcp build
+
+# 3. Configure your MCP client
+```
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "veritas-kanban": {
+      "command": "node",
+      "args": ["/absolute/path/to/veritas-kanban/mcp/dist/index.js"],
+      "env": {
+        "VK_API_URL": "http://localhost:3001",
+        "VK_API_KEY": "your-agent-api-key"
+      }
+    }
+  }
+}
+```
+
+For **Cursor**, add the same block to `.cursor/mcp.json` in your project root.
+
+For **OpenClaw**, add to your OpenClaw MCP config:
+
+```json
+{
+  "mcpServers": {
+    "veritas-kanban": {
+      "command": "node",
+      "args": ["/absolute/path/to/veritas-kanban/mcp/dist/index.js"],
+      "env": {
+        "VK_API_URL": "http://localhost:3001",
+        "VK_API_KEY": "your-agent-api-key"
+      }
+    }
+  }
+}
+```
+
+Omit `VK_API_KEY` only for read-only localhost checks. Write tools need a key unless localhost bypass grants an `agent` or `admin` role.
+
+**Verify discovery works:**
+
+```bash
+# Quick smoke test — run the MCP server directly and send a tools/list request
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
+  VK_API_URL=http://localhost:3001 node mcp/dist/index.js 2>/dev/null | \
+  head -1 | jq '.result.tools | length'
+# Expected output: 36
+```
+
+**Verify read/write auth works:**
+
+Run this before giving an assistant MCP write access:
+
+```bash
+export VK_API_URL=http://localhost:3001
+export VK_API_KEY=your-agent-api-key
+
+# Read check: call list_tasks
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tasks","arguments":{"status":"todo"}}}' | \
+  node mcp/dist/index.js 2>/dev/null | \
+  head -1 | jq -e '.result.content[0].text | fromjson | type == "array"'
+
+# Write check: create a temporary task
+MCP_TASK_ID=$(echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_task","arguments":{"title":"MCP auth smoke test","type":"automation","priority":"low","description":"Temporary task created by MCP auth smoke test."}}}' | \
+  node mcp/dist/index.js 2>/dev/null | \
+  head -1 | jq -r '.result.content[0].text | capture("Task created: (?<id>[^\\n]+)").id')
+
+# Cleanup
+echo "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_task\",\"arguments\":{\"id\":\"$MCP_TASK_ID\"}}}" | \
+  node mcp/dist/index.js 2>/dev/null | \
+  head -1 | jq -e '.result.content[0].text | startswith("Task deleted: ")'
+```
+
+Expected result: the read command exits `0`, the write command captures a task ID, and cleanup returns `true`. If `tools/list` works but `create_task` fails with `401` or `403`, the MCP process is installed but does not have write-capable API auth. Put `VK_API_KEY` in the MCP client env block and restart the client.
+
+### Codex
+
+OpenAI Codex can also use the Veritas Kanban MCP server. This is the recommended setup when Codex should update tasks, read board context, or coordinate through Veritas instead of making ad hoc HTTP calls.
+
+Local development:
+
+```bash
+codex mcp add veritas-kanban \
+  --env VK_API_URL=http://localhost:3001 \
+  --env VK_API_KEY=your-agent-api-key \
+  -- node /absolute/path/to/veritas-kanban/mcp/dist/index.js
+```
+
+Production or API-key mode:
+
+```bash
+codex mcp add veritas-kanban \
+  --env VK_API_URL=https://kanban.yourdomain.com \
+  --env VK_API_KEY=your-agent-api-key \
+  -- node /absolute/path/to/veritas-kanban/mcp/dist/index.js
+```
+
+Recommended companion for OpenAI-related development work:
+
+```bash
+codex mcp add openaiDeveloperDocs --url https://developers.openai.com/mcp
+```
+
+Pair this with the Codex-specific instructions in [AGENTS-TEMPLATE.md](../AGENTS-TEMPLATE.md) and the [Codex Integration SOP](../SOP-codex-integration.md) when Codex is coordinating managed work.
+
+### Production
+
+When running VK behind a reverse proxy (nginx/Caddy):
+
+```json
+{
+  "mcpServers": {
+    "veritas-kanban": {
+      "command": "node",
+      "args": ["/opt/veritas-kanban/mcp/dist/index.js"],
+      "env": {
+        "VK_API_URL": "https://kanban.yourdomain.com",
+        "VK_API_KEY": "your-agent-api-key"
+      }
+    }
+  }
+}
+```
+
+> **Important:** In production, always set `VK_API_KEY` so the MCP server authenticates with the VK API. Without it, requests rely on localhost bypass (which won't work remotely).
+> **Local writes:** Read-only localhost calls may work without `VK_API_KEY`, but write tools need a key unless `VERITAS_AUTH_LOCALHOST_ROLE` is set to `agent` or `admin`.
+
+---
+
+## Configuration Reference
+
+The MCP server is configured via environment variables passed from the MCP client config.
+
+| Variable     | Default                 | Description                                                         |
+| ------------ | ----------------------- | ------------------------------------------------------------------- |
+| `VK_API_URL` | `http://localhost:3001` | Base URL of the Veritas Kanban server                               |
+| `VK_API_KEY` | _(none)_                | API key for authenticated requests. Required when not on localhost. |
+
+### VK Server Environment Variables (relevant to MCP)
+
+These are set in `server/.env`, not in the MCP client config:
+
+| Variable                        | Default                     | Description                                                        |
+| ------------------------------- | --------------------------- | ------------------------------------------------------------------ |
+| `PORT`                          | `3001`                      | Server port                                                        |
+| `VERITAS_AUTH_ENABLED`          | `true`                      | Enable/disable authentication                                      |
+| `VERITAS_AUTH_LOCALHOST_BYPASS` | `true`                      | Allow unauthenticated localhost requests                           |
+| `VERITAS_AUTH_LOCALHOST_ROLE`   | `read-only`                 | Role for unauthenticated localhost (`read-only`, `agent`, `admin`) |
+| `VERITAS_ADMIN_KEY`             | _(required)_                | Admin API key (≥ 32 characters)                                    |
+| `VERITAS_API_KEYS`              | _(none)_                    | Additional API keys. Format: `name:key:role,name2:key2:role2`      |
+| `CORS_ORIGINS`                  | `http://localhost:3000,...` | Allowed CORS origins                                               |
+| `TRUST_PROXY`                   | _(unset)_                   | Set when behind a reverse proxy                                    |
+
+### Auth Modes
+
+| Mode                 | Config                                                           | Use Case                                             |
+| -------------------- | ---------------------------------------------------------------- | ---------------------------------------------------- |
+| **Localhost bypass** | `VERITAS_AUTH_LOCALHOST_BYPASS=true`                             | Local development. MCP server on same machine as VK. |
+| **API key (agent)**  | `VK_API_KEY=<key>` + key in `VERITAS_API_KEYS` with `agent` role | Production. MCP server may be remote.                |
+| **API key (admin)**  | `VK_API_KEY=<admin-key>`                                         | Full access. Use sparingly.                          |
+| **Auth disabled**    | `VERITAS_AUTH_ENABLED=false`                                     | Testing only. Never in production.                   |
+
+**Recommended default:** Localhost bypass for local dev, `agent`-role API key for production.
+
+---
+
+## Tool Catalog
+
+### Task Management (6 tools)
+
+| Tool           | Description                             | Required Inputs | Key Options                                                                               |
+| -------------- | --------------------------------------- | --------------- | ----------------------------------------------------------------------------------------- |
+| `list_tasks`   | List all tasks, optionally filtered     | _(none)_        | `status`, `type`, `project`, `sprint`                                                     |
+| `get_task`     | Get task by ID (supports partial match) | `id`            | —                                                                                         |
+| `create_task`  | Create a new task                       | `title`         | `type`, `priority`, `project`, `sprint`, `commitPolicy`                                   |
+| `update_task`  | Update task fields                      | `id`            | `title`, `description`, `status`, `type`, `priority`, `project`, `sprint`, `commitPolicy` |
+| `archive_task` | Archive a completed task                | `id`            | —                                                                                         |
+| `delete_task`  | Permanently delete a task               | `id`            | —                                                                                         |
+
+Task write tools return concise confirmations. Use `get_task`, `list_tasks`, or `list_comments` when an assistant needs the full task or comment payload.
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**List high-priority tasks:**
+
+```json
+{
+  "name": "list_tasks",
+  "arguments": { "status": "in-progress", "project": "rubicon" }
+}
+```
+
+→ Returns JSON array of matching tasks.
+
+**Create a task:**
+
+```json
+{
+  "name": "create_task",
+  "arguments": {
+    "title": "Fix auth token refresh",
+    "type": "code",
+    "priority": "high",
+    "project": "rubicon",
+    "sprint": "sprint-1",
+    "commitPolicy": "required"
+  }
+}
+```
+
+→ Returns `Task created: task_20260302_abc123` plus status, priority, and comment count.
+
+**Update task status:**
+
+```json
+{
+  "name": "update_task",
+  "arguments": { "id": "abc123", "status": "done" }
+}
+```
+
+→ Returns `Task updated: task_20260302_abc123; fields: status; comments: 0`. Partial IDs work — matches the last 6+ characters.
+
+</details>
+
+#### Input Enums
+
+- **status:** `todo` · `in-progress` · `blocked` · `done`
+- **type:** `code` · `research` · `content` · `automation`
+- **priority:** `low` · `medium` · `high`
+- **commitPolicy:** `forbidden` · `allowed` · `required`
+
+---
+
+### Agent Control (4 tools)
+
+| Tool                         | Description                               | Required Inputs             | Key Options                                                           |
+| ---------------------------- | ----------------------------------------- | --------------------------- | --------------------------------------------------------------------- |
+| `start_agent`                | Start a coding agent on a task            | `id`                        | `agent`; `requiredRuntimeCapabilities`; `commitPolicy`                |
+| `stop_agent`                 | Stop a running agent                      | `id`                        | Resolves status and binds the stop to that exact attempt and manifest |
+| `cancel_agent_recovery`      | Cancel a pending retry or fallback        | `id`, `attemptId`           | Requires the exact persisted parent attempt                           |
+| `control_agent_conversation` | Invoke a supported conversation lifecycle | `id`, `attemptId`, `action` | `message`, `forkTurnId`, `commitPolicy`                               |
+
+> **Constraints:** Only works on tasks with `type: "code"` that already have a git worktree attached.
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**Start Claude Code on a task:**
+
+```json
+{
+  "name": "start_agent",
+  "arguments": {
+    "id": "abc123",
+    "agent": "claude-code",
+    "requiredRuntimeCapabilities": ["tool.mcp", "output.structured"],
+    "commitPolicy": "allowed"
+  }
+}
+```
+
+→ Returns attempt ID and worktree path.
+
+The required capability list is forwarded unchanged to the authoritative
+launch API. Unsupported, unknown, missing, failed-probe, or invalid manifest
+evidence fails closed before provider work starts.
+`commitPolicy` accepts `forbidden`, `allowed`, or `required` and overrides the
+task and legacy setting for that run. The launch result is bound to the exact
+persisted `task-envelope/v1` snapshot and pre-launch worktree baseline.
+
+**Stop a running agent:**
+
+```json
+{
+  "name": "stop_agent",
+  "arguments": { "id": "abc123" }
+}
+```
+
+The tool reads the active `attemptId` from status immediately before sending
+the stop. If the run is replaced between those calls, the server returns a
+conflict instead of stopping the replacement.
+
+</details>
+
+---
+
+### Automation (4 tools)
+
+| Tool                      | Description                          | Required Inputs | Key Options        |
+| ------------------------- | ------------------------------------ | --------------- | ------------------ |
+| `list_pending_automation` | List tasks pending automation        | _(none)_        | —                  |
+| `list_running_automation` | List currently executing automations | _(none)_        | —                  |
+| `start_automation`        | Start automation for a task          | `id`            | `sessionKey`       |
+| `complete_automation`     | Mark automation complete or failed   | `id`            | `result`, `failed` |
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**Start automation:**
+
+```json
+{
+  "name": "start_automation",
+  "arguments": { "id": "abc123" }
+}
+```
+
+→ Returns task title, attempt ID, and description.
+
+**Mark as failed:**
+
+```json
+{
+  "name": "complete_automation",
+  "arguments": { "id": "abc123", "result": "Timeout after 30s", "failed": true }
+}
+```
+
+</details>
+
+---
+
+### Notifications (3 tools)
+
+| Tool                        | Description                            | Required Inputs            | Key Options |
+| --------------------------- | -------------------------------------- | -------------------------- | ----------- |
+| `create_notification`       | Create a notification (Teams delivery) | `type`, `title`, `message` | `taskId`    |
+| `get_pending_notifications` | Get pending notifications              | _(none)_                   | —           |
+| `check_notifications`       | Scan tasks and create notifications    | _(none)_                   | —           |
+
+#### Notification Types
+
+`info` · `error` · `milestone` · `high_priority` · `agent_complete` · `agent_failed` · `needs_review` · `task_done`
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**Create a milestone notification:**
+
+```json
+{
+  "name": "create_notification",
+  "arguments": {
+    "type": "milestone",
+    "title": "Sprint 3 Complete",
+    "message": "All 12 tasks archived. Velocity: 34 points.",
+    "taskId": "abc123"
+  }
+}
+```
+
+</details>
+
+---
+
+### Summaries (2 tools)
+
+| Tool                 | Description                                             | Required Inputs | Key Options           |
+| -------------------- | ------------------------------------------------------- | --------------- | --------------------- |
+| `get_summary`        | Board overview (status counts, projects, high-priority) | _(none)_        | —                     |
+| `get_memory_summary` | Task summary formatted for agent memory files           | _(none)_        | `hours` (default: 24) |
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**Get last 48 hours of activity:**
+
+```json
+{
+  "name": "get_memory_summary",
+  "arguments": { "hours": 48 }
+}
+```
+
+→ Returns markdown-formatted summary (completed tasks, active high-priority, project progress).
+
+</details>
+
+---
+
+### Sprint Management (9 tools)
+
+| Tool                      | Description                           | Required Inputs | Key Options                        |
+| ------------------------- | ------------------------------------- | --------------- | ---------------------------------- |
+| `list_sprints`            | List all sprints                      | _(none)_        | `includeHidden`                    |
+| `get_sprint`              | Get sprint by ID                      | `id`            | —                                  |
+| `create_sprint`           | Create a new sprint                   | `label`         | `description`                      |
+| `update_sprint`           | Update sprint fields                  | `id`            | `label`, `description`, `isHidden` |
+| `delete_sprint`           | Delete a sprint                       | `id`            | `force`                            |
+| `can_delete_sprint`       | Check if sprint can be deleted        | `id`            | —                                  |
+| `reorder_sprints`         | Reorder sprints                       | `orderedIds`    | —                                  |
+| `get_archive_suggestions` | Sprints ready to archive              | _(none)_        | —                                  |
+| `close_sprint`            | Archive all completed tasks in sprint | `id`            | —                                  |
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**Create a sprint:**
+
+```json
+{
+  "name": "create_sprint",
+  "arguments": { "label": "Sprint 4", "description": "Auth hardening & MCP docs" }
+}
+```
+
+**Safe delete check:**
+
+```json
+{
+  "name": "can_delete_sprint",
+  "arguments": { "id": "sprint-3" }
+}
+```
+
+→ Returns `{ "canDelete": true, "referenceCount": 0 }` or tells you how many tasks still reference it.
+
+**Close a sprint (archive completed tasks):**
+
+```json
+{
+  "name": "close_sprint",
+  "arguments": { "id": "sprint-3" }
+}
+```
+
+→ Returns count and IDs of archived tasks.
+
+</details>
+
+#### Force Delete Behavior
+
+The `delete_sprint` tool supports a `force` flag that controls how deletion handles referenced items.
+
+**Default behavior (`force: false` or omitted):**
+
+When a sprint is referenced by one or more tasks (i.e., tasks have `sprint: "sprint-id"`), the delete is **blocked**. The server checks for references via `can_delete_sprint` internally and returns a response indicating the item cannot be deleted along with the reference count. This prevents accidental data loss — tasks would lose their sprint assignment.
+
+**Recommended workflow:**
+
+1. Call `can_delete_sprint` first to check if any tasks reference the sprint.
+2. If `referenceCount > 0`, either reassign those tasks to another sprint or use `force: true`.
+3. Call `delete_sprint` with or without `force` based on the check.
+
+```json
+// Step 1: Check
+{ "name": "can_delete_sprint", "arguments": { "id": "sprint-3" } }
+// → { "allowed": true, "referenceCount": 0 }  OR  { "allowed": false, "referenceCount": 5 }
+
+// Step 2: Delete (safe)
+{ "name": "delete_sprint", "arguments": { "id": "sprint-3" } }
+
+// Step 2 alt: Force delete (skips reference check)
+{ "name": "delete_sprint", "arguments": { "id": "sprint-3", "force": true } }
+```
+
+**Force behavior (`force: true`):**
+
+The reference check is **skipped entirely**. The sprint is deleted regardless of how many tasks reference it. Tasks that referenced the deleted sprint will retain their `sprint` field value, but it will point to a non-existent sprint (orphaned reference). This is useful for cleanup scenarios where you know the references are stale or the tasks will be updated separately.
+
+**This applies to all managed lists** (sprints, projects, task-types) — they all use the same `ManagedListService` base class with identical force delete semantics. The MCP server supports force delete on `/api/projects/:id?force=true` and `/api/task-types/:id?force=true` as well.
+
+---
+
+### Project Management (7 tools) <small>_New in v4.0_</small>
+
+Full project lifecycle management from MCP — create, organize, and track projects without leaving your agent context.
+
+| Tool                | Description                      | Required Inputs | Key Options                        |
+| ------------------- | -------------------------------- | --------------- | ---------------------------------- |
+| `list_projects`     | List all projects                | _(none)_        | `includeHidden`                    |
+| `get_project`       | Get a project by ID              | `id`            | —                                  |
+| `create_project`    | Create a new project             | `label`         | `description`, `color`             |
+| `update_project`    | Update project fields            | `id`            | `label`, `description`, `isHidden` |
+| `delete_project`    | Delete a project                 | `id`            | `force`                            |
+| `get_project_stats` | Task counts and status breakdown | `id`            | —                                  |
+| `reorder_projects`  | Reorder projects in the sidebar  | `orderedIds`    | —                                  |
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**Create a project:**
+
+```json
+{
+  "name": "create_project",
+  "arguments": {
+    "label": "Rubicon",
+    "description": "Industrial safety AI platform",
+    "color": "#8B5CF6"
+  }
+}
+```
+
+**Get project task breakdown:**
+
+```json
+{
+  "name": "get_project_stats",
+  "arguments": { "id": "rubicon" }
+}
+```
+
+→ Returns:
+
+```json
+{
+  "id": "rubicon",
+  "label": "Rubicon",
+  "total": 24,
+  "byStatus": { "todo": 8, "in-progress": 5, "blocked": 2, "done": 9 }
+}
+```
+
+**Reorder projects:**
+
+```json
+{
+  "name": "reorder_projects",
+  "arguments": { "orderedIds": ["rubicon", "brainmeld", "dealmeld"] }
+}
+```
+
+**Force-delete a project with tasks still assigned:**
+
+```json
+{
+  "name": "delete_project",
+  "arguments": { "id": "old-project", "force": true }
+}
+```
+
+</details>
+
+---
+
+### Comment Management (3 tools) <small>_New in v4.0_</small>
+
+Comment tools for task discussion threads, enabling agents to participate in async review notes.
+Comment write tools return concise confirmations. Use `list_comments` when an assistant needs the full thread.
+
+| Tool             | Description                 | Required Inputs       | Key Options |
+| ---------------- | --------------------------- | --------------------- | ----------- |
+| `add_comment`    | Add a comment to a task     | `taskId`, `text`      | `agent`     |
+| `list_comments`  | List comments for a task    | `taskId`              | —           |
+| `delete_comment` | Delete a task comment by ID | `taskId`, `commentId` | —           |
+
+<details>
+<summary><strong>Examples</strong></summary>
+
+**Add a code review comment:**
+
+```json
+{
+  "name": "add_comment",
+  "arguments": {
+    "taskId": "task_20260321_abc",
+    "text": "Auth token refresh looks good. One nit: the 5-minute buffer could be configurable.",
+    "agent": "TARS"
+  }
+}
+```
+
+→ Returns `Comment added to task task_20260321_abc; comment: comment_xyz789; comments: 3`.
+
+**List comments on a task:**
+
+```json
+{
+  "name": "list_comments",
+  "arguments": { "taskId": "task_20260321_abc" }
+}
+```
+
+→ Returns array of `{ id, content, author, createdAt, updatedAt }`.
+
+**Delete a comment:**
+
+```json
+{
+  "name": "delete_comment",
+  "arguments": {
+    "taskId": "task_20260321_abc",
+    "commentId": "cmt_xyz789"
+  }
+}
+```
+
+→ Returns `Comment deleted from task task_20260321_abc; comment: cmt_xyz789; comments: 2`.
+
+</details>
+
+---
+
+### Run-scoped Tool Control (4 tools)
+
+| Tool                   | Description                                       | Required Inputs                                                       |
+| ---------------------- | ------------------------------------------------- | --------------------------------------------------------------------- |
+| `list_tool_servers`    | List registered tool-server definitions           | _(none)_                                                              |
+| `discover_tool_server` | Validate and discover one definition              | `serverId`; optional `force`                                          |
+| `get_run_tool_catalog` | Read the immutable catalog for an exact attempt   | `taskId`, `attemptId`                                                 |
+| `call_run_tool`        | Invoke one cataloged tool through policy controls | `taskId`, `attemptId`, `serverId`, `tool`, `arguments`, `operationId` |
+
+`call_run_tool` requires the exact active attempt and the catalog digest stored
+in its launch manifest. A stable `operationId` prevents duplicate dispatch.
+Denied tools fail immediately. Approval-required tools return a
+`run-approval/v1` identity until an authenticated reviewer approves the exact
+server, tool, arguments, and catalog digest; retry with that `approvalId`.
+
+Definition management remains a REST/CLI administrator surface. Tool-server
+environment and credential values never appear in MCP inputs or results.
+
+---
+
+## Resources
+
+The MCP server also exposes **MCP Resources** — read-only data accessible via `kanban://` URIs:
+
+| URI                     | Description                                  |
+| ----------------------- | -------------------------------------------- |
+| `kanban://tasks`        | All tasks (JSON)                             |
+| `kanban://tasks/active` | Tasks with status `in-progress` or `blocked` |
+| `kanban://task/{id}`    | Individual task by ID                        |
+
+Resources are useful for MCP clients that support resource browsing (e.g., Claude Desktop's resource panel).
+
+---
+
+## Security Model
+
+### Principle of Least Privilege
+
+1. **Use `agent` role, not `admin`.** The `agent` role can create/update/archive tasks and run automations. It cannot manage users or server config.
+2. **One key per integration.** Create separate API keys for each MCP client:
+   ```
+   VERITAS_API_KEYS=cursor-mcp:vk_cur_abc:agent,claude-desktop:vk_cd_xyz:agent
+   ```
+3. **Localhost bypass is for dev only.** In production, disable it: `VERITAS_AUTH_LOCALHOST_BYPASS=false`.
+
+### Token Boundaries
+
+- API keys are passed via the `X-API-Key` header by the shared VK API client. The server also accepts `Authorization: Bearer <key>` for direct HTTP callers.
+- The MCP server reads `VK_API_KEY` from its environment and includes it in every HTTP request to VK.
+- Keys never appear in MCP tool inputs/outputs — they stay in the transport layer.
+- v5 auth context classifies MCP calls with `actorType=agent`, `authMethod=api-key`, the configured token name, and role-derived permissions.
+- MCP tool calls preflight protected HTTP requests against `/api/auth/context`. If the configured key lacks the mapped permission, the tool returns a permission error before sending the target write request.
+- Future MCP tools should request the narrowest server permission that matches the operation.
+
+### What the MCP Server Cannot Do
+
+- **No direct file access** — all operations go through the VK REST API.
+- **No shell execution** — the `start_agent` tool tells VK to start an agent; it doesn't spawn processes itself.
+- **No outbound network** — the MCP server only talks to `VK_API_URL`. It has no internet access.
+
+---
+
+## Error Handling & Troubleshooting
+
+### Error Response Format
+
+All tool errors return:
+
+```json
+{
+  "content": [{ "type": "text", "text": "Error: <message>" }],
+  "isError": true
+}
+```
+
+### Common Errors
+
+| Error                                 | Cause                                             | Fix                                                                        |
+| ------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------- |
+| `Task not found: abc123`              | ID doesn't match any task                         | Use an exact ID or a suffix unique to one task                             |
+| `Can only start agents on code tasks` | Tried `start_agent` on a non-code task            | Change task type to `code` first                                           |
+| `Task needs a worktree first`         | `start_agent` on a task without git worktree      | Create a worktree via the VK UI or API before starting an agent            |
+| `Provider runtime does not support…`  | Required launch or stop capability is unavailable | Select a capable provider or refresh its validated manifest                |
+| `Provider runtime manifest is stale…` | Active and persisted run snapshots do not match   | Terminate through the host supervisor, reconcile the attempt, and relaunch |
+| `fetch failed` / `ECONNREFUSED`       | VK server not running                             | Start the server: `pnpm dev`                                               |
+| `401 Unauthorized`                    | Invalid or missing API key                        | Check `VK_API_KEY` in MCP config and `VERITAS_API_KEYS` in server `.env`   |
+| `Unknown tool: <name>`                | Typo in tool name                                 | Check the [Tool Catalog](#tool-catalog) for exact names                    |
+
+### Debugging
+
+```bash
+# Run MCP server with stderr visible (it logs to stderr)
+VK_API_URL=http://localhost:3001 VK_API_KEY=your-agent-api-key node mcp/dist/index.js
+
+# Test a specific tool via stdin
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tasks","arguments":{}}}' | \
+  VK_API_URL=http://localhost:3001 node mcp/dist/index.js 2>/dev/null | jq .
+
+# Check VK server health
+curl -s http://localhost:3001/api/health | jq .
+```
+
+---
+
+## Observability & Telemetry
+
+The MCP server itself is stateless and does not emit telemetry. Observability comes from the VK server:
+
+- **Telemetry events** — `run.started`, `run.completed`, `run.tokens` events via `/api/telemetry/events`.
+- **Time tracking** — `/api/tasks/{id}/time/start` and `/api/tasks/{id}/time/stop`.
+- **Agent status** — `/api/agent/status` shows active agents on the VK dashboard.
+- **Squad chat** — `/api/chat/squad` for agent coordination messages.
+
+Configure telemetry retention in `server/.env`:
+
+| Variable                   | Default | Description                                  |
+| -------------------------- | ------- | -------------------------------------------- |
+| `TELEMETRY_RETENTION_DAYS` | `30`    | Days to keep event files                     |
+| `TELEMETRY_COMPRESS_DAYS`  | `7`     | Days before NDJSON files are gzip-compressed |
+
+---
+
+## Versioning & Compatibility
+
+| Component          | Version      | Notes                       |
+| ------------------ | ------------ | --------------------------- |
+| MCP server package | `6.1.3`      | Matches VK server version   |
+| MCP SDK            | `1.29.0`     | `@modelcontextprotocol/sdk` |
+| MCP protocol       | `2025-11-25` | Latest stable spec          |
+| Node.js            | `≥ 22.22.1`  | Matches the repo runtime    |
+| TypeScript         | `6.0+`       | Build dependency only       |
+
+**Breaking change policy:**
+
+- Tool names and required inputs are stable within a major version.
+- New tools may be added in minor versions.
+- Tool removal or input schema changes only happen in major versions.
+- The MCP server version tracks the VK server version (`@veritas-kanban/mcp`).
+
+---
+
+## FAQ
+
+**Q: Does the MCP server need its own port?**
+No. It communicates via stdio (stdin/stdout). The MCP client spawns it as a child process. No ports needed.
+
+**Q: Can I run multiple MCP server instances?**
+Yes. Each MCP client spawns its own instance. They're stateless — no coordination needed.
+
+**Q: What happens if the VK server is down?**
+Tool calls will fail with connection errors (`ECONNREFUSED`). The MCP server stays alive and will work again once VK is reachable.
+
+**Q: Can I use this with non-Claude MCP clients?**
+Yes. Any MCP-compatible client works — Cursor, Cline, Continue, Zed, or custom implementations. The config format may differ slightly per client.
+
+**Q: How do I add a new tool?**
+
+1. Create or edit a file in `mcp/src/tools/`.
+2. Define the tool schema and handler.
+3. Export from the module and import in `mcp/src/index.ts`.
+4. Rebuild: `cd mcp && pnpm build`.
+
+**Q: Is there an SSE/HTTP transport option?**
+Not currently. The server uses stdio only. If you need HTTP transport, use the VK REST API directly.
+
+**Q: How do partial task IDs work?**
+An exact ID takes precedence over suffix matches. A suffix is accepted only when it identifies one task. Empty or whitespace-only IDs are rejected, and ambiguous suffixes return an error listing candidate IDs without updating, archiving, or deleting any task. Use an exact ID to resolve ambiguity.
+
+---
+
+_Last updated: 2026-08-30 · VK v6.1.3 · 42 tools / 9 categories_
+
+### API deadlines and errors
+
+Shared API requests have a 30-second deadline, including response-body reads. Set `VK_API_TIMEOUT_MS` to a positive integer of milliseconds for a different default. Agent launch requests explicitly allow 120 seconds for provider preflight and worktree preparation. Client integrations can set `timeoutMs` per request and supply an `AbortSignal`; cancellation also covers uncached permission preflight. Writes are never retried automatically. A timeout does not prove that the server rejected or rolled back a write: inspect the task or operation before trying it again.
+
+API errors retain HTTP status and server error code. MCP tool errors and CLI task commands using `--json` include structured metadata. Forwarded details use an allowlist for validation, revision, permission, and retry fields; complete task snapshots and credential fields are omitted. A rejected preflight does not remain cached as a permanent transport failure.
